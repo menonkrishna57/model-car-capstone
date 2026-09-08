@@ -1,25 +1,24 @@
 # AGENTS.md — Autonomous RC Car Capstone
 
-This file configures the Antigravity coding agent (and its subagents) for the
-MPSTME/NMIMS autonomous RC car capstone project. It gives the top-level agent
-enough context to work independently and defines a set of subagents that own
-distinct parts of the stack. Route work to the narrowest subagent that fits;
-use the top-level agent only for orchestration, cross-cutting changes, and
-final integration.
+Configuration for the Antigravity coding agent and its subagents on the
+MPSTME/NMIMS autonomous RC car capstone. Route work to the narrowest
+subagent whose `Owns:` path covers it. The top-level agent is only for
+orchestration, cross-cutting changes, and final integration.
 
 ## 1. Project summary
 
 Two-layer autonomous RC car:
-- **Arduino Nano** — real-time motor control (PWM via L298N, turn-then-drive
-  state machine, IMU heading hooks, serial telemetry).
+- **Arduino Uno** — real-time motor control (PWM via L298N, turn-then-drive
+  state machine, IMU heading hooks, serial telemetry). *(Future scope: swap
+  to a Nano for a smaller footprint — same ATmega328P, drop-in, no code
+  changes expected.)*
 - **Raspberry Pi 5** — perception (YOLOv10n via NCNN, CSI global-shutter
-  camera, ICM20948 IMU over I2C, 3x HC-SR04P ultrasonic array) and high-level
-  navigation, talking to the Nano over serial (USB or GPIO UART — undecided).
+  camera, ICM20948 IMU over I2C, 3x HC-SR04P ultrasonic array) and
+  high-level navigation, talking to the Uno over serial (USB or GPIO
+  UART — undecided; keep transport swappable until settled).
 
-Team: Krishna (hardware + integration + C++ control loop, lead), Aditya
-(YOLO pipeline/fine-tuning), Parth (ultrasonic logic + assembly). Krishna is
-the primary user of this agent and has the strongest hardware/software
-background on the team.
+Team: Krishna (hardware + integration + C++ control loop, lead, primary
+agent user), Aditya (hardware/chassis), Parth (software).
 
 Chassis: 2-layer acrylic 4WD, TT motors, single L298N in skid-steer
 (both-left / both-right channel pairing). Power: 2S 18650 + 5V/5A buck
@@ -31,170 +30,194 @@ Pi 5. No wheel encoders — navigation fallback is IMU-aided dead reckoning
 
 - **No destructive changes to shared hardware.** Components are borrowed
   from a college lab under a 15/60-day ID rotation policy shared across the
-  team. Never suggest cutting cables, desoldering, or any other
-  irreversible modification. Flag anything destructive instead of doing it.
-- **Two-layer architecture is not negotiable.** Do not propose collapsing
-  control into the Pi alone — GPIO PWM jitter under YOLO load and resource
-  contention are the reason the Nano owns real-time control.
-- **Uno→Nano is a drop-in swap** (same ATmega328P) — don't reintroduce
-  Uno-specific assumptions (e.g. shield stacking) in new code or docs.
-- Once a solution path is confirmed unavailable (currently: micro-HDMI —
-  none on hand, hard to source), do not re-suggest it. Treat it as closed
-  unless the user reopens it.
-- Prefer granular, step-by-step output with exact pin names / wire-by-wire
-  instructions when producing hardware guidance — match Krishna's stated
-  working style.
-- Benchmarking claims about the Pi 5 must be framed honestly: Oracle Cloud
-  Ampere A1 results are an **optimistic upper bound** (same ARM lineage,
-  not the same SoC), paired with published Pi 5 literature numbers
-  (~125–145 ms/frame for a YOLO-nano model via NCNN) as the realistic range.
+  team. Never cut, desolder, or otherwise irreversibly modify borrowed
+  gear — flag it instead.
+- **Two-layer architecture is not negotiable.** Never propose collapsing
+  control into the Pi alone; GPIO PWM jitter under YOLO load and resource
+  contention are exactly why the Uno owns real-time control.
+- **Currently on Arduino Uno.** A future Nano migration is in scope (same
+  ATmega328P, drop-in, zero code changes expected) but not yet done — don't
+  write Uno-only assumptions (e.g. shield stacking) that would block it, and
+  don't refer to the board as a Nano until the swap actually happens.
+- **micro-HDMI is a closed path** (none on hand, hard to source) — do not
+  re-suggest display-cable-based debugging.
+- Prefer granular, step-by-step output with exact pin names and
+  wire-by-wire breakdowns for hardware guidance.
+- Benchmark against real Pi 5 hardware — no cloud/simulated proxy is in
+  use for this project right now.
+- Never fabricate benchmark numbers, sensor readings, or test results —
+  mark anything not yet run on real hardware as "unverified / simulated."
 
-## 3. Repo layout (target — create if missing)
+## 3. Repo layout (authoritative)
 
 ```
-/firmware/arduino/          # Nano sketches (point_to_point_control.ino, bench tests)
-/perception/                # Pi-side Python: camera, YOLO/NCNN, IMU, ultrasonic
-/perception/serial_bridge/  # Pi<->Nano serial handshake code
-/sim/                       # Oracle Cloud benchmark notebooks, yolo-env setup scripts
-/tools/component_tracker/   # Excel workbook + any scripts that regenerate it
-/docs/                      # Architecture notes, wiring diagrams, ADRs
-AGENTS.md
-README.md
+.
+├── arduino/                       # Uno firmware (Nano migration = future scope) — owned by firmware-agent
+│   ├── motor_test/
+│   │   └── motor_test.ino         # Motor forward/reverse bench sketch
+│   ├── point_to_point_control/
+│   │   └── point_to_point_control.ino
+│   ├── lib/                       # Shared Arduino headers (pin maps, protocol constants)
+│   └── PROTOCOL.md                # Serial telemetry / command format (source of truth)
+│
+├── car/                           # Pi 5 runtime — split across perception & integration
+│   ├── main.py                    # Entry point: camera → detect → decide → drive
+│   ├── perception/                # owned by perception-agent
+│   │   ├── detector.py            # NCNN detection wrapper (loads benchmarking/models exports)
+│   │   ├── sensors.py             # ICM20948 IMU + HC-SR04P ultrasonic reads/filtering
+│   │   └── config.py              # Resolution, thresholds, sensor pin/I2C addresses
+│   ├── control/                   # owned by integration-agent
+│   │   ├── motor_controller.py    # Pi-side serial handshake (implements arduino/PROTOCOL.md)
+│   │   └── navigation.py          # IMU-aided dead-reckoning point-to-point logic
+│   └── requirements.txt           # Runtime-only deps (picamera2, pyserial, ncnn, etc.)
+│
+├── benchmarking/                  # owned by bench-agent
+│   ├── benchmark.py                # Latest benchmark script (runs directly on Pi 5 hardware)
+│   ├── requirements.txt
+│   ├── test_videos/
+│   │   ├── dashcam_test.mp4
+│   │   └── testvideovid1.mp4
+│   ├── models/                     # Model weights & exports
+│   │   ├── yolov10n.pt
+│   │   ├── yolov10n_ncnn_model/
+│   │   └── yolov10n_openvino_model/
+│   ├── results/                    # Dated on-device benchmark run outputs
+│   └── legacy/                     # Old Oracle Cloud proxy benchmark — inactive, kept for reference only
+│       ├── benchmark.py
+│       ├── NCNN_Model/
+│       └── OpenVINO/
+│
+├── infra/                          # owned by network-agent
+│   ├── pi-image/
+│   │   ├── network-config          # cloud-init Wi-Fi config (one-shot — reflash, don't hot-edit)
+│   │   └── user-data
+│   └── SETUP.md                    # Headless bring-up, SSH/Pi Connect, interface enablement steps
+│
+├── tools/
+│   └── component_tracker/          # owned by docs-tracker-agent
+│       └── lab_component_tracker.xlsx
+│
+├── docs/                            # owned by docs-tracker-agent
+│   ├── architecture.md              # Two-layer design rationale, wiring diagrams
+│   └── decisions/                   # Short ADRs (e.g. USB-serial vs GPIO-UART)
+│
+├── .venv/
+├── AGENTS.md
+└── README.md                        # Project overview, current status, quickstart
 ```
 
 ## 4. Global conventions
 
 - **Arduino/C++**: state machines over deep call chains; every motor/IMU
-  action gets a serial telemetry line for debugging (9600 baud). Keep pin
-  mappings as named constants at the top of the file, matching whatever the
-  current wiring doc says (see `/docs`).
-- **Python (Pi + sim)**: use the `yolo-env` venv conventions (ultralytics,
-  onnxruntime). Keep inference code swappable between the Oracle Cloud proxy
-  and the real Pi 5 — no hardcoded ARM/Pi-only assumptions in the model code
-  itself; isolate GPIO/CSI/I2C calls behind a thin hardware interface so the
-  same perception code can run on the cloud proxy for benchmarking.
+  action gets a serial telemetry line (9600 baud). Pin mappings are named
+  constants, defined once in `arduino/lib/` and never duplicated inline.
+- **Python (`car/`, `benchmarking/`)**: hardware access (GPIO/CSI/I2C/
+  serial) stays behind a thin interface so `car/perception/detector.py`'s
+  core logic can also run unmodified inside `benchmarking/` for offline
+  testing. `car/requirements.txt` and `benchmarking/requirements.txt` stay
+  independent — runtime-only deps never leak into the benchmarking env.
+- **Serial protocol**: `arduino/PROTOCOL.md` is the single source of truth
+  for message format and baud rate. Any change to it is a `firmware-agent`
+  change, propagated to `car/control/motor_controller.py` by
+  `integration-agent`.
 - **Commits/PRs**: one subagent's work per commit where possible, so
   integration diffs stay reviewable by teammates who aren't Krishna.
-- Never fabricate benchmark numbers, sensor readings, or test results —
-  mark anything not yet run on real hardware as "unverified / simulated."
 
 ## 5. Subagents
 
 ### 5.1 `firmware-agent` — Arduino / real-time control
-**Owns:** `/firmware/arduino/**`
-**Responsibilities:**
-- Motor control state machines (turn-then-drive, skid-steer mixing).
-- IMU heading integration hooks (consumes heading from Pi or onboard calc).
-- Serial telemetry protocol definition and implementation.
-- Bench test sketches (single motor → full 4WD scale-up).
-**Constraints:** Target ATmega328P (Nano). No shield-stacking assumptions.
-Keep serial protocol documented in `/docs/serial_protocol.md` and update it
-whenever the message format changes — the perception-agent depends on it.
-**Does not:** touch Python/perception code, decide the Wi-Fi/networking
-approach, or modify the component tracker.
+**Owns:** `arduino/**`
+**Responsibilities:** motor control state machines (turn-then-drive,
+skid-steer mixing), IMU heading hooks, serial telemetry, bench sketches
+scaling from `motor_test.ino` to `point_to_point_control.ino`; keeps
+`arduino/PROTOCOL.md` current.
+**Constraints:** ATmega328P (Uno, currently) target, no shield-stacking
+assumptions. Nano migration is future scope — flag any change that would
+make that swap harder, but don't do the migration itself unprompted.
+**Does not:** touch `car/**` or `benchmarking/**`.
 
-### 5.2 `perception-agent` — Pi 5 / camera / YOLO / sensors
-**Owns:** `/perception/**` (excluding `serial_bridge/`, see 5.3)
-**Responsibilities:**
-- Camera capture pipeline (CSI, global shutter).
-- YOLOv10n via NCNN inference: loading, pre/post-processing, lane
-  detection, obstacle avoidance, traffic sign recognition.
-- ICM20948 IMU reads over I2C; HC-SR04P ultrasonic array reads/filtering.
-- IMU-aided dead-reckoning fallback logic (no encoders available).
-**Constraints:** Must run against the confirmed interface set (Camera/CSI,
-I2C, Serial Port hardware with login-shell-over-serial disabled). Do not
-assume the Pi has network access when writing core perception logic — that
-is a separate concern owned by `network-agent`.
-**Does not:** own the Nano-facing serial framing (defers to the protocol
-doc from `firmware-agent`), touch cloud benchmarking scripts.
+### 5.2 `perception-agent` — detection & sensing
+**Owns:** `car/perception/**`
+**Responsibilities:** NCNN detection wrapper (lane detection, obstacle
+avoidance, traffic sign recognition) loading exports from
+`benchmarking/models/`; IMU + ultrasonic reads/filtering in `sensors.py`;
+runtime thresholds/config.
+**Constraints:** must run against the confirmed interface set (Camera/CSI,
+I2C, Serial Port with login-shell-over-serial disabled); no Pi-only
+assumptions that would break running the same code path under
+`benchmarking/`.
+**Does not:** own `car/main.py`'s orchestration loop or anything in
+`car/control/`.
 
-### 5.3 `integration-agent` — Pi↔Arduino bridge & full-stack wiring
-**Owns:** `/perception/serial_bridge/**`
-**Responsibilities:**
-- Implements the Pi-side half of the serial handshake against the protocol
-  documented by `firmware-agent`.
-- Resolves and implements the USB-serial vs GPIO-UART decision once made;
-  until decided, keep the transport behind an interface so either works.
-- End-to-end wiring of perception outputs → control commands.
-- Owns the eventual full 4WD integration test plan.
-**Constraints:** Must not modify `firmware-agent`'s sketch files or
-`perception-agent`'s inference code directly — request changes from those
-subagents via the protocol/interface doc instead of reaching across
-boundaries.
+### 5.3 `integration-agent` — runtime wiring & Pi↔Arduino bridge
+**Owns:** `car/main.py`, `car/control/**`, `car/requirements.txt`
+**Responsibilities:** `motor_controller.py` implements the Pi-side half of
+the handshake defined in `arduino/PROTOCOL.md`; `navigation.py` implements
+IMU-aided dead-reckoning point-to-point driving; `main.py` wires
+camera → `perception/` → decision → `control/` → Arduino end to end. Owns
+the integration test plan (bench → tethered → free-run).
+**Constraints:** requests changes to `arduino/**` or `car/perception/**`
+from the owning subagent rather than editing across the boundary.
 
-### 5.4 `network-agent` — Pi headless setup & connectivity
-**Owns:** `/docs/networking/**`, any `network-config`/cloud-init assets
-**Responsibilities:**
-- Headless Wi-Fi bring-up for the Pi 5 (currently targeting hotspot SSID
-  "Krogs57's Network").
-- cloud-init `network-config` authoring — remember this is **one-shot**:
-  once the OS has booted with a given config, edits require a full reflash,
-  not a live edit. Always produce a fresh image-writing plan rather than
-  "just edit the file on the running system."
-- SSH/Raspberry Pi Connect setup once network access is confirmed.
-- Distinct-hostname assignment per team member to avoid SSH collisions on
-  shared lab Wi-Fi; Asia/Kolkata timezone.
-**Constraints:** No micro-HDMI is available and is currently out of scope
-to source — do not propose display-cable-based debugging. A Caps-Lock LED
-test has already confirmed the OS itself boots fine, so treat this purely
-as a Wi-Fi/connectivity problem, not a boot problem. Required interfaces to
-(re)enable on every reflash: Camera, I2C, Serial Port hardware (with login
-shell over serial **disabled**, to keep UART free for the Arduino link).
-**Escalates to user:** any step that requires physical access to the Pi
-(swapping storage, plugging in a cable) rather than something scriptable.
+### 5.4 `bench-agent` — benchmarking
+**Owns:** `benchmarking/**`
+**Responsibilities:** maintains `benchmark.py`, `models/`, `test_videos/`,
+and dated `results/`; runs and reports YOLOv10n/NCNN inference performance
+directly on the real Pi 5. `legacy/` (old Oracle Cloud proxy benchmark) is
+inactive and kept for reference only — never the source of truth, and no
+new work goes into it.
+**Constraints:** no cloud proxy is in use for this project — don't stand
+one up or route benchmarking through it unless the user reopens that
+option.
+**Does not:** touch `car/**` — exported artifacts flow one-way from
+`benchmarking/models/` into what `perception-agent` loads at runtime.
 
-### 5.5 `sim-bench-agent` — Oracle Cloud benchmarking proxy
-**Owns:** `/sim/**`
-**Responsibilities:**
-- Maintains the `raspberrypi5-simulation` Oracle Cloud A1 instance setup
-  (Ubuntu 24.04 aarch64, `yolo-env` venv: ultralytics, onnxruntime,
-  JupyterLab).
-- Writes/updates the YOLOv10n benchmark notebook(s).
-- Reports results paired with published Pi 5 NCNN benchmarks, always
-  labeled as an optimistic upper bound, never presented as equivalent to
-  real Pi 5 performance.
-**Constraints:** Remember the instance has an **ephemeral IP** that can
-change on restart — any setup script or doc should not hardcode the IP.
-"Stop" preserves the boot volume; "Terminate" is destructive and
-irreversible — never invoke/recommend Terminate without explicit
-confirmation from the user.
+### 5.5 `network-agent` — Pi headless setup & connectivity
+**Owns:** `infra/**`
+**Responsibilities:** headless Wi-Fi bring-up; `network-config`/
+`user-data` cloud-init authoring (this is **one-shot** — a full reflash is
+required after any change, never a live edit of the running system); SSH /
+Pi Connect setup; distinct per-teammate hostnames to avoid SSH collisions
+on shared lab Wi-Fi; documents required interface enablement (Camera, I2C,
+Serial Port with login-shell-over-serial disabled) in `infra/SETUP.md`.
+**Constraints:** no micro-HDMI available — never propose display-cable
+debugging.
+**Escalates to user:** anything requiring physical access to the Pi
+(storage swap, cable plug-in).
 
-### 5.6 `docs-tracker-agent` — Component tracking & documentation
-**Owns:** `/tools/component_tracker/**`, `/docs/*.md` (non-networking)
-**Responsibilities:**
-- Maintains the four-sheet Excel component tracker (paste-and-parse entry,
-  ID rotation log, rotation summary dashboard, policy reference).
-- Keeps the 15/60-day ID rotation auto-logic correct: flag caps hit, and
-  suggest the next available team member by cross-referencing full
-  rotation history.
-- Writes/updates architecture notes, wiring diagrams, ADRs, and the serial
-  protocol doc (in coordination with `firmware-agent`).
-**Constraints:** This is a shared-equipment logistics tool, not a hardware
-control path — never let it drive actual pin/wiring decisions, only record
-them.
+### 5.6 `docs-tracker-agent` — documentation & component tracking
+**Owns:** `README.md`, `docs/**`, `tools/component_tracker/**`
+**Responsibilities:** keeps `README.md` current (architecture summary,
+repo map, status/blockers); maintains `lab_component_tracker.xlsx`
+(15/60-day ID rotation across Krishna/Aditya/Parth — flags caps hit,
+suggests next holder); writes architecture notes and short ADRs in
+`docs/decisions/` (e.g. USB-serial vs GPIO-UART once decided).
+**Constraints:** records decisions made by other subagents — never makes
+pin/wiring/code decisions itself.
 
 ## 6. Delegation rules for the top-level agent
 
-1. If a task is entirely within one subagent's `Owns:` path, delegate to it
-   directly and let it report back a short summary.
-2. If a task spans subagents (e.g. "get the car driving end to end"), the
-   top-level agent breaks it into per-subagent subtasks, sequences them,
-   and calls `integration-agent` last to wire the pieces together.
-3. If a task changes the serial protocol, the top-level agent must route
-   the change through `firmware-agent` first, then notify
-   `perception-agent`/`integration-agent` of the updated contract.
-4. Any task involving Terminating cloud resources, reflashing storage, or
-   physically modifying borrowed lab hardware requires explicit user
-   confirmation before a subagent proceeds.
+1. Task fits entirely inside one subagent's `Owns:` path → delegate
+   directly, get a short summary back.
+2. Task spans subagents (e.g. "get the car driving end to end") → break
+   into per-subagent subtasks, sequence them, call `integration-agent`
+   last to wire pieces together.
+3. Task changes the serial protocol → route through `firmware-agent`
+   first (updates `arduino/PROTOCOL.md`), then notify `perception-agent`/
+   `integration-agent` of the new contract.
+4. Reflashing storage or physically modifying borrowed lab hardware →
+   requires explicit user confirmation before any subagent proceeds.
 
 ## 7. Current priority (as of last sync)
 
-**Blocker:** Pi 5 headless Wi-Fi connectivity (`network-agent`). This gates
-`perception-agent`, `integration-agent`, and any real (non-simulated)
-benchmarking. Everything else can proceed in parallel using the Oracle
-Cloud proxy (`sim-bench-agent`) and bench-top Arduino testing
-(`firmware-agent`).
+**Blocker:** Pi 5 headless Wi-Fi connectivity (`network-agent`, `infra/`).
+This gates `perception-agent` and `integration-agent`. Benchmarking
+(`bench-agent`) and bench-top Arduino testing (`firmware-agent`) can
+proceed in parallel directly on the real Pi 5 / Uno hardware, no
+simulation needed.
 
-**Next up once unblocked:** run the YOLOv10n benchmark notebook on real Pi
-5 hardware, implement the Pi↔Arduino serial handshake, and begin scaling
-the single-motor bench test to full 4WD.
+**Next up once unblocked:** run `benchmarking/benchmark.py` on real Pi 5
+hardware, implement `car/control/motor_controller.py` against
+`arduino/PROTOCOL.md`, and scale `arduino/motor_test/motor_test.ino`
+toward `point_to_point_control.ino`, then wire it all through
+`car/main.py`.

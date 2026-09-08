@@ -1,0 +1,10 @@
+# cloud-init network configuration for Raspberry Pi 5
+# NOTE: One-shot configuration on boot partition. Changes require reflash.
+version: 2
+wifis:
+  wlan0:
+    dhcp4: true
+    optional: true
+    access-points:
+      "Krogs57's Network":
+        password: "YOUR_WIFI_PASSWORD"

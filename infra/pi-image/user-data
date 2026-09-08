@@ -1,0 +1,20 @@
+#cloud-config
+# cloud-init user-data for Raspberry Pi 5
+# Owned by network-agent
+
+hostname: pi5-krishna
+timezone: Asia/Kolkata
+
+users:
+  - name: pi
+    gecos: Raspberry Pi User
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: false
+    # Replace with your public SSH key or pre-hashed password:
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...
+
+ssh_pwauth: true
+package_update: false
+package_upgrade: false
