@@ -1,0 +1,21 @@
+# Raspberry Pi 5 — YOLOv10n Benchmark Dependencies
+# Install with:  pip install -r requirements.txt
+#
+# NOTE: On Pi 5 (aarch64), install PyTorch ARM wheel first if not already present:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# Core inference
+ultralytics>=8.2.0
+numpy>=1.24.0
+
+# Video I/O (headless — no GUI needed on Pi)
+opencv-python-headless>=4.8.0
+
+# NCNN backend (ARM NEON accelerated)
+ncnn>=1.0.20230517
+
+# OpenVINO backend
+openvino>=2024.0.0
+
+# System monitoring (RAM, CPU)
+psutil>=5.9.0
