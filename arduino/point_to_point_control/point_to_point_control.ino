@@ -19,6 +19,36 @@ CarState currentState = STATE_IDLE;
 unsigned long stateStartTime = 0;
 unsigned long stateDuration = 0;
 
+// Sonar polling
+#define SONAR_INTERVAL_MS 50
+unsigned long lastSonarTime = 0;
+
+// Helper to read distance in cm (with 20ms timeout ~ 3.4m max)
+long readDistanceCM(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 20000);
+  if (duration == 0) return 100; // Timeout, assume clear (100cm)
+  return duration * 0.034 / 2;
+}
+
+void pollSonar() {
+  long dLeft = readDistanceCM(PIN_TRIG_LEFT, PIN_ECHO_LEFT);
+  long dCenter = readDistanceCM(PIN_TRIG_CENTER, PIN_ECHO_CENTER);
+  long dRight = readDistanceCM(PIN_TRIG_RIGHT, PIN_ECHO_RIGHT);
+  
+  Serial.print(TELEM_PREFIX);
+  Serial.print("SONAR ");
+  Serial.print(dLeft);
+  Serial.print(" ");
+  Serial.print(dCenter);
+  Serial.print(" ");
+  Serial.println(dRight);
+}
+
 void setMotors(int leftSpeed, int rightSpeed) {
   // Left side direction & PWM
   if (leftSpeed > 0) {
@@ -66,6 +96,13 @@ void setup() {
   pinMode(PIN_ENB, OUTPUT);
   pinMode(PIN_IN3, OUTPUT);
   pinMode(PIN_IN4, OUTPUT);
+
+  pinMode(PIN_TRIG_LEFT, OUTPUT);
+  pinMode(PIN_ECHO_LEFT, INPUT);
+  pinMode(PIN_TRIG_CENTER, OUTPUT);
+  pinMode(PIN_ECHO_CENTER, INPUT);
+  pinMode(PIN_TRIG_RIGHT, OUTPUT);
+  pinMode(PIN_ECHO_RIGHT, INPUT);
 
   stopMotors();
 
@@ -140,6 +177,12 @@ void loop() {
   if (Serial.available() > 0) {
     String cmd = Serial.readStringUntil('\n');
     handleCommand(cmd);
+  }
+
+  // Poll ultrasonics at intervals
+  if (millis() - lastSonarTime >= SONAR_INTERVAL_MS) {
+    lastSonarTime = millis();
+    pollSonar();
   }
 
   // Handle timed state transitions

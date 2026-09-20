@@ -8,14 +8,15 @@ yaw/heading rates from the ICM20948 9-DOF IMU over I2C.
 
 import time
 from typing import Dict, Optional
-from car.perception.config import ULTRASONIC_SENSORS, IMU_I2C_BUS, IMU_I2C_ADDRESS
+from car.perception.config import IMU_I2C_BUS, IMU_I2C_ADDRESS
+from car.control.motor_controller import MotorController
 
 
 class SensorManager:
     """Manages ultrasonic rangefinders and onboard IMU."""
 
-    def __init__(self):
-        self.sensors = ULTRASONIC_SENSORS
+    def __init__(self, motor_controller: Optional[MotorController] = None):
+        self.motor = motor_controller
         self.imu_bus_num = IMU_I2C_BUS
         self.imu_address = IMU_I2C_ADDRESS
         self._imu_bus = None
@@ -36,12 +37,11 @@ class SensorManager:
         Returns:
             Dict mapping sensor name ('left', 'center', 'right') to distance in cm.
         """
-        # Skeleton/stub: returns simulated or hardware reads
-        readings = {}
-        for s in self.sensors:
-            # Placeholder: 100.0 cm (clear path)
-            readings[s["name"]] = 100.0
-        return readings
+        if self.motor is not None:
+            return self.motor.latest_sonar
+        
+        # Fallback if running without motor controller
+        return {"left": 100.0, "center": 100.0, "right": 100.0}
 
     def read_imu_heading(self) -> Optional[float]:
         """Reads current yaw/heading in degrees from the ICM20948 IMU.

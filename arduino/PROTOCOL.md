@@ -1,7 +1,7 @@
 # Serial Protocol Specification (Source of Truth)
 
 **Layer Contract**: Raspberry Pi 5 ↔ Arduino Uno (ATmega328P)  
-**Baud Rate**: 9600 baud, 8-N-1  
+**Baud Rate**: 115200 baud, 8-N-1  
 **Line Ending**: `\n` (newline, ASCII `0x0A`)  
 **Transport**: Swappable — USB-Serial (`/dev/ttyUSB0` or `/dev/ttyACM0`) or GPIO-UART (`/dev/ttyAMA0`).
 
@@ -30,6 +30,7 @@ Arduino broadcasts or responds with single-line telemetry events prefixed by `[T
 | **ACK** | `[ACK] DRIVE 180 1500` | Command accepted and executed/queued |
 | **STATUS** | `[TELEM] STATE=DRIVING SPEED=180` | Current state machine status |
 | **DONE** | `[TELEM] DONE DRIVE` | Timed drive/turn action finished |
+| **SONAR** | `[TELEM] SONAR 45 100 20` | Real-time ultrasonic distances (Left, Center, Right) in cm |
 | **PONG** | `[ACK] PONG` | Heartbeat response to `PING` |
 | **READY** | `[TELEM] READY Uno-ATmega328P` | Broadcast once bootloader finishes in `setup()` |
 
