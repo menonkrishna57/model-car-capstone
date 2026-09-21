@@ -1,7 +1,7 @@
 # Serial Protocol Specification (Source of Truth)
 
 **Layer Contract**: Raspberry Pi 5 ↔ Arduino Uno (ATmega328P)  
-**Baud Rate**: 9600 baud, 8-N-1  
+**Baud Rate**: 115200 baud, 8-N-1  
 **Line Ending**: `\n` (newline, ASCII `0x0A`)  
 **Transport**: Swappable — USB-Serial (`/dev/ttyUSB0` or `/dev/ttyACM0`) or GPIO-UART (`/dev/ttyAMA0`).
 

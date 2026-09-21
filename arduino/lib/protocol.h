@@ -6,7 +6,7 @@
 // Source of truth: arduino/PROTOCOL.md
 // =============================================================================
 
-#define SERIAL_BAUD_RATE 9600
+#define SERIAL_BAUD_RATE 115200
 #define SERIAL_BUFFER_SIZE 64
 
 // Telemetry prefixes

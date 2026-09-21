@@ -18,7 +18,7 @@ CONFIDENCE_THRESHOLD = 0.25            # Detection threshold
 # Default transport: USB-serial (/dev/ttyUSB0 or /dev/ttyACM0).
 # For GPIO UART: /dev/ttyAMA0
 SERIAL_PORT = "/dev/ttyUSB0"
-SERIAL_BAUD = 9600                     # Matches arduino/PROTOCOL.md
+SERIAL_BAUD = 115200                   # Matches arduino/PROTOCOL.md
 
 # ── Camera (CSI — Global Shutter) ────────────────────────────────────────────
 # Managed via picamera2 on Pi 5
@@ -27,12 +27,8 @@ CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
 
 # ── Ultrasonic Array (3× HC-SR04P, 3.3V/5V compatible) ───────────────────────
-# GPIO BCM pins: Left, Center, Right
-ULTRASONIC_SENSORS = [
-    {"name": "left",   "trigger": 23, "echo": 24},
-    {"name": "center", "trigger": 17, "echo": 27},
-    {"name": "right",  "trigger": 25, "echo": 8},
-]
+# Hardware ownership moved to Arduino Uno to avoid Pi OS jitter. 
+# Distances are received via [TELEM] SONAR serial messages.
 EMERGENCY_STOP_DISTANCE_CM = 20.0      # Stop immediately if obstacle closer than 20cm
 
 # ── IMU (ICM20948 over I2C) ──────────────────────────────────────────────────

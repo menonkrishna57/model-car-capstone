@@ -22,6 +22,8 @@ class MotorController:
         self.baud = baud
         self.timeout = timeout
         self._serial: Optional[serial.Serial] = None
+        # Shared state for latest sonar readings parsed from telemetry
+        self.latest_sonar = {"left": 100.0, "center": 100.0, "right": 100.0}
 
     def connect(self) -> bool:
         """Opens the serial link and waits for Arduino bootloader to settle."""
@@ -88,7 +90,21 @@ class MotorController:
         try:
             if self._serial.in_waiting > 0:
                 line = self._serial.readline().decode("utf-8", errors="replace").strip()
-                return line if line else None
+                if not line:
+                    return None
+                
+                # Intercept and parse SONAR messages silently update state
+                if line.startswith("[TELEM] SONAR"):
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        try:
+                            self.latest_sonar["left"] = float(parts[2])
+                            self.latest_sonar["center"] = float(parts[3])
+                            self.latest_sonar["right"] = float(parts[4])
+                        except ValueError:
+                            pass
+                
+                return line
         except serial.SerialException:
             pass
         return None

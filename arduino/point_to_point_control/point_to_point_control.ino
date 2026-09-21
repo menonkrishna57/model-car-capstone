@@ -57,6 +57,36 @@ float usRightDistance = 999.0f;
 // Motor Control (skid-steer L298N)
 // =============================================================================
 
+// Sonar polling
+#define SONAR_INTERVAL_MS 50
+unsigned long lastSonarTime = 0;
+
+// Helper to read distance in cm (with 20ms timeout ~ 3.4m max)
+long readDistanceCM(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 20000);
+  if (duration == 0) return 100; // Timeout, assume clear (100cm)
+  return duration * 0.034 / 2;
+}
+
+void pollSonar() {
+  long dLeft = readDistanceCM(PIN_TRIG_LEFT, PIN_ECHO_LEFT);
+  long dCenter = readDistanceCM(PIN_TRIG_CENTER, PIN_ECHO_CENTER);
+  long dRight = readDistanceCM(PIN_TRIG_RIGHT, PIN_ECHO_RIGHT);
+  
+  Serial.print(TELEM_PREFIX);
+  Serial.print("SONAR ");
+  Serial.print(dLeft);
+  Serial.print(" ");
+  Serial.print(dCenter);
+  Serial.print(" ");
+  Serial.println(dRight);
+}
+
 void setMotors(int leftSpeed, int rightSpeed) {
   // Left side direction & PWM
   if (leftSpeed > 0) {
@@ -365,6 +395,7 @@ void loop() {
     handleCommand(cmd);
   }
 
+<<<<<<< HEAD
   // ── 2. Tier 1 check: If Pi latch is active, do nothing else ───────────────
 
   if (currentState == STATE_PI_STOPPED) {
@@ -420,6 +451,16 @@ void loop() {
 
   if (currentState == STATE_DRIVING || currentState == STATE_TURNING ||
       currentState == STATE_REVERSING) {
+=======
+  // Poll ultrasonics at intervals
+  if (millis() - lastSonarTime >= SONAR_INTERVAL_MS) {
+    lastSonarTime = millis();
+    pollSonar();
+  }
+
+  // Handle timed state transitions
+  if (currentState != STATE_IDLE) {
+>>>>>>> 65f0686ad95bd14e8d070b79ea17d2129212f935
     if (millis() - stateStartTime >= stateDuration) {
       Serial.print(TELEM_PREFIX);
       if (currentState == STATE_DRIVING) {
