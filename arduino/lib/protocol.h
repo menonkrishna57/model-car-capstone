@@ -13,4 +13,14 @@
 #define TELEM_PREFIX "[TELEM] "
 #define ACK_PREFIX   "[ACK] "
 
+// Ultrasonic obstacle detection
+#define US_OBSTACLE_DISTANCE_CM  20.0f  // Emergency stop if obstacle closer than this
+#define US_PING_INTERVAL_MS      100    // Poll ultrasonics every 100ms
+#define US_TIMEOUT_US            30000  // pulseIn timeout in microseconds (~5m max range)
+
+// Avoidance maneuver timing (calibrate on real chassis)
+#define AVOID_REVERSE_MS         400    // How long to reverse during avoidance
+#define AVOID_TURN_MS            500    // How long to skid-turn during avoidance
+#define AVOID_SPEED              150    // PWM speed for avoidance maneuvers
+
 #endif // CAR_PROTOCOL_H
