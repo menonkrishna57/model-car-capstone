@@ -9,17 +9,13 @@ orchestration, cross-cutting changes, and final integration.
 
 Two-layer autonomous RC car:
 - **Arduino Uno** — real-time motor control (PWM via L298N, turn-then-drive
-  state machine, 2× HC-SR04P ultrasonic polling & local avoidance reflex,
-  serial telemetry at 115200 baud). *(Future scope: swap to a Nano for a
-  smaller footprint — same ATmega328P, drop-in, no code changes expected.)*
-- **Raspberry Pi 5** — perception (YOLOv10n via NCNN, classical CV pothole
-  detection, CSI global-shutter camera, ICM20948 IMU over I2C) and
-  high-level navigation (follow-me person tracking via KCF + PID steering),
-  talking to the Uno over USB-serial (115200 baud).
-
-Sensor layout: 2× HC-SR04P ultrasonic sensors, both forward-facing (left
-and right), owned by the Arduino. The Pi receives distances via serial
-telemetry (`[TELEM] US LEFT=xx RIGHT=yy`).
+  state machine, IMU heading hooks, serial telemetry). *(Future scope: swap
+  to a Nano for a smaller footprint — same ATmega328P, drop-in, no code
+  changes expected.)*
+- **Raspberry Pi 5** — perception (YOLOv10n via NCNN, CSI global-shutter
+  camera, ICM20948 IMU over I2C, 2x HC-SR04P ultrasonic sensors, both front-facing) and
+  high-level navigation, talking to the Uno over serial (USB or GPIO
+  UART — undecided; keep transport swappable until settled).
 
 Team: Krishna (hardware + integration + C++ control loop, lead, primary
 agent user), Aditya (hardware/chassis), Parth (software).
@@ -65,16 +61,16 @@ Pi 5. No wheel encoders — navigation fallback is IMU-aided dead reckoning
 │   └── PROTOCOL.md                # Serial telemetry / command format (source of truth)
 │
 ├── car/                           # Pi 5 runtime — split across perception & integration
-│   ├── main.py                    # Entry point: camera → detect → decide → drive
+│   ├── main.py                    # Entry point: orchestrates STOP > AVOID > FOLLOW priority stack
 │   ├── perception/                # owned by perception-agent
-│   │   ├── detector.py            # NCNN detection wrapper + classical CV pothole detector
-│   │   ├── avoidance.py           # Zone-scoring engine + avoidance decision logic
-│   │   ├── tracker.py             # OpenCV KCF person tracker (follow-me mode)
-│   │   ├── sensors.py             # Reads ultrasonic distances from Arduino telemetry + IMU
-│   │   └── config.py              # Resolution, thresholds, serial port, I2C addresses
+│   │   ├── detector.py            # NCNN detection wrapper + pothole classical CV
+│   │   ├── avoidance.py           # Zone-scoring decision engine
+│   │   ├── tracker.py             # KCF person tracker for follow-me
+│   │   ├── sensors.py             # Parses Arduino telemetry for ultrasonic/IMU data
+│   │   └── config.py              # Resolution, thresholds, serial port/baud
 │   ├── control/                   # owned by integration-agent
-│   │   ├── motor_controller.py    # Pi-side serial bridge (implements arduino/PROTOCOL.md)
-│   │   ├── pid.py                 # PID controller for smooth follow-me steering
+│   │   ├── motor_controller.py    # Pi-side serial handshake (implements arduino/PROTOCOL.md)
+│   │   ├── pid.py                 # PID steering controller
 │   │   └── navigation.py          # IMU-aided dead-reckoning point-to-point logic
 │   └── requirements.txt           # Runtime-only deps (picamera2, pyserial, ncnn, etc.)
 │
@@ -109,7 +105,6 @@ Pi 5. No wheel encoders — navigation fallback is IMU-aided dead reckoning
 │   └── decisions/                   # Short ADRs (e.g. USB-serial vs GPIO-UART)
 │
 ├── .venv/
-├── setup.py                         # Python package config (enables `from car.xxx import`)
 ├── AGENTS.md
 └── README.md                        # Project overview, current status, quickstart
 ```
@@ -117,7 +112,7 @@ Pi 5. No wheel encoders — navigation fallback is IMU-aided dead reckoning
 ## 4. Global conventions
 
 - **Arduino/C++**: state machines over deep call chains; every motor/IMU
-  action gets a serial telemetry line (115200 baud). Pin mappings are named
+  action gets a serial telemetry line (9600 baud). Pin mappings are named
   constants, defined once in `arduino/lib/` and never duplicated inline.
 - **Python (`car/`, `benchmarking/`)**: hardware access (GPIO/CSI/I2C/
   serial) stays behind a thin interface so `car/perception/detector.py`'s
@@ -135,45 +130,30 @@ Pi 5. No wheel encoders — navigation fallback is IMU-aided dead reckoning
 
 ### 5.1 `firmware-agent` — Arduino / real-time control
 **Owns:** `arduino/**`
-**Responsibilities:** motor control state machines (turn-then-drive,
-skid-steer mixing), 2× HC-SR04P ultrasonic polling and local avoidance
-reflex (Tier 2), IMU heading hooks, serial telemetry (including
-`[TELEM] US LEFT=xx RIGHT=yy`), bench sketches scaling from
-`motor_test.ino` to `point_to_point_control.ino`; keeps
-`arduino/PROTOCOL.md` current.
+**Responsibilities:** motor control state machines, 2x HC-SR04P ultrasonic polling (front-left, front-right), local ultrasonic avoidance FSM (Tier 2 priority), serial telemetry (115200 baud), bench sketches; keeps `arduino/PROTOCOL.md` current.
 **Constraints:** ATmega328P (Uno, currently) target, no shield-stacking
 assumptions. Nano migration is future scope — flag any change that would
 make that swap harder, but don't do the migration itself unprompted.
 **Does not:** touch `car/**` or `benchmarking/**`.
 
-### 5.2 `perception-agent` — detection, sensing & avoidance
+### 5.2 `perception-agent` — detection & sensing
 **Owns:** `car/perception/**`
-**Responsibilities:** NCNN detection wrapper (`detector.py` — YOLOv10n for
-positive obstacles + classical CV Laplacian pothole detector for negative
-obstacles); zone-scoring avoidance engine (`avoidance.py` — computes
-L/C/R danger scores, returns CLEAR/LEFT/RIGHT/STOP); OpenCV KCF person
-tracker for follow-me mode (`tracker.py`); sensor telemetry parsing
-(`sensors.py` — reads ultrasonic distances from Arduino serial stream +
-IMU over I2C); runtime thresholds/config.
+**Responsibilities:** NCNN detection wrapper loading exports from
+`benchmarking/models/`, pothole classical CV detection, `avoidance.py` zone-scoring engine, `tracker.py` person tracker; runtime thresholds/config.
 **Constraints:** must run against the confirmed interface set (Camera/CSI,
 I2C, Serial Port with login-shell-over-serial disabled); no Pi-only
 assumptions that would break running the same code path under
-`benchmarking/`. Ultrasonic hardware is owned by Arduino — perception-agent
-only reads parsed distances from the serial telemetry stream.
+`benchmarking/`.
 **Does not:** own `car/main.py`'s orchestration loop or anything in
-`car/control/`.
+`car/control/`. Ultrasonic hardware reads have moved to Arduino.
 
 ### 5.3 `integration-agent` — runtime wiring & Pi↔Arduino bridge
 **Owns:** `car/main.py`, `car/control/**`, `car/requirements.txt`
 **Responsibilities:** `motor_controller.py` implements the Pi-side half of
-the handshake defined in `arduino/PROTOCOL.md` (including parsing
-`[TELEM] US` messages into `latest_sonar`); `pid.py` implements PID
-steering for follow-me mode; `navigation.py` implements IMU-aided
-dead-reckoning point-to-point driving; `main.py` wires
-camera → `perception/` → decision → `control/` → Arduino end to end,
-enforcing the priority stack: Emergency Stop (ultrasonics) > Avoidance
-(YOLO + pothole CV) > Follow Person (KCF + PID). Owns the integration
-test plan (bench → tethered → free-run).
+the handshake defined in `arduino/PROTOCOL.md`; `navigation.py` implements
+IMU-aided dead-reckoning point-to-point driving; `main.py` wires
+camera → `perception/` → decision → `control/` → Arduino end to end. Owns
+the integration test plan (bench → tethered → free-run).
 **Constraints:** requests changes to `arduino/**` or `car/perception/**`
 from the owning subagent rather than editing across the boundary.
 
@@ -228,16 +208,14 @@ pin/wiring/code decisions itself.
 
 ## 7. Current priority (as of last sync)
 
-**Status:** The core pipeline is wired end-to-end. `main.py` implements
-the full priority stack (Emergency Stop > Avoidance > Follow-Me), the
-Arduino firmware handles 2× ultrasonic polling with local avoidance, and
-the perception layer includes both YOLO and classical CV pothole detection.
+**Blocker:** Pi 5 headless Wi-Fi connectivity (`network-agent`, `infra/`).
+This gates `perception-agent` and `integration-agent`. Benchmarking
+(`bench-agent`) and bench-top Arduino testing (`firmware-agent`) can
+proceed in parallel directly on the real Pi 5 / Uno hardware, no
+simulation needed.
 
-**Next steps:**
-1. Bench-test the ultrasonic avoidance on real hardware (wave hand in front
-   of sensors, verify emergency stop triggers).
-2. Tethered test: hold car in air, stand in front of camera, verify
-   follow-me PID steering spins motors correctly.
-3. Tune PID gains (`pid.py` P/I/D values) and avoidance thresholds
-   (`avoidance.py` DANGER_THRESHOLD) on the real track.
-4. Free-run test on the track with full autonomy.
+**Next up once unblocked:** run `benchmarking/benchmark.py` on real Pi 5
+hardware, implement `car/control/motor_controller.py` against
+`arduino/PROTOCOL.md`, and scale `arduino/motor_test/motor_test.ino`
+toward `point_to_point_control.ino`, then wire it all through
+`car/main.py`.
