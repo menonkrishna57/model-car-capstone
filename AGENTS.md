@@ -18,7 +18,7 @@ Two-layer autonomous RC car:
   UART — undecided; keep transport swappable until settled).
 
 Team: Krishna (hardware + integration + C++ control loop, lead, primary
-agent user), Aditya (hardware/chassis), Parth (software).
+agent user), Parth (hardware/chassis), Aditya (software).
 
 Chassis: 2-layer acrylic 4WD, TT motors, single L298N in skid-steer
 (both-left / both-right channel pairing). Power: 2S 18650 + 5V/5A buck
