@@ -8,9 +8,9 @@ Two-layer autonomous 4WD RC vehicle powered by an **Arduino Uno** for real-time 
 
 | Layer | Hardware | Role | Owner |
 |---|---|---|---|
-| **Real-Time Control** | Arduino Uno (ATmega328P) | Deterministic PWM via L298N (skid-steer 4WD), turn-then-drive state machine, IMU heading hooks, serial telemetry | `firmware-agent` |
-| **Edge Perception** | Raspberry Pi 5 (8GB) | YOLOv10n inference via NCNN, CSI global-shutter camera, ICM20948 IMU (I2C), 3× HC-SR04P ultrasonic array | `perception-agent` |
-| **Integration** | Pi ↔ Uno Bridge | Serial command/telemetry handshake, point-to-point dead reckoning navigation | `integration-agent` |
+| **Real-Time Control** | Arduino Uno (ATmega328P) | Deterministic PWM via L298N (skid-steer 4WD), 2× HC-SR04P local avoidance FSM, serial telemetry (115200 baud) | `firmware-agent` |
+| **Edge Perception** | Raspberry Pi 5 (8GB) | YOLOv10n inference via NCNN, CSI global-shutter camera, KCF person tracker, decision engine | `perception-agent` |
+| **Integration** | Pi ↔ Uno Bridge | Serial command/telemetry handshake (115200 baud), point-to-point & follow-me navigation | `integration-agent` |
 
 ---
 
@@ -26,8 +26,8 @@ Two-layer autonomous 4WD RC vehicle powered by an **Arduino Uno** for real-time 
 │
 ├── car/                           # Pi 5 runtime — owned by perception-agent & integration-agent
 │   ├── main.py                    # Entry point: camera → detect → decide → drive
-│   ├── perception/                # YOLOv10n NCNN detector, ICM20948 IMU, 3x ultrasonic array
-│   ├── control/                   # Pi-side serial handshake & point-to-point dead reckoning
+│   ├── perception/                # YOLOv10n NCNN detector, pothole CV, zone scoring, KCF tracker
+│   ├── control/                   # Pi-side serial handshake & PID steering / navigation
 │   └── requirements.txt           # Runtime-only dependencies (picamera2, pyserial, ncnn, etc.)
 │
 ├── benchmarking/                  # Hardware benchmarking on real Pi 5 — owned by bench-agent
@@ -46,7 +46,7 @@ Two-layer autonomous 4WD RC vehicle powered by an **Arduino Uno** for real-time 
 │   └── component_tracker/         # Lab borrowing rotation tracker (15/60-day policy)
 │
 ├── docs/                          # Project documentation — owned by docs-tracker-agent
-│   ├── architecture.md            # Two-layer design rationale & power rail isolation
+│   ├── architecture.md            # Canonical system architecture, wiring, modes, priority stack
 │   └── decisions/                 # Architectural Decision Records (ADRs)
 │
 ├── AGENTS.md                      # Multi-agent role boundaries and constraints
@@ -68,13 +68,16 @@ python benchmark.py --video test_videos/dashcam_test.mp4 --imgsz 320
 ```bash
 cd car
 pip install -r requirements.txt
-python main.py
+# Run in autonomous obstacle navigation mode
+python main.py --mode autonomous
+# Or run in follow-me mode (locks onto closest person and tracks them)
+python main.py --mode follow
 ```
 
 ### C. Arduino Control Firmware
 1. Open `arduino/point_to_point_control/point_to_point_control.ino` in Arduino IDE.
 2. Select **Arduino Uno** board and correct COM/TTY port.
-3. Upload and open Serial Monitor at **9600 baud**.
+3. Upload and open Serial Monitor at **115200 baud**.
 
 ---
 

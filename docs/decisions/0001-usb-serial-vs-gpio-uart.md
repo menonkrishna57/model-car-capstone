@@ -1,11 +1,11 @@
 # ADR 0001: Serial Transport — USB-Serial vs GPIO-UART
 
-- **Status**: Proposed / Under Evaluation
-- **Deciders**: Krishna (Integration), firmware-agent, integration-agent
-- **Date**: 2026-09-08
+- **Status**: Accepted
+- **Deciders**: Krishna (Lead / Hardware / Integration), firmware-agent, integration-agent
+- **Date**: 2026-09-29 (Updated from 2026-09-08 evaluation)
 
 ## Context
-The Raspberry Pi 5 must communicate with the Arduino Uno (and later Nano) over full-duplex serial at 9600 baud. Two physical transport mechanisms exist on the chassis:
+The Raspberry Pi 5 communicates with the Arduino Uno (and later Nano) over full-duplex serial at 115200 baud. Two physical transport mechanisms exist on the chassis:
 
 1. **USB-Serial**:
    - Standard USB Type-A (Pi 5) to USB Type-B (Uno) or mini-USB (Nano) cable.
@@ -25,4 +25,4 @@ The Raspberry Pi 5 must communicate with the Arduino Uno (and later Nano) over f
 | **Physical Space** | Bulkier USB connectors | Low-profile Dupont wiring |
 
 ## Decision
-Keep transport **swappable behind `car/perception/config.py` and `car/control/motor_controller.py`**. For initial bench testing, use **USB-Serial** for simplicity and safety. Once chassis integration and clearance constraints require it, evaluate migrating to GPIO-UART with an external level shifter.
+**USB-Serial (`/dev/ttyUSB0` at 115200 baud)** is accepted as the active transport for the vehicle. It eliminates level shifting complexity and provides stable isolation. Code references remain parameterized in `car/perception/config.py` and `car/control/motor_controller.py`.
