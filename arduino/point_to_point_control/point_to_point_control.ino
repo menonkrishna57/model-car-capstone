@@ -1,20 +1,31 @@
 // =============================================================================
-// point_to_point_control.ino — Skid-Steer Control with Ultrasonic Avoidance
-// Hardware: Arduino Uno (ATmega328P) + L298N (4WD skid-steer) + 2× HC-SR04P
-// Communicates with Raspberry Pi 5 over Serial (9600 baud)
-// Protocol: arduino/PROTOCOL.md
+// point_to_point_control.ino — Autonomous RC Car Arduino Firmware
+// ================================================================
+// Hardware:  Arduino Uno (ATmega328P) + L298N 4WD skid-steer + 2× HC-SR04P
+// Pi Link:   Serial 115200 baud (USB-Serial to Raspberry Pi 5)
+// Protocol:  arduino/PROTOCOL.md  (source of truth)
+// Pins:      arduino/lib/pins.h   (source of truth)
+// Constants: arduino/lib/protocol.h (source of truth)
 //
-// Priority tiers (highest wins):
-//   Tier 1 — Pi Camera Latch (PI_STOP / PI_GO)
-//   Tier 2 — Local Ultrasonic Avoidance (reflex)
-//   Tier 3 — Normal Commands (DRIVE / REV / TURN / STOP)
+// Three-Tier Priority Stack (highest wins):
+//   Tier 1 — PI_STOP / PI_GO / PI_AVOID  (Pi camera latch — overrides everything)
+//   Tier 2 — Ultrasonic avoidance reflex  (autonomous, no Pi needed)
+//   Tier 3 — DRIVE / REV / TURN / STOP / PING  (Pi commands, normal driving)
+//
+// State machine:
+//   IDLE → DRIVING / TURNING / REVERSING  (via Tier 3 commands)
+//   DRIVING / TURNING / REVERSING → AVOIDING  (Tier 2 trigger, < 20cm)
+//   ANY → PI_STOPPED  (PI_STOP from Pi)
+//   PI_STOPPED → IDLE  (PI_GO from Pi)
+//   AVOIDING → DRIVING  (Phase 3 resume forward)
+//   DRIVING / TURNING / REVERSING → IDLE  (timer expires)
 // =============================================================================
 
 #include "../lib/pins.h"
 #include "../lib/protocol.h"
 
 // =============================================================================
-// State Machine
+// State Machine Definitions
 // =============================================================================
 
 enum CarState {
@@ -22,73 +33,63 @@ enum CarState {
   STATE_DRIVING,
   STATE_TURNING,
   STATE_REVERSING,
-  STATE_AVOIDING,       // Local ultrasonic avoidance in progress
-  STATE_PI_STOPPED      // Latched stop from Pi camera — frozen until PI_GO
+  STATE_AVOIDING,       // Tier 2 ultrasonic avoidance in progress
+  STATE_PI_STOPPED      // Tier 1 latch — frozen until PI_GO
 };
 
-// Sub-states within STATE_AVOIDING (reverse → turn → resume)
+// Avoidance sub-phases (Tier 2): Reverse → Skid-turn → Resume forward
 enum AvoidPhase {
-  AVOID_REVERSE,        // Phase 1: back up
-  AVOID_TURN,           // Phase 2: skid-turn away from obstacle
-  AVOID_RESUME          // Phase 3: resume forward briefly
+  AVOID_PHASE_REVERSE,
+  AVOID_PHASE_TURN,
+  AVOID_PHASE_RESUME
 };
 
-CarState currentState = STATE_IDLE;
-unsigned long stateStartTime  = 0;
-unsigned long stateDuration   = 0;
+// =============================================================================
+// Global State Variables
+// =============================================================================
 
-// Avoidance sub-state tracking
-AvoidPhase   avoidPhase       = AVOID_REVERSE;
+CarState     currentState    = STATE_IDLE;
+unsigned long stateStartTime = 0;
+unsigned long stateDuration  = 0;
+
+// Avoidance sub-state
+AvoidPhase   avoidPhase      = AVOID_PHASE_REVERSE;
 unsigned long avoidPhaseStart = 0;
-int          avoidTurnDir     = 0;  // +1 = turn right, -1 = turn left
+int          avoidTurnDir    = 1;    // +1 = turn right, -1 = turn left
 
-// Saved state before avoidance (to know what speed to resume at)
+// Speed at the time avoidance was triggered (restored in Phase 3 if > 0)
 int savedDriveSpeed = 0;
 
-// Pi avoid hint: +1 = right, -1 = left, 0 = no hint (Arduino decides locally)
+// PI_AVOID one-shot hint: +1 = right, -1 = left, 0 = no hint
 int piAvoidHint = 0;
 
-// Ultrasonic polling timer
-unsigned long lastUsPollTime = 0;
-float usLeftDistance  = 999.0f;
-float usRightDistance = 999.0f;
+// Ultrasonic polling
+unsigned long lastUsPollTime   = 0;
+float         usLeftDistance   = 999.0f;
+float         usRightDistance  = 999.0f;
+
+// Avoidance cooldown (suppresses re-trigger during Phase 3 resume)
+unsigned long avoidCooldownEnd = 0;
+
+// Serial watchdog (Pi silence detection)
+unsigned long lastPiRxTime     = 0;
+bool          watchdogArmed    = false;  // Only arm once we've received at least one Pi command
+
+// Serial input buffer
+char serialBuf[SERIAL_BUFFER_SIZE];
+int  serialBufLen = 0;
 
 // =============================================================================
-// Motor Control (skid-steer L298N)
+// Motor Control — Skid-Steer L298N
 // =============================================================================
 
-// Sonar polling
-#define SONAR_INTERVAL_MS 50
-unsigned long lastSonarTime = 0;
-
-// Helper to read distance in cm (with 20ms timeout ~ 3.4m max)
-long readDistanceCM(int trigPin, int echoPin) {
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-  long duration = pulseIn(echoPin, HIGH, 20000);
-  if (duration == 0) return 100; // Timeout, assume clear (100cm)
-  return duration * 0.034 / 2;
-}
-
-void pollSonar() {
-  long dLeft = readDistanceCM(PIN_TRIG_LEFT, PIN_ECHO_LEFT);
-  long dCenter = readDistanceCM(PIN_TRIG_CENTER, PIN_ECHO_CENTER);
-  long dRight = readDistanceCM(PIN_TRIG_RIGHT, PIN_ECHO_RIGHT);
-  
-  Serial.print(TELEM_PREFIX);
-  Serial.print("SONAR ");
-  Serial.print(dLeft);
-  Serial.print(" ");
-  Serial.print(dCenter);
-  Serial.print(" ");
-  Serial.println(dRight);
-}
-
+/**
+ * Set individual left/right motor speeds.
+ * Positive value = forward, negative = reverse, 0 = stop.
+ * Range: -255 to +255.
+ */
 void setMotors(int leftSpeed, int rightSpeed) {
-  // Left side direction & PWM
+  // ── Left channel (Channel A) ──────────────────────────────────────────────
   if (leftSpeed > 0) {
     digitalWrite(PIN_IN1, HIGH);
     digitalWrite(PIN_IN2, LOW);
@@ -102,7 +103,7 @@ void setMotors(int leftSpeed, int rightSpeed) {
   }
   analogWrite(PIN_ENA, constrain(leftSpeed, 0, 255));
 
-  // Right side direction & PWM
+  // ── Right channel (Channel B) ─────────────────────────────────────────────
   if (rightSpeed > 0) {
     digitalWrite(PIN_IN3, HIGH);
     digitalWrite(PIN_IN4, LOW);
@@ -117,124 +118,153 @@ void setMotors(int leftSpeed, int rightSpeed) {
   analogWrite(PIN_ENB, constrain(rightSpeed, 0, 255));
 }
 
+/** Immediately cuts all motor output. */
 void stopMotors() {
   setMotors(0, 0);
 }
 
-// Transition to IDLE and broadcast state
+/** Transition to IDLE: stop motors, reset speed, emit telemetry. */
 void goIdle() {
   stopMotors();
-  currentState = STATE_IDLE;
+  currentState    = STATE_IDLE;
   savedDriveSpeed = 0;
   Serial.print(TELEM_PREFIX);
   Serial.println("STATE=IDLE SPEED=0");
 }
 
 // =============================================================================
-// Ultrasonic Distance Reading
+// Ultrasonic Distance Measurement
 // =============================================================================
 
+/**
+ * Reads distance in cm from one HC-SR04P sensor.
+ * Returns 999.0 on timeout (no echo = open space beyond max range).
+ *
+ * ATmega328P note: pulseIn() is blocking. At 115200 baud with 100ms poll
+ * interval, each call blocks < 30ms (US_TIMEOUT_US = 30000µs). Two
+ * sensors per cycle = < 60ms worst case, well within the 100ms budget.
+ */
 float readUltrasonicCm(int trigPin, int echoPin) {
-  // Send 10µs trigger pulse
   digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
   digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  // Measure echo pulse width (timeout = US_TIMEOUT_US)
   unsigned long duration = pulseIn(echoPin, HIGH, US_TIMEOUT_US);
-
   if (duration == 0) {
-    // Timeout — no echo received, treat as max range (no obstacle)
-    return 999.0f;
+    return 999.0f;   // Timeout → no obstacle in range
   }
-
-  // Speed of sound ≈ 0.0343 cm/µs, round trip → divide by 2
+  // Speed of sound ≈ 0.0343 cm/µs; round-trip so divide by 2
   return (float)duration * 0.0343f / 2.0f;
 }
 
 // =============================================================================
-// Avoidance Maneuver (Tier 2 — Spine Reflex)
+// Tier 2 — Avoidance Maneuver (Spine Reflex)
 // =============================================================================
 
+/**
+ * Initiates a 3-phase avoidance maneuver.
+ * turnDirection: +1 = turn right (away from left obstacle),
+ *                -1 = turn left  (away from right obstacle).
+ *
+ * If a PI_AVOID hint is stored, that direction overrides the local decision
+ * (one-shot — consumed immediately).
+ */
 void startAvoidance(int turnDirection) {
-  // turnDirection: +1 = turn right (obstacle on left), -1 = turn left (obstacle on right)
-
-  // If Pi has provided a directional hint, use it instead
   if (piAvoidHint != 0) {
     turnDirection = piAvoidHint;
-    piAvoidHint = 0;  // Consume the hint (one-shot)
+    piAvoidHint   = 0;  // Consume hint
   }
 
-  avoidTurnDir = turnDirection;
-  avoidPhase = AVOID_REVERSE;
+  avoidTurnDir  = turnDirection;
+  avoidPhase    = AVOID_PHASE_REVERSE;
   avoidPhaseStart = millis();
-  currentState = STATE_AVOIDING;
+  currentState  = STATE_AVOIDING;
 
-  // Phase 1: Reverse
+  // Phase 1: Reverse at AVOID_SPEED
   setMotors(-AVOID_SPEED, -AVOID_SPEED);
 
-  // Broadcast which direction we're avoiding toward
   Serial.print(TELEM_PREFIX);
   Serial.print("AVOID ");
   Serial.println(avoidTurnDir > 0 ? "RIGHT" : "LEFT");
 }
 
+/**
+ * Advances the avoidance state machine each loop iteration.
+ * Called only while currentState == STATE_AVOIDING.
+ */
 void updateAvoidance() {
   unsigned long elapsed = millis() - avoidPhaseStart;
 
   switch (avoidPhase) {
-    case AVOID_REVERSE:
+
+    case AVOID_PHASE_REVERSE:
       if (elapsed >= AVOID_REVERSE_MS) {
-        // Transition to Phase 2: Skid-turn
-        avoidPhase = AVOID_TURN;
+        // → Phase 2: Skid-turn
+        avoidPhase    = AVOID_PHASE_TURN;
         avoidPhaseStart = millis();
         if (avoidTurnDir > 0) {
-          // Turn right: left forward, right reverse
-          setMotors(AVOID_SPEED, -AVOID_SPEED);
+          setMotors( AVOID_SPEED, -AVOID_SPEED);  // Right: left fwd, right rev
         } else {
-          // Turn left: left reverse, right forward
-          setMotors(-AVOID_SPEED, AVOID_SPEED);
+          setMotors(-AVOID_SPEED,  AVOID_SPEED);  // Left: left rev, right fwd
         }
       }
       break;
 
-    case AVOID_TURN:
+    case AVOID_PHASE_TURN:
       if (elapsed >= AVOID_TURN_MS) {
-        // Transition to Phase 3: Resume forward driving
-        avoidPhase = AVOID_RESUME;
+        // → Phase 3: Resume forward
+        avoidPhase    = AVOID_PHASE_RESUME;
+        avoidPhaseStart = millis();
         int resumeSpeed = (savedDriveSpeed > 0) ? savedDriveSpeed : AVOID_SPEED;
         setMotors(resumeSpeed, resumeSpeed);
-        currentState = STATE_DRIVING;
+        // Transition to DRIVING so timed-state machinery handles DONE DRIVE
+        currentState  = STATE_DRIVING;
         stateStartTime = millis();
-        // Give 2 seconds of forward travel after avoidance
-        stateDuration = 2000;
+        stateDuration  = AVOID_RESUME_MS;
+        // Arm cooldown so ultrasonics don't re-trigger immediately
+        avoidCooldownEnd = millis() + AVOID_COOLDOWN_MS;
         Serial.print(TELEM_PREFIX);
         Serial.println("DONE AVOID");
+        Serial.print(TELEM_PREFIX);
+        Serial.print("STATE=DRIVING SPEED=");
+        Serial.println(resumeSpeed);
       }
       break;
 
-    default:
+    case AVOID_PHASE_RESUME:
+      // Phase 3 is managed by the normal timed-state machinery
+      // (currentState = STATE_DRIVING with stateDuration = AVOID_RESUME_MS).
+      // Nothing extra to do here.
       break;
   }
 }
 
 // =============================================================================
-// Command Handler (Pi 5 → Arduino)
+// Tier 3 — Command Handler (Pi 5 → Arduino)
 // =============================================================================
 
+/**
+ * Parses and dispatches a single ASCII command line from the Pi 5.
+ * Commands are newline-terminated, whitespace-trimmed.
+ */
 void handleCommand(String cmd) {
   cmd.trim();
   if (cmd.length() == 0) return;
 
-  // ── Tier 1: Pi Camera Latch Commands ──────────────────────────────────────
+  // Reset watchdog timer on any incoming Pi message
+  lastPiRxTime  = millis();
+  watchdogArmed = true;
+
+  // ── Tier 1: Pi Camera Latch ───────────────────────────────────────────────
 
   if (cmd.startsWith("PI_STOP")) {
-    // Latched stop — overrides EVERYTHING, even mid-avoidance
+    // Latched stop — overrides EVERYTHING including mid-avoidance
     stopMotors();
-    currentState = STATE_PI_STOPPED;
+    currentState    = STATE_PI_STOPPED;
     savedDriveSpeed = 0;
+    avoidCooldownEnd = 0;  // Cancel cooldown
     Serial.print(ACK_PREFIX);
     Serial.println("PI_STOP");
     Serial.print(TELEM_PREFIX);
@@ -243,13 +273,12 @@ void handleCommand(String cmd) {
   }
 
   if (cmd.startsWith("PI_GO")) {
-    // Release Pi latch — return to idle (clean slate)
     if (currentState == STATE_PI_STOPPED) {
       goIdle();
       Serial.print(ACK_PREFIX);
       Serial.println("PI_GO");
     } else {
-      // Not in PI_STOPPED state, still acknowledge
+      // Not in PI_STOPPED — acknowledge but ignore (idempotent)
       Serial.print(ACK_PREFIX);
       Serial.println("PI_GO IGNORED (not PI_STOPPED)");
     }
@@ -257,8 +286,8 @@ void handleCommand(String cmd) {
   }
 
   if (cmd.startsWith("PI_AVOID")) {
-    // Directional hint for next avoidance maneuver
     // Format: PI_AVOID LEFT  or  PI_AVOID RIGHT
+    // One-shot hint; last hint wins if multiple are sent.
     if (cmd.indexOf("LEFT") >= 0) {
       piAvoidHint = -1;
     } else if (cmd.indexOf("RIGHT") >= 0) {
@@ -269,7 +298,7 @@ void handleCommand(String cmd) {
     return;
   }
 
-  // ── Block all Tier 3 commands while Pi latch is active ────────────────────
+  // ── Block Tier 3 commands while Pi latch is active ────────────────────────
 
   if (currentState == STATE_PI_STOPPED) {
     Serial.print(ACK_PREFIX);
@@ -277,31 +306,31 @@ void handleCommand(String cmd) {
     return;
   }
 
-  // ── Tier 3: Normal Driving Commands ───────────────────────────────────────
+  // ── Tier 3: Normal Driving Commands ──────────────────────────────────────
 
   if (cmd.startsWith("PING")) {
     Serial.print(ACK_PREFIX);
     Serial.println("PONG");
 
   } else if (cmd.startsWith("STOP")) {
-    // Non-latched stop — immediate, goes to idle
+    // Non-latched stop — immediate, returns to IDLE
     goIdle();
     Serial.print(ACK_PREFIX);
     Serial.println("STOP");
 
   } else if (cmd.startsWith("DRIVE")) {
     // Format: DRIVE <speed> <duration_ms>
-    int firstSpace = cmd.indexOf(' ');
-    int secondSpace = cmd.indexOf(' ', firstSpace + 1);
-    if (firstSpace > 0 && secondSpace > 0) {
-      int speed = cmd.substring(firstSpace + 1, secondSpace).toInt();
-      unsigned long duration = cmd.substring(secondSpace + 1).toInt();
-      speed = constrain(speed, 0, 255);
+    // A new DRIVE replaces any current timed action immediately (no queue).
+    int sp1 = cmd.indexOf(' ');
+    int sp2 = cmd.indexOf(' ', sp1 + 1);
+    if (sp1 > 0 && sp2 > 0) {
+      int          speed    = constrain(cmd.substring(sp1 + 1, sp2).toInt(), 0, 255);
+      unsigned long duration = (unsigned long)cmd.substring(sp2 + 1).toInt();
       setMotors(speed, speed);
-      currentState = STATE_DRIVING;
+      currentState    = STATE_DRIVING;
       savedDriveSpeed = speed;
-      stateStartTime = millis();
-      stateDuration = duration;
+      stateStartTime  = millis();
+      stateDuration   = duration;
       Serial.print(ACK_PREFIX);
       Serial.println(cmd);
       Serial.print(TELEM_PREFIX);
@@ -311,17 +340,16 @@ void handleCommand(String cmd) {
 
   } else if (cmd.startsWith("REV")) {
     // Format: REV <speed> <duration_ms>
-    int firstSpace = cmd.indexOf(' ');
-    int secondSpace = cmd.indexOf(' ', firstSpace + 1);
-    if (firstSpace > 0 && secondSpace > 0) {
-      int speed = cmd.substring(firstSpace + 1, secondSpace).toInt();
-      unsigned long duration = cmd.substring(secondSpace + 1).toInt();
-      speed = constrain(speed, 0, 255);
+    int sp1 = cmd.indexOf(' ');
+    int sp2 = cmd.indexOf(' ', sp1 + 1);
+    if (sp1 > 0 && sp2 > 0) {
+      int          speed    = constrain(cmd.substring(sp1 + 1, sp2).toInt(), 0, 255);
+      unsigned long duration = (unsigned long)cmd.substring(sp2 + 1).toInt();
       setMotors(-speed, -speed);
-      currentState = STATE_REVERSING;
-      savedDriveSpeed = 0;
-      stateStartTime = millis();
-      stateDuration = duration;
+      currentState    = STATE_REVERSING;
+      savedDriveSpeed = 0;  // REV doesn't set a forward resume speed
+      stateStartTime  = millis();
+      stateDuration   = duration;
       Serial.print(ACK_PREFIX);
       Serial.println(cmd);
       Serial.print(TELEM_PREFIX);
@@ -330,30 +358,31 @@ void handleCommand(String cmd) {
     }
 
   } else if (cmd.startsWith("TURN")) {
-    // Format: TURN <angle_deg> <speed> (skid-steer)
-    int firstSpace = cmd.indexOf(' ');
-    int secondSpace = cmd.indexOf(' ', firstSpace + 1);
-    if (firstSpace > 0 && secondSpace > 0) {
-      int angle = cmd.substring(firstSpace + 1, secondSpace).toInt();
-      int speed = cmd.substring(secondSpace + 1).toInt();
-      speed = constrain(speed, 0, 255);
-      // Positive angle = turn right (left fwd, right rev)
+    // Format: TURN <angle_deg> <speed>
+    // Positive angle = turn right (left fwd / right rev).
+    // Negative angle = turn left  (left rev / right fwd).
+    // Duration is derived from TURN_MS_PER_DEGREE (calibrate on real chassis).
+    int sp1 = cmd.indexOf(' ');
+    int sp2 = cmd.indexOf(' ', sp1 + 1);
+    if (sp1 > 0 && sp2 > 0) {
+      int angle = cmd.substring(sp1 + 1, sp2).toInt();
+      int speed = constrain(cmd.substring(sp2 + 1).toInt(), 0, 255);
       if (angle > 0) {
-        setMotors(speed, -speed);
+        setMotors( speed, -speed);   // Turn right: left fwd, right rev
       } else {
-        setMotors(-speed, speed);
+        setMotors(-speed,  speed);   // Turn left: left rev, right fwd
       }
-      currentState = STATE_TURNING;
+      currentState    = STATE_TURNING;
       savedDriveSpeed = 0;
-      stateStartTime = millis();
-      // Calibrated duration placeholder: abs(angle) * 10 ms
-      stateDuration = (unsigned long)abs(angle) * 10;
+      stateStartTime  = millis();
+      stateDuration   = (unsigned long)abs(angle) * TURN_MS_PER_DEGREE;
       Serial.print(ACK_PREFIX);
       Serial.println(cmd);
       Serial.print(TELEM_PREFIX);
       Serial.println("STATE=TURNING");
     }
   }
+  // Unknown command: silently ignore (no ACK noise for malformed lines)
 }
 
 // =============================================================================
@@ -363,7 +392,7 @@ void handleCommand(String cmd) {
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
 
-  // Motor pins
+  // Motor output pins
   pinMode(PIN_ENA, OUTPUT);
   pinMode(PIN_IN1, OUTPUT);
   pinMode(PIN_IN2, OUTPUT);
@@ -377,40 +406,80 @@ void setup() {
   pinMode(PIN_US_RIGHT_TRIG, OUTPUT);
   pinMode(PIN_US_RIGHT_ECHO, INPUT);
 
+  // IR proximity sensors (reserved; may be scrapped)
+  pinMode(PIN_IR1, INPUT);
+  pinMode(PIN_IR2, INPUT);
+
+  // Ensure all trigger lines start LOW (HC-SR04P spec)
+  digitalWrite(PIN_US_LEFT_TRIG,  LOW);
+  digitalWrite(PIN_US_RIGHT_TRIG, LOW);
+
   stopMotors();
 
+  lastPiRxTime = millis();  // Initialise watchdog clock
+
+  // Boot announcement — Pi SensorManager listens for this line
   Serial.print(TELEM_PREFIX);
   Serial.println("READY Uno-ATmega328P");
 }
 
 // =============================================================================
-// Main Loop — Priority-driven execution
+// Main Loop — Priority-Driven Execution
 // =============================================================================
 
 void loop() {
-  // ── 1. Read serial commands from Pi 5 (or Serial Monitor) ─────────────────
 
-  if (Serial.available() > 0) {
-    String cmd = Serial.readStringUntil('\n');
-    handleCommand(cmd);
+  // ── 1. Read serial command from Pi 5 (or Serial Monitor for bench tests) ──
+  //
+  // Use a manual byte-by-byte buffer instead of Serial.readStringUntil() so
+  // that the loop is non-blocking. Serial.readStringUntil() has an internal
+  // timeout that stalls the MCU and can delay ultrasonic polling.
+
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialBufLen > 0) {
+        serialBuf[serialBufLen] = '\0';
+        handleCommand(String(serialBuf));
+        serialBufLen = 0;
+      }
+    } else if (serialBufLen < SERIAL_BUFFER_SIZE - 1) {
+      serialBuf[serialBufLen++] = c;
+    }
+    // Overflow: silently discard extra characters; buffer resets on next '\n'
   }
 
-<<<<<<< HEAD
-  // ── 2. Tier 1 check: If Pi latch is active, do nothing else ───────────────
+  // ── 2. Tier 1 check: If Pi latch active, motors stay frozen ───────────────
 
   if (currentState == STATE_PI_STOPPED) {
-    return;  // Frozen. Only PI_GO (via serial above) can release.
+    // Serial watchdog is deliberately not active while PI_STOPPED —
+    // the Pi intentionally latched us; we shouldn't self-release.
+    return;
   }
 
-  // ── 3. Tier 2: Ultrasonic polling & avoidance ─────────────────────────────
+  // ── 3. Serial Watchdog: safe-stop if Pi goes silent while driving ─────────
 
-  // If currently in an avoidance maneuver, run the avoidance FSM
+#if WATCHDOG_TIMEOUT_MS > 0
+  if (watchdogArmed &&
+      (currentState == STATE_DRIVING || currentState == STATE_TURNING || currentState == STATE_REVERSING)) {
+    if (millis() - lastPiRxTime >= WATCHDOG_TIMEOUT_MS) {
+      goIdle();
+      Serial.print(TELEM_PREFIX);
+      Serial.println("HEARTBEAT_TIMEOUT");
+      watchdogArmed = false;  // Disarm until next Pi command
+      return;
+    }
+  }
+#endif
+
+  // ── 4. Tier 2: Ultrasonic polling & avoidance ─────────────────────────────
+
+  // If currently executing an avoidance maneuver, advance the FSM
   if (currentState == STATE_AVOIDING) {
     updateAvoidance();
-    return;  // Don't poll ultrasonics during an active avoidance maneuver
+    return;  // Don't poll sensors while avoidance FSM runs (avoid re-entry)
   }
 
-  // Poll ultrasonics at regular intervals
   unsigned long now = millis();
   if (now - lastUsPollTime >= US_PING_INTERVAL_MS) {
     lastUsPollTime = now;
@@ -418,58 +487,46 @@ void loop() {
     usLeftDistance  = readUltrasonicCm(PIN_US_LEFT_TRIG, PIN_US_LEFT_ECHO);
     usRightDistance = readUltrasonicCm(PIN_US_RIGHT_TRIG, PIN_US_RIGHT_ECHO);
 
-    // Broadcast ultrasonic telemetry to Pi
+    // Broadcast telemetry — format matches PROTOCOL.md §3
     Serial.print(TELEM_PREFIX);
     Serial.print("US LEFT=");
     Serial.print(usLeftDistance, 1);
     Serial.print(" RIGHT=");
     Serial.println(usRightDistance, 1);
 
-    // Check for obstacle — only trigger avoidance while actively moving
-    if (currentState == STATE_DRIVING || currentState == STATE_REVERSING ||
-        currentState == STATE_TURNING) {
+    // Trigger avoidance only while actively moving and outside cooldown window
+    bool coolingDown = (now < avoidCooldownEnd);
+    if (!coolingDown &&
+        (currentState == STATE_DRIVING || currentState == STATE_TURNING || currentState == STATE_REVERSING)) {
+
       bool leftBlocked  = (usLeftDistance  < US_OBSTACLE_DISTANCE_CM);
       bool rightBlocked = (usRightDistance < US_OBSTACLE_DISTANCE_CM);
 
       if (leftBlocked && rightBlocked) {
-        // Both sides blocked — reverse and turn right (arbitrary default)
+        // Both blocked: default turn right (arbitrary), Pi_AVOID hint overrides
         startAvoidance(1);
         return;
       } else if (leftBlocked) {
-        // Obstacle on left — turn right
+        // Obstacle on left → turn right to avoid
         startAvoidance(1);
         return;
       } else if (rightBlocked) {
-        // Obstacle on right — turn left
+        // Obstacle on right → turn left to avoid
         startAvoidance(-1);
         return;
       }
     }
   }
 
-  // ── 4. Tier 3: Handle timed state transitions for normal commands ─────────
+  // ── 5. Tier 3: Timed-state expiry for normal driving commands ─────────────
 
-  if (currentState == STATE_DRIVING || currentState == STATE_TURNING ||
-      currentState == STATE_REVERSING) {
-=======
-  // Poll ultrasonics at intervals
-  if (millis() - lastSonarTime >= SONAR_INTERVAL_MS) {
-    lastSonarTime = millis();
-    pollSonar();
-  }
-
-  // Handle timed state transitions
-  if (currentState != STATE_IDLE) {
->>>>>>> 65f0686ad95bd14e8d070b79ea17d2129212f935
+  if (currentState == STATE_DRIVING || currentState == STATE_TURNING || currentState == STATE_REVERSING) {
     if (millis() - stateStartTime >= stateDuration) {
+      // Emit the appropriate DONE message before going idle
       Serial.print(TELEM_PREFIX);
-      if (currentState == STATE_DRIVING) {
-        Serial.println("DONE DRIVE");
-      } else if (currentState == STATE_TURNING) {
-        Serial.println("DONE TURN");
-      } else {
-        Serial.println("DONE REV");
-      }
+      if      (currentState == STATE_DRIVING)   Serial.println("DONE DRIVE");
+      else if (currentState == STATE_TURNING)   Serial.println("DONE TURN");
+      else if (currentState == STATE_REVERSING) Serial.println("DONE REV");
       goIdle();
     }
   }
