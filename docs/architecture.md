@@ -726,11 +726,18 @@ The Arduino firmware maintains **no command queue**:
 
 ## 12. Open Items & Decisions Needed
 
+> [!NOTE]
+> For the complete analysis of architectural edge cases, design trade-offs, and prioritized implementation/calibration roadmap, see:
+> **[concerns_and_future_todos.md](concerns_and_future_todos.md)**
+
 | # | Item | Owner | Status |
 |---|---|---|---|
 | 1 | **Execute the 4-wire PWM migration** (Section 3c) | Krishna (hardware) | ⏳ Pending — hardware not changed yet |
 | 2 | **Update `pins.h`** to match target pin map after migration | firmware-agent | Blocked by #1 |
 | 3 | **IR sensor decision** — keep or scrap the 2× IR proximity sensors? | Krishna | Leaning towards scrapping |
+| 4 | **TURN command calibration** — derive `TURN_MS_PER_DEGREE` on physical chassis | firmware-agent | Documented in `concerns_and_future_todos.md` |
+| 5 | **Continuous PID vs timed TURN** — evaluate Differential DRIVE vs Micro-TURNs | integration-agent | Documented in `concerns_and_future_todos.md` |
+| 6 | **IMU-aided post-avoidance heading recovery** | integration-agent | Documented in `concerns_and_future_todos.md` |
 
 ### Resolved Decisions
 
@@ -739,6 +746,8 @@ The Arduino firmware maintains **no command queue**:
 | Ultrasonic pin assignment | Use RF guide as current baseline; target architecture after PWM migration | 2026-09-29 |
 | Transport | **USB-Serial** (Pi USB-A → Arduino USB-B) | 2026-09-29 |
 | Avoidance timing | **Configurable** via `AVOID_REVERSE_MS`, `AVOID_TURN_MS`, `AVOID_RESUME_MS`, `AVOID_SPEED` in `protocol.h` | 2026-09-29 |
+| Avoidance loop prevention | **`AVOID_COOLDOWN_MS` (500ms)** suppresses re-trigger during resume | 2026-09-29 |
+| Serial watchdog | **`WATCHDOG_TIMEOUT_MS` (5000ms)** with `[TELEM] HEARTBEAT_TIMEOUT` | 2026-09-29 |
 | Baud rate | **115200** (updated from older 9600 baseline) | 2026-09-29 |
 | Motor count | 4× TT motors in 2 L298N channels (skid-steer) | 2026-09-29 |
 | Operating modes | Autonomous navigation vs Follow-Me with owner feature profiling | 2026-09-29 |

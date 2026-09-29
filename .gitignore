@@ -41,6 +41,7 @@ env/
 # IDE and editor files
 .vscode/
 .idea/
+.agent/
 *.swp
 *.swo
 *~
