@@ -26,9 +26,10 @@ CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
 
-# ── Ultrasonic Array (3× HC-SR04P, 3.3V/5V compatible) ───────────────────────
-# Hardware ownership moved to Arduino Uno to avoid Pi OS jitter. 
-# Distances are received via [TELEM] SONAR serial messages.
+# ── Ultrasonic Sensors (2× HC-SR04P, both front-facing) ──────────────────────
+# Polling is owned by the Arduino Uno to avoid Pi OS GPIO jitter.
+# Distances are received as '[TELEM] US LEFT=x RIGHT=y' serial messages
+# (parsed by MotorController.read_telemetry → SensorManager.read_ultrasonic).
 EMERGENCY_STOP_DISTANCE_CM = 20.0      # Stop immediately if obstacle closer than 20cm
 
 # ── IMU (ICM20948 over I2C) ──────────────────────────────────────────────────
