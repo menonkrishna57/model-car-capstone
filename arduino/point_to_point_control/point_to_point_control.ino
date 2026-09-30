@@ -1,28 +1,28 @@
-// =============================================================================
-// point_to_point_control.ino — Autonomous RC Car Arduino Firmware
+﻿// =============================================================================
+// point_to_point_control.ino â€” Autonomous RC Car Arduino Firmware
 // ================================================================
-// Hardware:  Arduino Uno (ATmega328P) + L298N 4WD skid-steer + 2× HC-SR04P
+// Hardware:  Arduino Uno (ATmega328P) + L298N 4WD skid-steer + 2Ã— HC-SR04P
 // Pi Link:   Serial 115200 baud (USB-Serial to Raspberry Pi 5)
 // Protocol:  arduino/PROTOCOL.md  (source of truth)
 // Pins:      arduino/lib/pins.h   (source of truth)
 // Constants: arduino/lib/protocol.h (source of truth)
 //
 // Three-Tier Priority Stack (highest wins):
-//   Tier 1 — PI_STOP / PI_GO / PI_AVOID  (Pi camera latch — overrides everything)
-//   Tier 2 — Ultrasonic avoidance reflex  (autonomous, no Pi needed)
-//   Tier 3 — DRIVE / REV / TURN / STOP / PING  (Pi commands, normal driving)
+//   Tier 1 â€” PI_STOP / PI_GO / PI_AVOID  (Pi camera latch â€” overrides everything)
+//   Tier 2 â€” Ultrasonic avoidance reflex  (autonomous, no Pi needed)
+//   Tier 3 â€” DRIVE / REV / TURN / STOP / PING  (Pi commands, normal driving)
 //
 // State machine:
-//   IDLE → DRIVING / TURNING / REVERSING  (via Tier 3 commands)
-//   DRIVING / TURNING / REVERSING → AVOIDING  (Tier 2 trigger, < 20cm)
-//   ANY → PI_STOPPED  (PI_STOP from Pi)
-//   PI_STOPPED → IDLE  (PI_GO from Pi)
-//   AVOIDING → DRIVING  (Phase 3 resume forward)
-//   DRIVING / TURNING / REVERSING → IDLE  (timer expires)
+//   IDLE â†’ DRIVING / TURNING / REVERSING  (via Tier 3 commands)
+//   DRIVING / TURNING / REVERSING â†’ AVOIDING  (Tier 2 trigger, < 20cm)
+//   ANY â†’ PI_STOPPED  (PI_STOP from Pi)
+//   PI_STOPPED â†’ IDLE  (PI_GO from Pi)
+//   AVOIDING â†’ DRIVING  (Phase 3 resume forward)
+//   DRIVING / TURNING / REVERSING â†’ IDLE  (timer expires)
 // =============================================================================
 
-#include "../lib/pins.h"
-#include "../lib/protocol.h"
+#include "pins.h"
+#include "protocol.h"
 
 // =============================================================================
 // State Machine Definitions
@@ -34,10 +34,10 @@ enum CarState {
   STATE_TURNING,
   STATE_REVERSING,
   STATE_AVOIDING,       // Tier 2 ultrasonic avoidance in progress
-  STATE_PI_STOPPED      // Tier 1 latch — frozen until PI_GO
+  STATE_PI_STOPPED      // Tier 1 latch â€” frozen until PI_GO
 };
 
-// Avoidance sub-phases (Tier 2): Reverse → Skid-turn → Resume forward
+// Avoidance sub-phases (Tier 2): Reverse â†’ Skid-turn â†’ Resume forward
 enum AvoidPhase {
   AVOID_PHASE_REVERSE,
   AVOID_PHASE_TURN,
@@ -80,7 +80,7 @@ char serialBuf[SERIAL_BUFFER_SIZE];
 int  serialBufLen = 0;
 
 // =============================================================================
-// Motor Control — Skid-Steer L298N
+// Motor Control â€” Skid-Steer L298N
 // =============================================================================
 
 /**
@@ -89,7 +89,7 @@ int  serialBufLen = 0;
  * Range: -255 to +255.
  */
 void setMotors(int leftSpeed, int rightSpeed) {
-  // ── Left channel (Channel A) ──────────────────────────────────────────────
+  // â”€â”€ Left channel (Channel A) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (leftSpeed > 0) {
     digitalWrite(PIN_IN1, HIGH);
     digitalWrite(PIN_IN2, LOW);
@@ -103,7 +103,7 @@ void setMotors(int leftSpeed, int rightSpeed) {
   }
   analogWrite(PIN_ENA, constrain(leftSpeed, 0, 255));
 
-  // ── Right channel (Channel B) ─────────────────────────────────────────────
+  // â”€â”€ Right channel (Channel B) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (rightSpeed > 0) {
     digitalWrite(PIN_IN3, HIGH);
     digitalWrite(PIN_IN4, LOW);
@@ -141,7 +141,7 @@ void goIdle() {
  * Returns 999.0 on timeout (no echo = open space beyond max range).
  *
  * ATmega328P note: pulseIn() is blocking. At 115200 baud with 100ms poll
- * interval, each call blocks < 30ms (US_TIMEOUT_US = 30000µs). Two
+ * interval, each call blocks < 30ms (US_TIMEOUT_US = 30000Âµs). Two
  * sensors per cycle = < 60ms worst case, well within the 100ms budget.
  */
 float readUltrasonicCm(int trigPin, int echoPin) {
@@ -153,14 +153,14 @@ float readUltrasonicCm(int trigPin, int echoPin) {
 
   unsigned long duration = pulseIn(echoPin, HIGH, US_TIMEOUT_US);
   if (duration == 0) {
-    return 999.0f;   // Timeout → no obstacle in range
+    return 999.0f;   // Timeout â†’ no obstacle in range
   }
-  // Speed of sound ≈ 0.0343 cm/µs; round-trip so divide by 2
+  // Speed of sound â‰ˆ 0.0343 cm/Âµs; round-trip so divide by 2
   return (float)duration * 0.0343f / 2.0f;
 }
 
 // =============================================================================
-// Tier 2 — Avoidance Maneuver (Spine Reflex)
+// Tier 2 â€” Avoidance Maneuver (Spine Reflex)
 // =============================================================================
 
 /**
@@ -169,7 +169,7 @@ float readUltrasonicCm(int trigPin, int echoPin) {
  *                -1 = turn left  (away from right obstacle).
  *
  * If a PI_AVOID hint is stored, that direction overrides the local decision
- * (one-shot — consumed immediately).
+ * (one-shot â€” consumed immediately).
  */
 void startAvoidance(int turnDirection) {
   if (piAvoidHint != 0) {
@@ -201,7 +201,7 @@ void updateAvoidance() {
 
     case AVOID_PHASE_REVERSE:
       if (elapsed >= AVOID_REVERSE_MS) {
-        // → Phase 2: Skid-turn
+        // â†’ Phase 2: Skid-turn
         avoidPhase    = AVOID_PHASE_TURN;
         avoidPhaseStart = millis();
         if (avoidTurnDir > 0) {
@@ -214,7 +214,7 @@ void updateAvoidance() {
 
     case AVOID_PHASE_TURN:
       if (elapsed >= AVOID_TURN_MS) {
-        // → Phase 3: Resume forward
+        // â†’ Phase 3: Resume forward
         avoidPhase    = AVOID_PHASE_RESUME;
         avoidPhaseStart = millis();
         int resumeSpeed = (savedDriveSpeed > 0) ? savedDriveSpeed : AVOID_SPEED;
@@ -242,7 +242,7 @@ void updateAvoidance() {
 }
 
 // =============================================================================
-// Tier 3 — Command Handler (Pi 5 → Arduino)
+// Tier 3 â€” Command Handler (Pi 5 â†’ Arduino)
 // =============================================================================
 
 /**
@@ -257,10 +257,10 @@ void handleCommand(String cmd) {
   lastPiRxTime  = millis();
   watchdogArmed = true;
 
-  // ── Tier 1: Pi Camera Latch ───────────────────────────────────────────────
+  // â”€â”€ Tier 1: Pi Camera Latch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   if (cmd.startsWith("PI_STOP")) {
-    // Latched stop — overrides EVERYTHING including mid-avoidance
+    // Latched stop â€” overrides EVERYTHING including mid-avoidance
     stopMotors();
     currentState    = STATE_PI_STOPPED;
     savedDriveSpeed = 0;
@@ -278,7 +278,7 @@ void handleCommand(String cmd) {
       Serial.print(ACK_PREFIX);
       Serial.println("PI_GO");
     } else {
-      // Not in PI_STOPPED — acknowledge but ignore (idempotent)
+      // Not in PI_STOPPED â€” acknowledge but ignore (idempotent)
       Serial.print(ACK_PREFIX);
       Serial.println("PI_GO IGNORED (not PI_STOPPED)");
     }
@@ -298,7 +298,7 @@ void handleCommand(String cmd) {
     return;
   }
 
-  // ── Block Tier 3 commands while Pi latch is active ────────────────────────
+  // â”€â”€ Block Tier 3 commands while Pi latch is active â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   if (currentState == STATE_PI_STOPPED) {
     Serial.print(ACK_PREFIX);
@@ -306,14 +306,14 @@ void handleCommand(String cmd) {
     return;
   }
 
-  // ── Tier 3: Normal Driving Commands ──────────────────────────────────────
+  // â”€â”€ Tier 3: Normal Driving Commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   if (cmd.startsWith("PING")) {
     Serial.print(ACK_PREFIX);
     Serial.println("PONG");
 
   } else if (cmd.startsWith("STOP")) {
-    // Non-latched stop — immediate, returns to IDLE
+    // Non-latched stop â€” immediate, returns to IDLE
     goIdle();
     Serial.print(ACK_PREFIX);
     Serial.println("STOP");
@@ -418,18 +418,18 @@ void setup() {
 
   lastPiRxTime = millis();  // Initialise watchdog clock
 
-  // Boot announcement — Pi SensorManager listens for this line
+  // Boot announcement â€” Pi SensorManager listens for this line
   Serial.print(TELEM_PREFIX);
   Serial.println("READY Uno-ATmega328P");
 }
 
 // =============================================================================
-// Main Loop — Priority-Driven Execution
+// Main Loop â€” Priority-Driven Execution
 // =============================================================================
 
 void loop() {
 
-  // ── 1. Read serial command from Pi 5 (or Serial Monitor for bench tests) ──
+  // â”€â”€ 1. Read serial command from Pi 5 (or Serial Monitor for bench tests) â”€â”€
   //
   // Use a manual byte-by-byte buffer instead of Serial.readStringUntil() so
   // that the loop is non-blocking. Serial.readStringUntil() has an internal
@@ -449,15 +449,15 @@ void loop() {
     // Overflow: silently discard extra characters; buffer resets on next '\n'
   }
 
-  // ── 2. Tier 1 check: If Pi latch active, motors stay frozen ───────────────
+  // â”€â”€ 2. Tier 1 check: If Pi latch active, motors stay frozen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   if (currentState == STATE_PI_STOPPED) {
-    // Serial watchdog is deliberately not active while PI_STOPPED —
+    // Serial watchdog is deliberately not active while PI_STOPPED â€”
     // the Pi intentionally latched us; we shouldn't self-release.
     return;
   }
 
-  // ── 3. Serial Watchdog: safe-stop if Pi goes silent while driving ─────────
+  // â”€â”€ 3. Serial Watchdog: safe-stop if Pi goes silent while driving â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #if WATCHDOG_TIMEOUT_MS > 0
   if (watchdogArmed &&
@@ -472,7 +472,7 @@ void loop() {
   }
 #endif
 
-  // ── 4. Tier 2: Ultrasonic polling & avoidance ─────────────────────────────
+  // â”€â”€ 4. Tier 2: Ultrasonic polling & avoidance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   // If currently executing an avoidance maneuver, advance the FSM
   if (currentState == STATE_AVOIDING) {
@@ -487,7 +487,7 @@ void loop() {
     usLeftDistance  = readUltrasonicCm(PIN_US_LEFT_TRIG, PIN_US_LEFT_ECHO);
     usRightDistance = readUltrasonicCm(PIN_US_RIGHT_TRIG, PIN_US_RIGHT_ECHO);
 
-    // Broadcast telemetry — format matches PROTOCOL.md §3
+    // Broadcast telemetry â€” format matches PROTOCOL.md Â§3
     Serial.print(TELEM_PREFIX);
     Serial.print("US LEFT=");
     Serial.print(usLeftDistance, 1);
@@ -507,18 +507,18 @@ void loop() {
         startAvoidance(1);
         return;
       } else if (leftBlocked) {
-        // Obstacle on left → turn right to avoid
+        // Obstacle on left â†’ turn right to avoid
         startAvoidance(1);
         return;
       } else if (rightBlocked) {
-        // Obstacle on right → turn left to avoid
+        // Obstacle on right â†’ turn left to avoid
         startAvoidance(-1);
         return;
       }
     }
   }
 
-  // ── 5. Tier 3: Timed-state expiry for normal driving commands ─────────────
+  // â”€â”€ 5. Tier 3: Timed-state expiry for normal driving commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   if (currentState == STATE_DRIVING || currentState == STATE_TURNING || currentState == STATE_REVERSING) {
     if (millis() - stateStartTime >= stateDuration) {
