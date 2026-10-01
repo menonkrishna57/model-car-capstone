@@ -1,3 +1,18 @@
+﻿/**
+ * motor_test.ino (Legacy Single-Motor Test)
+ * =============================================================================
+ * NOTICE:
+ * To avoid "redefinition of setup() / loop()" compilation errors in Arduino IDE,
+ * the old single-motor test below is disabled.
+ *
+ * For the complete dual-motor and PWM speed test, see:
+ *   -> dual_motor_speed_test.ino (included in this sketch folder)
+ *   -> or open arduino/dual_motor_speed_test/dual_motor_speed_test.ino
+ * =============================================================================
+ */
+
+#if 0
+// --- LEGACY SINGLE MOTOR TEST (ARCHIVED) ---
 const int IN1 = 8;
 const int IN2 = 9;
 const int ENA = 5;
@@ -37,3 +52,4 @@ void loop() {
 
   Serial.println("--- loop restarting ---");
 }
+#endif
