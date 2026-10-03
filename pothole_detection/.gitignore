@@ -1,0 +1,13 @@
+# Ignore raw Kaggle datasets and temporary YOLO caches
+train/
+rdd_yolo_dataset/
+*.cache
+labels.cache
+
+# Ignore long 2-minute raw/annotated videos (only 30s clips tracked)
+test_video.mp4
+annotated_video.mp4
+
+# Python bytecode
+__pycache__/
+*.py[cod]
