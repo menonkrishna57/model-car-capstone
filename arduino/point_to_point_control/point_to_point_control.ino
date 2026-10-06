@@ -1,4 +1,4 @@
-﻿// =============================================================================
+// =============================================================================
 // point_to_point_control.ino â€” Autonomous RC Car Arduino Firmware
 // ================================================================
 // Hardware:  Arduino Uno (ATmega328P) + L298N 4WD skid-steer + 2Ã— HC-SR04P
@@ -89,33 +89,33 @@ int  serialBufLen = 0;
  * Range: -255 to +255.
  */
 void setMotors(int leftSpeed, int rightSpeed) {
-  // â”€â”€ Left channel (Channel A) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Left channel (Channel B: ENB=6, IN3=10, IN4=11) ───────────────────────
   if (leftSpeed > 0) {
-    digitalWrite(PIN_IN1, HIGH);
-    digitalWrite(PIN_IN2, LOW);
+    digitalWrite(PIN_LEFT_IN1, HIGH);
+    digitalWrite(PIN_LEFT_IN2, LOW);
   } else if (leftSpeed < 0) {
-    digitalWrite(PIN_IN1, LOW);
-    digitalWrite(PIN_IN2, HIGH);
+    digitalWrite(PIN_LEFT_IN1, LOW);
+    digitalWrite(PIN_LEFT_IN2, HIGH);
     leftSpeed = -leftSpeed;
   } else {
-    digitalWrite(PIN_IN1, LOW);
-    digitalWrite(PIN_IN2, LOW);
+    digitalWrite(PIN_LEFT_IN1, LOW);
+    digitalWrite(PIN_LEFT_IN2, LOW);
   }
-  analogWrite(PIN_ENA, constrain(leftSpeed, 0, 255));
+  analogWrite(PIN_LEFT_PWM, constrain(leftSpeed, 0, 255));
 
-  // â”€â”€ Right channel (Channel B) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Right channel (Channel A: ENA=5, IN1=8, IN2=9) ────────────────────────
   if (rightSpeed > 0) {
-    digitalWrite(PIN_IN3, HIGH);
-    digitalWrite(PIN_IN4, LOW);
+    digitalWrite(PIN_RIGHT_IN1, HIGH);
+    digitalWrite(PIN_RIGHT_IN2, LOW);
   } else if (rightSpeed < 0) {
-    digitalWrite(PIN_IN3, LOW);
-    digitalWrite(PIN_IN4, HIGH);
+    digitalWrite(PIN_RIGHT_IN1, LOW);
+    digitalWrite(PIN_RIGHT_IN2, HIGH);
     rightSpeed = -rightSpeed;
   } else {
-    digitalWrite(PIN_IN3, LOW);
-    digitalWrite(PIN_IN4, LOW);
+    digitalWrite(PIN_RIGHT_IN1, LOW);
+    digitalWrite(PIN_RIGHT_IN2, LOW);
   }
-  analogWrite(PIN_ENB, constrain(rightSpeed, 0, 255));
+  analogWrite(PIN_RIGHT_PWM, constrain(rightSpeed, 0, 255));
 }
 
 /** Immediately cuts all motor output. */
@@ -392,13 +392,13 @@ void handleCommand(String cmd) {
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
 
-  // Motor output pins
-  pinMode(PIN_ENA, OUTPUT);
-  pinMode(PIN_IN1, OUTPUT);
-  pinMode(PIN_IN2, OUTPUT);
-  pinMode(PIN_ENB, OUTPUT);
-  pinMode(PIN_IN3, OUTPUT);
-  pinMode(PIN_IN4, OUTPUT);
+  // Motor output pins (Channel B = Left, Channel A = Right)
+  pinMode(PIN_LEFT_PWM,  OUTPUT);
+  pinMode(PIN_LEFT_IN1,  OUTPUT);
+  pinMode(PIN_LEFT_IN2,  OUTPUT);
+  pinMode(PIN_RIGHT_PWM, OUTPUT);
+  pinMode(PIN_RIGHT_IN1, OUTPUT);
+  pinMode(PIN_RIGHT_IN2, OUTPUT);
 
   // Ultrasonic pins
   pinMode(PIN_US_LEFT_TRIG,  OUTPUT);

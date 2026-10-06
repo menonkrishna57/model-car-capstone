@@ -1,4 +1,4 @@
-﻿/**
+/**
  * pins.h — Arduino Uno (ATmega328P) Pin Mapping
  * ===============================================
  * Single source of truth for all pin assignments.
@@ -15,20 +15,32 @@
 #define CAR_PINS_H
 
 // =============================================================================
-// Left Motor Pair — Channel A (FL + RL motors)
-// L298N: IN1 / IN2 control direction; ENA controls PWM speed (0–255)
+// Motor Driver (L298N) Pin Assignments — Skid-Steer Pairing
+// -----------------------------------------------------------------------------
+// On this chassis:
+//   - Channel A (OUT1/OUT2) drives the RIGHT Motor Pair (FR + RR motors)
+//   - Channel B (OUT3/OUT4) drives the LEFT Motor Pair (FL + RL motors)
 // =============================================================================
-const int PIN_ENA = 5;    // ENA: PWM speed control (Timer0/OC0B) — wired to D5 ✅
-const int PIN_IN1 = 8;    // IN1: Direction bit 1 — HIGH = forward
-const int PIN_IN2 = 9;    // IN2: Direction bit 2 — HIGH = reverse
 
-// =============================================================================
-// Right Motor Pair — Channel B (FR + RR motors)
+// Right Motor Pair — Channel A (FR + RR motors)
+// L298N: IN1 / IN2 control direction; ENA controls PWM speed (0–255)
+const int PIN_RIGHT_PWM = 5;   // ENA: PWM speed control (Timer0/OC0B) — wired to D5 ✅
+const int PIN_RIGHT_IN1 = 8;   // IN1: Direction bit 1 — HIGH = forward
+const int PIN_RIGHT_IN2 = 9;   // IN2: Direction bit 2 — HIGH = reverse
+
+// Left Motor Pair — Channel B (FL + RL motors)
 // L298N: IN3 / IN4 control direction; ENB controls PWM speed (0–255)
-// =============================================================================
-const int PIN_ENB = 6;    // ENB: PWM speed control (Timer0/OC0A) — wired to D6 ✅
-const int PIN_IN3 = 10;   // IN3: Direction bit 1 — HIGH = forward
-const int PIN_IN4 = 11;   // IN4: Direction bit 2 — HIGH = reverse
+const int PIN_LEFT_PWM  = 6;   // ENB: PWM speed control (Timer0/OC0A) — wired to D6 ✅
+const int PIN_LEFT_IN1  = 10;  // IN3: Direction bit 1 — HIGH = forward
+const int PIN_LEFT_IN2  = 11;  // IN4: Direction bit 2 — HIGH = reverse
+
+// Hardware pin aliases (retaining L298N pin names)
+const int PIN_ENA = PIN_RIGHT_PWM;
+const int PIN_IN1 = PIN_RIGHT_IN1;
+const int PIN_IN2 = PIN_RIGHT_IN2;
+const int PIN_ENB = PIN_LEFT_PWM;
+const int PIN_IN3 = PIN_LEFT_IN1;
+const int PIN_IN4 = PIN_LEFT_IN2;
 
 // =============================================================================
 // Ultrasonic Sensors — 2× HC-SR04P, both front-facing

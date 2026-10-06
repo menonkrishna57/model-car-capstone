@@ -1,19 +1,19 @@
-﻿/**
+/**
  * dual_motor_speed_test.ino
  * =============================================================================
  * Dual Motor & PWM Speed Control Diagnostic Sketch
  * 
  * Hardware Setup (L298N Dual H-Bridge & Arduino Uno):
  * ---------------------------------------------------
- *   LEFT MOTOR (Channel A):
- *     - ENA: Pin D5  (PWM Speed: 0 - 255)
- *     - IN1: Pin D8  (Direction bit 1: HIGH = Forward)
- *     - IN2: Pin D9  (Direction bit 2: HIGH = Reverse)
+ *   LEFT MOTOR (Channel B):
+ *     - PWM (ENB): Pin D6  (PWM Speed: 0 - 255)
+ *     - IN3:       Pin D10 (Direction bit 1: HIGH = Forward)
+ *     - IN4:       Pin D11 (Direction bit 2: HIGH = Reverse)
  * 
- *   RIGHT MOTOR (Channel B):
- *     - ENB: Pin D6  (PWM Speed: 0 - 255)
- *     - IN3: Pin D10 (Direction bit 1: HIGH = Forward)
- *     - IN4: Pin D11 (Direction bit 2: HIGH = Reverse)
+ *   RIGHT MOTOR (Channel A):
+ *     - PWM (ENA): Pin D5  (PWM Speed: 0 - 255)
+ *     - IN1:       Pin D8  (Direction bit 1: HIGH = Forward)
+ *     - IN2:       Pin D9  (Direction bit 2: HIGH = Reverse)
  * 
  * Test Features:
  * --------------
@@ -33,47 +33,49 @@
  * =============================================================================
  */
 
-// Pin Definitions (Matches pins.h single source of truth)
-const int PIN_ENA = 5;   // Left Motor PWM (Timer0/OC0B)
-const int PIN_IN1 = 8;   // Left Motor Dir 1
-const int PIN_IN2 = 9;   // Left Motor Dir 2
+// Pin Definitions (Matches physical chassis wiring and pins.h):
+// Left Motor Pair  -> L298N Channel B: ENB = D6, IN3 = D10, IN4 = D11
+// Right Motor Pair -> L298N Channel A: ENA = D5, IN1 = D8,  IN2 = D9
+const int PIN_LEFT_PWM  = 6;   // L298N ENB (Timer0/OC0A)
+const int PIN_LEFT_IN1  = 10;  // L298N IN3 (Dir bit 1)
+const int PIN_LEFT_IN2  = 11;  // L298N IN4 (Dir bit 2)
 
-const int PIN_ENB = 6;   // Right Motor PWM (Timer0/OC0A)
-const int PIN_IN3 = 10;  // Right Motor Dir 1
-const int PIN_IN4 = 11;  // Right Motor Dir 2
+const int PIN_RIGHT_PWM = 5;   // L298N ENA (Timer0/OC0B)
+const int PIN_RIGHT_IN1 = 8;   // L298N IN1 (Dir bit 1)
+const int PIN_RIGHT_IN2 = 9;   // L298N IN2 (Dir bit 2)
 
 // Helper functions for motor control
 void setLeftMotor(int speed) {
   speed = constrain(speed, -255, 255);
   if (speed > 0) {
-    digitalWrite(PIN_IN1, HIGH);
-    digitalWrite(PIN_IN2, LOW);
-    analogWrite(PIN_ENA, speed);
+    digitalWrite(PIN_LEFT_IN1, HIGH);
+    digitalWrite(PIN_LEFT_IN2, LOW);
+    analogWrite(PIN_LEFT_PWM, speed);
   } else if (speed < 0) {
-    digitalWrite(PIN_IN1, LOW);
-    digitalWrite(PIN_IN2, HIGH);
-    analogWrite(PIN_ENA, -speed);
+    digitalWrite(PIN_LEFT_IN1, LOW);
+    digitalWrite(PIN_LEFT_IN2, HIGH);
+    analogWrite(PIN_LEFT_PWM, -speed);
   } else {
-    digitalWrite(PIN_IN1, LOW);
-    digitalWrite(PIN_IN2, LOW);
-    analogWrite(PIN_ENA, 0);
+    digitalWrite(PIN_LEFT_IN1, LOW);
+    digitalWrite(PIN_LEFT_IN2, LOW);
+    analogWrite(PIN_LEFT_PWM, 0);
   }
 }
 
 void setRightMotor(int speed) {
   speed = constrain(speed, -255, 255);
   if (speed > 0) {
-    digitalWrite(PIN_IN3, HIGH);
-    digitalWrite(PIN_IN4, LOW);
-    analogWrite(PIN_ENB, speed);
+    digitalWrite(PIN_RIGHT_IN1, HIGH);
+    digitalWrite(PIN_RIGHT_IN2, LOW);
+    analogWrite(PIN_RIGHT_PWM, speed);
   } else if (speed < 0) {
-    digitalWrite(PIN_IN3, LOW);
-    digitalWrite(PIN_IN4, HIGH);
-    analogWrite(PIN_ENB, -speed);
+    digitalWrite(PIN_RIGHT_IN1, LOW);
+    digitalWrite(PIN_RIGHT_IN2, HIGH);
+    analogWrite(PIN_RIGHT_PWM, -speed);
   } else {
-    digitalWrite(PIN_IN3, LOW);
-    digitalWrite(PIN_IN4, LOW);
-    analogWrite(PIN_ENB, 0);
+    digitalWrite(PIN_RIGHT_IN1, LOW);
+    digitalWrite(PIN_RIGHT_IN2, LOW);
+    analogWrite(PIN_RIGHT_PWM, 0);
   }
 }
 
@@ -86,8 +88,8 @@ void printBanner() {
   Serial.println(F("\n=================================================="));
   Serial.println(F("     DUAL MOTOR & SPEED TEST DIAGNOSTIC           "));
   Serial.println(F("=================================================="));
-  Serial.println(F("Pins: Left Motor (ENA=5, IN1=8, IN2=9)"));
-  Serial.println(F("      Right Motor (ENB=6, IN3=10, IN4=11)"));
+  Serial.println(F("Pins: Left Motor  [Ch.B] (PWM=6, IN3=10, IN4=11)"));
+  Serial.println(F("      Right Motor [Ch.A] (PWM=5, IN1=8,  IN2=9)"));
   Serial.println(F("Commands (Serial Monitor at 115200 baud):"));
   Serial.println(F("  TEST         - Run automated test cycle"));
   Serial.println(F("  RAMP         - Run PWM speed ramp sweep (0-255)"));
@@ -272,15 +274,15 @@ void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 1000); // Wait briefly for USB Serial
 
-  // Configure Left Motor Pins
-  pinMode(PIN_ENA, OUTPUT);
-  pinMode(PIN_IN1, OUTPUT);
-  pinMode(PIN_IN2, OUTPUT);
+  // Configure Left Motor Pins (Channel B)
+  pinMode(PIN_LEFT_PWM, OUTPUT);
+  pinMode(PIN_LEFT_IN1, OUTPUT);
+  pinMode(PIN_LEFT_IN2, OUTPUT);
 
-  // Configure Right Motor Pins
-  pinMode(PIN_ENB, OUTPUT);
-  pinMode(PIN_IN3, OUTPUT);
-  pinMode(PIN_IN4, OUTPUT);
+  // Configure Right Motor Pins (Channel A)
+  pinMode(PIN_RIGHT_PWM, OUTPUT);
+  pinMode(PIN_RIGHT_IN1, OUTPUT);
+  pinMode(PIN_RIGHT_IN2, OUTPUT);
 
   // Ensure all motors are off initially
   stopMotors();

@@ -185,15 +185,19 @@ graph TB
 | D2 | IR Sensor 1 | IN | IR proximity | Digital HIGH/LOW (may be scrapped) |
 | D3 | IR Sensor 2 | IN | IR proximity | Interrupt-capable (may be scrapped) |
 | D4 | Ultrasonic 1 Echo | IN | HC-SR04P front-left | Unchanged |
-| **D5** | **ENA — Left Motor PWM** | **OUT** | **L298N Ch.A** | **Timer0 PWM (0–255)** |
-| **D6** | **ENB — Right Motor PWM** | **OUT** | **L298N Ch.B** | **Timer0 PWM (0–255)** |
+| **D5** | **ENA — Right Motor PWM** | **OUT** | **L298N Ch.A** | **Timer0 PWM (0–255)** |
+| **D6** | **ENB — Left Motor PWM** | **OUT** | **L298N Ch.B** | **Timer0 PWM (0–255)** |
 | D7 | Ultrasonic 2 Trigger | OUT | HC-SR04P front-right | Unchanged |
-| D8 | Motor IN1 | OUT | L298N | Left direction bit 1 |
-| D9 | Motor IN2 | OUT | L298N | Left direction bit 2 |
-| D10 | Motor IN3 | OUT | L298N | Right direction bit 1 |
-| D11 | Motor IN4 | OUT | L298N | Right direction bit 2 |
+| D8 | Motor IN1 | OUT | L298N | Right direction bit 1 |
+| D9 | Motor IN2 | OUT | L298N | Right direction bit 2 |
+| D10 | Motor IN3 | OUT | L298N | Left direction bit 1 |
+| D11 | Motor IN4 | OUT | L298N | Left direction bit 2 |
 | **D12** | **Ultrasonic 1 Trigger** | **OUT** | **HC-SR04P front-left** | **← moved from D5** |
 | **D13** | **Ultrasonic 2 Echo** | **IN** | **HC-SR04P front-right** | **← moved from D6** (LED flickers, cosmetic) |
+
+> [!NOTE]
+> **Chassis Channel Assignment:**
+> On the physical chassis, L298N Channel A (D5, D8, D9) is wired to the **Right Motor Pair** (FR + RR), and Channel B (D6, D10, D11) is wired to the **Left Motor Pair** (FL + RL). Firmware (`pins.h`, `point_to_point_control.ino`, and `dual_motor_speed_test.ino`) cleanly abstracts this by assigning `PIN_LEFT_PWM`/`PIN_LEFT_IN1`/`PIN_LEFT_IN2` to Channel B and `PIN_RIGHT_PWM`/`PIN_RIGHT_IN1`/`PIN_RIGHT_IN2` to Channel A.
 
 > [!IMPORTANT]
 > **ENA and ENB MUST be wired to D5/D6** — never jumpered to 5V. Jumpering locks motors at full speed, disabling PWM control entirely. PID steering and avoidance speed modulation both depend on variable PWM.
@@ -725,7 +729,7 @@ The Arduino firmware maintains **no command queue**:
 ---
 
 ## 12. Open Items & Decisions Needed
-
+`
 > [!NOTE]
 > For the complete analysis of architectural edge cases, design trade-offs, and prioritized implementation/calibration roadmap, see:
 > **[concerns_and_future_todos.md](concerns_and_future_todos.md)**
