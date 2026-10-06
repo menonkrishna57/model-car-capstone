@@ -65,3 +65,6 @@ openvino_cache/
 # Microsoft Office temporary lock files
 ~$*.docx
 ~$*.xlsx
+
+extracted_mentorpi/
+extracted_mentrpi/
