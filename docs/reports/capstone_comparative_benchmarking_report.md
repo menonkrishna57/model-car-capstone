@@ -1,27 +1,15 @@
 # DESIGN, IMPLEMENTATION, AND COMPARATIVE BENCHMARKING OF AN AUTONOMOUS FOLLOW-ME AND OBSTACLE-AVOIDANT ROBOTIC VEHICLE
 
 **Subtitle:** A Two-Layer Heterogeneous Computing Architecture (Raspberry Pi 5 + Arduino Uno) with NMS-Free YOLOv10n Inference, RDD2022 Pothole Avoidance, and Multi-Tier Reflex Control  
-**Document Type:** Interim Technical Report (Aligned with Table 5.2.5 2nd Review Rubrics)  
-**Academic Track:** B.Tech Final Year Capstone Project — NMIMS MPSTME  
-**Authors:** Krishna Shah, Aditya Rana, Parth Surve  
+**Document Type:** Technical Engineering Report  
+**Academic Institution:** NMIMS MPSTME, Department of Electronics & Telecommunication / Computer Engineering  
+**Authors:** Krishna Menon, Aditya Rana, Parth Surve  
 **Target Hardware:** Raspberry Pi 5 (8GB) + Arduino Uno R3 (ATmega328P)  
 **Primary Repository:** `model-car-capstone`  
 
 ---
 
-## 2nd Review Rubric Compliance Matrix (Target: 25/25 Marks)
-
-| Rubric Parameter | Evaluated Criteria (Far Exceeds Expectation - 5 Marks) | Document Section & Evidence |
-|---|---|---|
-| **Parameter A: Literature Review / Market Survey (5)** | Complete understanding of existing research, commercial products, and architectural debates. | **Section 2:** 8-platform granular comparative matrix (JetBot, AWS DeepRacer, Duckietown, OpenBot, DonkeyCar, PiCar-X, MentorPi, Our Car) with exact parameters, FLOPs, NMS overhead, and citations to OpenBot (IROS 2020), YOLOv10 (2024), DAVE-2 (2016), and RDD2022. |
-| **Parameter B: Clarity of Problem Statement (5)** | Problem statement identified after establishing clear research gaps; objectives well stated. | **Section 1:** Formalizes 3 specific research gaps (Linux PWM jitter, acoustic negative obstacle blindness, Indian market cost inflation) and states 4 quantifiable objectives. |
-| **Parameter C: Design / System-Level Representation (5)** | System design very well drawn; gives complete understanding of proposed model; algorithms clearly stated. | **Section 3 & 4:** System block diagrams, power topology, 3-tier FSM Mermaid flowcharts, post-migration pinout, and mathematical equations for danger scoring, Bhattacharyya distance, and PID visual servoing. |
-| **Parameter D: Implementation & Results (5)** | Model/algorithms implemented with >50% completed work; results very well documented. | **Section 6:** Documents >65% total project completion, including 50-epoch RDD2022 training loss/mAP metrics, 22–26 ms measured NCNN latency, and hardware PWM bench test. |
-| **Parameter E: Interim Report & Technical Requirements (5)** | Complete explanation of key concepts, technical requirements, realistic BOM, and well-specified future extensions. | **Section 5 & 7:** Accurately reflects Indian retail market cost of Raspberry Pi 5 (₹15,800 INR) with college lab asset offset; outlines software stacks and future roadmap (Option B TSR, IMU). |
-
----
-
-## 1. Executive Summary & Problem Formulation [Rubric B: Problem Statement & Research Gaps]
+## 1. Executive Summary & Problem Formulation
 
 Autonomous mobile robotics in developing road environments (particularly Indian urban and semi-urban conditions) faces a harsh operational reality: high-throughput computer vision must operate under severe computational constraints, while simultaneously guaranteeing microsecond-accurate motor actuation and reflexive physical safety. 
 
@@ -45,7 +33,7 @@ Most educational and open-source autonomous robotics platforms (such as NVIDIA J
 
 ---
 
-## 2. Literature Review & Granular Market Survey [Rubric A: Understanding of Existing Research]
+## 2. Literature Review & Comparative Market Survey
 
 To establish rigorous academic benchmark standards, our platform was benchmarked against the leading small-scale autonomous vehicle architectures in literature and industry: **NVIDIA JetBot**, **AWS DeepRacer**, **Duckietown (Duckiebot DB21)**, **Intel/Stanford OpenBot**, **DonkeyCar**, **SunFounder PiCar-X**, and the **Hiwonder MentorPi**.
 
@@ -89,7 +77,7 @@ To establish rigorous academic benchmark standards, our platform was benchmarked
 
 ---
 
-## 3. System Design & Architectural Representation [Rubric C: Architecture & Algorithms]
+## 3. System Architecture & Hardware Topology
 
 ### 3.1 Hardware Topology & Power Distribution
 
@@ -177,7 +165,7 @@ stateDiagram-v2
 
 ---
 
-## 4. Algorithms & Perception Pipeline Formulation [Rubric C: Algorithms Stated]
+## 4. Algorithms & Perception Pipeline Formulation
 
 ### 4.1 Dual-Modality Pothole & Negative Obstacle Engine
 
@@ -219,7 +207,7 @@ Implemented in `car/control/traffic_signs.py` (6 classes: `go, right, park, red,
 
 ---
 
-## 5. Economic Feasibility & Bill of Materials (BOM) [Rubric E: Technical Requirements & Real Costs]
+## 5. Economic Feasibility & Bill of Materials (BOM)
 
 In the Indian electronics retail market, the **Raspberry Pi 5 (8GB)** carries an import price, customs tariff, and 18% GST that places its local retail price between **₹15,500 and ₹16,200 INR** (approx. $185 USD, verified via official distributors Robu.in and Fab.to.Lab).
 
@@ -242,9 +230,9 @@ However, because this project was constructed within the academic infrastructure
 
 ---
 
-## 6. Implementation Progress & Empirical Results [Rubric D: >50% Completed Work]
+## 6. Implementation Status & Empirical Results
 
-In compliance with Rubric D (>50% completed implementation), over **65% of the total project engineering work** has been completed, physically deployed, and benchmarked:
+Over **65% of the system engineering pipeline** has been implemented, physically deployed, and benchmarked on the test chassis:
 
 | Subsystem | Implemented Modules & Artifacts | % Completed | Verification Status |
 |---|---|:---:|---|
@@ -263,7 +251,7 @@ A dedicated custom pothole detection model was trained for 50 epochs on the RDD2
 
 ---
 
-## 7. Technical Requirements & Future Project Extensions [Rubric E: Future Extensions]
+## 7. Technical Specifications & Planned Autonomy Roadmap
 
 ### 7.1 Technical Operating Requirements
 
@@ -271,15 +259,20 @@ A dedicated custom pothole detection model was trained for 50 epochs on the RDD2
 * **Microcontroller Toolchain:** Arduino IDE / `avr-gcc 7.3+`, Baud Rate 115200 bps, ATmega328P 16 MHz 5V.
 * **Thermal & Power Budget:** Pi 5 actively cooled via Official Heatsink/Fan (steady-state 52°C under full NCNN load); isolated 5.1V/5A logic supply.
 
-### 7.2 Prioritized Future Extensions Roadmap
+### 7.2 Core Autonomy Integration Roadmap
 
-1. **Traffic Sign Recognition Integration (Option B):** Standalone integration of the 6-class track sign state machine (`traffic_signs.py`) with pre-trained weights (`traffic_signs_640s_7_0.pt`) using upper-ROI gating ($<2\,\text{ms}$) to guarantee zero regression to obstacle avoidance.
-2. **IMU-Aided Yaw Dead-Reckoning (MPU-6050):** Integrate an MPU-6050 6-DOF IMU on the Arduino I2C bus to measure true angular turning yaw, eliminating skid-steer wheel-slip drift during avoidance maneuvers.
-3. **Arduino Nano Hardware Form-Factor Migration:** Migrate from the Uno R3 to an Arduino Nano (identical ATmega328P core, pinout, and timer registers), reducing microcontroller chassis footprint by 70%.
+The development roadmap focuses strictly on integrating and validating three core edge capabilities:
+
+1. **Negative Obstacle & Pothole Avoidance Integration:**
+   Deploy the fine-tuned RDD2022 YOLOv8n model (`rdd2022_yolov8n.pt`) and the $<4\,\text{ms}$ Laplacian CV fallback directly into the live perception loop on the vehicle. Validate the trapezoidal driving corridor and dynamic swerve arbitration (`SWERVE_LEFT`, `SWERVE_RIGHT`, `PI_STOP`) across physical road cavities and surface defects.
+2. **Vision-Based Lane Following:**
+   Integrate the classical multi-ROI perspective lane detector (`lane_detector.py`) to extract road boundaries in CIE LAB space ($<4\,\text{ms}$) without deep learning compute overhead. Couple the angular steering error $\theta = \arctan(dx/dy)$ to the discrete PID controller (`pid.py`) for closed-loop centerline tracking.
+3. **Track Traffic Sign & Signal Recognition:**
+   Integrate the 6-class traffic sign state machine (`traffic_signs.py`) with the pre-trained weights (`traffic_signs_640s_7_0.pt`). The temporal 5-frame debounce filter and upper-ROI spatial gating will enable reliable intersection handling (`red` stop latch, `green` release, `right` turn execution, and timed crosswalk speed modulation) without degrading real-time obstacle avoidance.
 
 ---
 
-## 8. Formal Academic References [Rubric A: Citable Sources]
+## 8. References
 
 * **[1]** M. Müller and V. Koltun, "OpenBot: Turning Smartphones into Robots," in *IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)*, 2020, pp. 6411–6418. DOI: 10.1109/IROS45743.2020.9340777. arXiv:2008.10631.
 * **[2]** A. Wang, H. Chen, L. Liu, K. Chen, Z. Lin, J. Han, and G. Ding, "YOLOv10: Real-Time End-to-End Object Detection," *arXiv preprint arXiv:2405.14458*, May 2024.
@@ -290,7 +283,7 @@ A dedicated custom pothole detection model was trained for 50 epochs on the RDD2
 * **[7]** W. Rosenthal et al., "Donkey Car: An Open Source DIY Self Driving Platform for Small Scale Cars," *Donkey Car Documentation*, 2023. [Online]. Available: https://docs.donkeycar.com/
 * **[8]** NVIDIA Corporation, "NVIDIA JetBot: An Open-Source AI Robot Platform Powered by NVIDIA Jetson Nano," *NVIDIA Developer Zone*, 2021. [Online]. Available: https://developer.nvidia.com/embedded/jetbot
 * **[9]** Indian Road Congress, "Code of Practice for Road Signs (IRC:67-2012)," New Delhi: Indian Roads Congress, 2012.
-* **[10]** Hiwonder, "MentorPi: AI Vision Autonomous Driving Robot Car Powered by Raspberry Pi 5," *Hiwonder Robotics Documentation*, 2024. [Online]. Available: https://www.hiwonder.com/
+* **[10]** P. Surve, A. Rana, and K. Menon, "Two-Layer Heterogeneous System Architecture and Serial Telemetry Protocol for Autonomous RC Vehicles," *Technical Report*, NMIMS MPSTME, 2026.
 * **[11]** B. Balaji et al., "DeepRacer: Educational Autonomous Racing Platform for Experimentation with Sim2Real Reinforcement Learning," in *IEEE International Conference on Robotics and Automation (ICRA)*, 2020. AWS Whitepaper.
 * **[12]** M. Tani, L. Paull, J. Tani et al., "The Duckietown Project: An Open, Inexpensive, Flexible Platform for Autonomous Driving Research and Education," *IEEE Robotics & Automation Magazine*, vol. 25, no. 3, pp. 43–55, Sept. 2018. DOI: 10.1109/MRA.2018.2844286.
 * **[13]** SunFounder, "PiCar-X: AI Autonomous Driving Robot Car Kit for Raspberry Pi," *SunFounder Documentation*, 2023. [Online]. Available: https://docs.sunfounder.com/projects/picar-x/
