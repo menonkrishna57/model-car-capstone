@@ -68,3 +68,7 @@ openvino_cache/
 
 extracted_mentorpi/
 extracted_mentrpi/
+
+~$*.pptx
+*.onnx
+yolov10n_openvino_model/
