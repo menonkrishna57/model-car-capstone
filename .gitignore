@@ -61,3 +61,7 @@ dashcam_annotated.mp4
 # PyTorch / OpenVINO cache
 .cache/
 openvino_cache/
+
+# Microsoft Office temporary lock files
+~$*.docx
+~$*.xlsx
