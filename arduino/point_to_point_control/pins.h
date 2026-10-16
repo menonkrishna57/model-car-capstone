@@ -4,65 +4,57 @@
  * Single source of truth for all pin assignments.
  * Owned by firmware-agent. Update this file after any physical rewiring.
  *
- * WIRING STATUS: ✅ PWM migration COMPLETE (2026-09-30)
- *   - ENA wired to D5 (PWM speed control enabled)
- *   - ENB wired to D6 (PWM speed control enabled)
- *   - US1 Trigger moved from D5 → D12
- *   - US2 Echo moved from D6 → D13
+ * WIRING STATUS: ✅ Architecture v2 Verified (2026-10-11)
+ *   - ENA wired to D5 (Timer0 PWM)
+ *   - ENB wired to D6 (Timer0 PWM)
+ *   - Left US:  Trig=D7,  Echo=D13 (LED flicker cosmetic)
+ *   - Right US: Trig=D12, Echo=D4
+ *   - D2, D3: Physically empty / reserved for encoders/interrupts
+ *   - INVERT_MOTOR_POLARITY = true (corrects TT motor chassis wiring)
  */
 
 #ifndef CAR_PINS_H
 #define CAR_PINS_H
 
 // =============================================================================
-// Motor Driver (L298N) Pin Assignments — Skid-Steer Pairing
-// -----------------------------------------------------------------------------
-// On this chassis:
-//   - Channel A (OUT1/OUT2) drives the RIGHT Motor Pair (FR + RR motors)
-//   - Channel B (OUT3/OUT4) drives the LEFT Motor Pair (FL + RL motors)
-// =============================================================================
-
-// Right Motor Pair — Channel A (FR + RR motors)
+// Left Motor Pair — Channel A (FL + RL motors)
 // L298N: IN1 / IN2 control direction; ENA controls PWM speed (0–255)
-const int PIN_RIGHT_PWM = 5;   // ENA: PWM speed control (Timer0/OC0B) — wired to D5 ✅
-const int PIN_RIGHT_IN1 = 8;   // IN1: Direction bit 1 — HIGH = forward
-const int PIN_RIGHT_IN2 = 9;   // IN2: Direction bit 2 — HIGH = reverse
+// =============================================================================
+const int PIN_ENA = 5;    // ENA: PWM speed control (Timer0/OC0B) — wired to D5 ✅
+const int PIN_IN1 = 8;    // IN1: Direction bit 1
+const int PIN_IN2 = 9;    // IN2: Direction bit 2
 
-// Left Motor Pair — Channel B (FL + RL motors)
+// =============================================================================
+// Right Motor Pair — Channel B (FR + RR motors)
 // L298N: IN3 / IN4 control direction; ENB controls PWM speed (0–255)
-const int PIN_LEFT_PWM  = 6;   // ENB: PWM speed control (Timer0/OC0A) — wired to D6 ✅
-const int PIN_LEFT_IN1  = 10;  // IN3: Direction bit 1 — HIGH = forward
-const int PIN_LEFT_IN2  = 11;  // IN4: Direction bit 2 — HIGH = reverse
+// =============================================================================
+const int PIN_ENB = 6;    // ENB: PWM speed control (Timer0/OC0A) — wired to D6 ✅
+const int PIN_IN3 = 10;   // IN3: Direction bit 1
+const int PIN_IN4 = 11;   // IN4: Direction bit 2
 
-// Hardware pin aliases (retaining L298N pin names)
-const int PIN_ENA = PIN_RIGHT_PWM;
-const int PIN_IN1 = PIN_RIGHT_IN1;
-const int PIN_IN2 = PIN_RIGHT_IN2;
-const int PIN_ENB = PIN_LEFT_PWM;
-const int PIN_IN3 = PIN_LEFT_IN1;
-const int PIN_IN4 = PIN_LEFT_IN2;
+// Motor Polarity Configuration
+const bool INVERT_MOTOR_POLARITY = true;
 
 // =============================================================================
 // Ultrasonic Sensors — 2× HC-SR04P, both front-facing
-//
-// After PWM migration (2026-09-30):
-//   US1 Front-Left:   Trig=D12, Echo=D4
-//   US2 Front-Right:  Trig=D7,  Echo=D13
+// Verified Physical Pinout (Architecture v2):
+//   Left Ultrasonic:   Trig=D7,  Echo=D13
+//   Right Ultrasonic:  Trig=D12, Echo=D4
 // =============================================================================
 
 // Left Ultrasonic (HC-SR04P front-left)
-const int PIN_US_LEFT_TRIG = 12;   // D12 — Trigger (10μs pulse OUTPUT)
-const int PIN_US_LEFT_ECHO = 4;    // D4  — Echo (INPUT, pulse timing)
+const int PIN_US_LEFT_TRIG = 7;    // D7  — Trigger (10μs pulse OUTPUT)
+const int PIN_US_LEFT_ECHO = 13;   // D13 — Echo (INPUT, pulse timing) — built-in LED flickers (cosmetic only)
 
 // Right Ultrasonic (HC-SR04P front-right)
-const int PIN_US_RIGHT_TRIG = 7;   // D7  — Trigger (10μs pulse OUTPUT)
-const int PIN_US_RIGHT_ECHO = 13;  // D13 — Echo (INPUT, pulse timing) — built-in LED flickers (cosmetic only)
+const int PIN_US_RIGHT_TRIG = 12;  // D12 — Trigger (10μs pulse OUTPUT)
+const int PIN_US_RIGHT_ECHO = 4;   // D4  — Echo (INPUT, pulse timing)
 
 // =============================================================================
-// IR Proximity Sensors (×2) — wired on D2/D3
-// D3 is interrupt-capable.
+// Reserved Pins — D2 / D3 (Physically empty on chassis)
+// Reserved for future wheel encoders (INT0 / INT1)
 // =============================================================================
-const int PIN_IR1 = 2;    // D2 — IR Sensor 1 (digital HIGH/LOW)
-const int PIN_IR2 = 3;    // D3 — IR Sensor 2 (interrupt-capable)
+const int PIN_RESERVED_INT0 = 2;   // D2 — External Interrupt 0 (INT0)
+const int PIN_RESERVED_INT1 = 3;   // D3 — External Interrupt 1 (INT1)
 
 #endif // CAR_PINS_H

@@ -1,7 +1,7 @@
 # System Architecture — Autonomous Follow-Me and Obstacle-Avoidant RC Vehicle
 
-**Status:** APPROVED / PRODUCTION BASELINE  
-**Last Updated:** 2026-10-02  
+**Status:** APPROVED / PRODUCTION BASELINE (Architecture v2 — Verified Hardware Baseline)  
+**Last Updated:** 2026-10-11  
 **Target Hardware:** Raspberry Pi 5 (8GB) + Arduino Uno R3 (ATmega328P)  
 **Primary Repositories:** `model-car-capstone` / `MentorPi`  
 **Active Branch:** `pothole-detection` / `main`
@@ -24,16 +24,17 @@ To overcome the fundamental failure modes of monolithic, single-board robotics s
 |   +----------------------------------+             +------------------------------+   |
 |   |   Raspberry Pi 5 (High-Level)    |             |  Arduino Uno (Real-Time)     |   |
 |   |----------------------------------|             |------------------------------|   |
-|   | • CSI Global-Shutter Camera      |  USB-Serial | • Hardware Timer0/1/2 PWM    |   |
-|   | • YOLOv10n (NCNN NMS-Free)       |  115200 8N1 | • 3-Tier Priority FSM        |   |
-|   | • RDD2022 Pothole YOLO / CV      |<----------->| • 2x HC-SR04P Sonar Polling  |   |
-|   | • HSV Appearance Re-ID Tracker   |             | • L298N Dual H-Bridge Driver |   |
-|   | • Discrete PID Steering Engine   |             | • Autonomous Emergency Reflex|   |
+|   | • CSI Camera (OV5647 5MP)        |  USB-Serial | • Hardware Timer0 PWM (D5/D6)|   |
+|   | • YOLOv10n (NCNN NMS-Free)       | 115200 Baud | • 3-Tier Priority FSM        |   |
+|   | • RDD2022 Pothole YOLO / CV      |    8-N-1    | • 2x HC-SR04P (D7/13, D12/4) |   |
+|   | • HSV Appearance Re-ID Tracker   |<----------->| • L298N Skid-Steer (Inverted)|   |
+|   | • Discrete PID Steering Engine   |             | • Auto-Brake (<25cm Reflex)  |   |
+|   |                                  |             | • Serial Halt ('s'/'g' Pause)|   |
 |   +----------------------------------+             +------------------------------+   |
 |                    ^                                               ^                  |
-|                    | Isolated 5.1V/5A                              | 7.4V -> 5V/5A    |
-|   +----------------------------------+             +------------------------------+   |
-|   | boAt EnergyShroom PB400 Battery  |             | 2S 18650 Li-Ion Pack + Buck  |   |
+|                    | Isolated 5.1V/5A                              | 7.4V (2S 18650)  |
+|   +----------------------------------+             +---------------+--------------+   |
+|   | boAt EnergyShroom PB400 Battery  |             | 2S 18650 Li-Ion + Common GND |   |
 |   +----------------------------------+             +------------------------------+   |
 |                                                                                       |
 +---------------------------------------------------------------------------------------+
@@ -66,67 +67,99 @@ Our architecture enforces strict physical and functional isolation:
 ## 2. Hardware Architecture & Electrical Design
 
 ### 2.1 Complete Pin Mapping Matrix
-> **Hardware Status: PWM MIGRATION COMPLETE (Verified 2026-09-30).**  
-> ENA and ENB are wired directly to Arduino PWM pins D5 and D6. Jumper clips to 5V have been removed. Variable speed control, PID modulation, and differential turning are fully operational.
+> **Hardware Status: ARCHITECTURE V2 VERIFIED & BENCH TESTED (2026-10-11).**  
+> Complete physical pin tracing, ultrasonic transceiver mapping, motor polarity inversion correction, and TT motor PWM torque compensation have been verified on the physical chassis.
 
 Authoritative pin definitions are maintained in [`arduino/lib/pins.h`](../arduino/lib/pins.h):
 
 | Arduino Uno Pin | Direction | Assigned Function | Connected Hardware Subsystem | Hardware Timer / Characteristics |
 |:---:|:---:|---|---|---|
-| **D2** | INPUT | IR Proximity Sensor 1 | Front Left IR Sensor | Digital logic input (HIGH/LOW) |
-| **D3** | INPUT | IR Proximity Sensor 2 | Front Right IR Sensor | Interrupt-capable pin (`INT1`) |
-| **D4** | INPUT | Ultrasonic 1 Echo | HC-SR04P Front-Left Sensor | 3.3V/5V compatible echo timing |
+| **D2** | UNCONNECTED | *Reserved / Unused* | Physically Empty | Available for wheel encoder / `INT0` |
+| **D3** | UNCONNECTED | *Reserved / Unused* | Physically Empty | Available for wheel encoder / `INT1` |
+| **D4** | INPUT | **Right Ultrasonic Echo** | HC-SR04P Front-Right Sensor | $1\,\mu\text{s}$ pulse timing input (`pulseIn`) |
 | **D5** | OUTPUT | **ENA (Left Motor PWM)** | L298N Dual H-Bridge Channel A | **Timer0 (OC0B)** — 8-bit PWM (0–255, 980 Hz) |
 | **D6** | OUTPUT | **ENB (Right Motor PWM)** | L298N Dual H-Bridge Channel B | **Timer0 (OC0A)** — 8-bit PWM (0–255, 980 Hz) |
-| **D7** | OUTPUT | Ultrasonic 2 Trigger | HC-SR04P Front-Right Sensor | $10\,\mu\text{s}$ digital trigger pulse |
-| **D8** | OUTPUT | Motor IN1 (Left Dir 1) | L298N Dual H-Bridge Channel A | Direction bit 1 (HIGH = Forward) |
-| **D9** | OUTPUT | Motor IN2 (Left Dir 2) | L298N Dual H-Bridge Channel A | Direction bit 2 (HIGH = Reverse) |
-| **D10** | OUTPUT | Motor IN3 (Right Dir 1) | L298N Dual H-Bridge Channel B | Direction bit 1 (HIGH = Forward) |
-| **D11** | OUTPUT | Motor IN4 (Right Dir 2) | L298N Dual H-Bridge Channel B | Direction bit 2 (HIGH = Reverse) |
-| **D12** | OUTPUT | **Ultrasonic 1 Trigger** | HC-SR04P Front-Left Sensor | Moved from D5 during PWM migration |
-| **D13** | INPUT | **Ultrasonic 2 Echo** | HC-SR04P Front-Right Sensor | Moved from D6 during PWM migration |
+| **D7** | OUTPUT | **Left Ultrasonic Trigger** | HC-SR04P Front-Left Sensor | $10\,\mu\text{s}$ digital trigger pulse output |
+| **D8** | OUTPUT | **Motor IN1 (Left Dir 1)** | L298N Dual H-Bridge Channel A | Direction bit 1 (Firmware inverted) |
+| **D9** | OUTPUT | **Motor IN2 (Left Dir 2)** | L298N Dual H-Bridge Channel A | Direction bit 2 (Firmware inverted) |
+| **D10** | OUTPUT | **Motor IN3 (Right Dir 1)**| L298N Dual H-Bridge Channel B | Direction bit 1 (Firmware inverted) |
+| **D11** | OUTPUT | **Motor IN4 (Right Dir 2)**| L298N Dual H-Bridge Channel B | Direction bit 2 (Firmware inverted) |
+| **D12** | OUTPUT | **Right Ultrasonic Trigger**| HC-SR04P Front-Right Sensor | $10\,\mu\text{s}$ digital trigger pulse output |
+| **D13** | INPUT | **Left Ultrasonic Echo** | HC-SR04P Front-Left Sensor | $1\,\mu\text{s}$ pulse timing (Uno 'L' LED flicker is purely cosmetic) |
+
+#### 2.1.1 The Ultrasonic Pin Resolution & Phantom IR Removal
+Initial documentation and legacy sketch comments incorrectly assumed pins D2 and D3 were connected to digital IR obstacle sensors, while reversing ultrasonic sensor channel mappings. Physical signal tracing and diagnostic bench testing confirmed:
+1. **Pins D2 and D3 are physically empty** on the chassis. No IR sensors are installed on the chassis; D2 and D3 are designated as unreserved inputs, preserving them for future quadrature wheel encoders or external hardware interrupts.
+2. The real physical pin routing is verified as:
+   * **Left Ultrasonic Sensor:** Trigger = **D7**, Echo = **D13**
+   * **Right Ultrasonic Sensor:** Trigger = **D12**, Echo = **D4**
+3. **Pin D13 Characteristics:** On the Arduino Uno, pin D13 is internally tied via an op-amp/resistor circuit to the onboard 'L' surface-mount LED. When the Left Ultrasonic emits an echo pulse, the LED flickers faintly. This is cosmetic only and introduces zero signal distortion or timing inaccuracy to `pulseIn()` timing.
+4. Live simultaneous centimeter distance telemetry streaming was bench-validated from both ultrasonic transceivers at 115200 baud.
+
+#### 2.1.2 Motor Wiring Polarity & Direction Inversion
+Due to physical chassis mounting orientations, the 4WD TT gearbox DC motors were wired with inverted polarity relative to standard H-bridge logic (asserting `IN1=HIGH, IN2=LOW` drove the chassis in reverse). Under the project's strict hard constraint (borrowed lab hardware under shared ID rotation; no cutting or desoldering), physical rewiring was rejected.
+
+This was resolved cleanly at the firmware layer via `#define INVERT_MOTOR_POLARITY true` in [`arduino/lib/pins.h`](../arduino/lib/pins.h) and `const bool INVERT_DIR = true;` in sketch files. The motor driver routines invert speed sign (`s = -s`) prior to setting `IN1`–`IN4`, ensuring all high-level forward drive commands spin the wheels forward.
+
+#### 2.1.3 TT Motor Torque & L298N Voltage Drop Calibration
+The L298N dual H-bridge motor driver employs internal bipolar Darlington transistors ($V_{CE(\text{sat})} \approx 1.8\text{–}2.0\,\text{V}$ total drop across high-side and low-side transistors). When powered by a 2S 18650 Li-Ion battery pack ($7.4\,\text{V}$ nominal, $8.4\,\text{V}$ peak), the effective motor terminal voltage is only:
+$$V_{\text{motor}} = V_{\text{battery}} - V_{\text{drop}} \approx 7.4\,\text{V} - 2.0\,\text{V} = 5.4\,\text{V}$$
+
+The legacy default PWM speed value of $120$ ($\approx 47\%$ duty cycle) delivered an effective RMS voltage of $\sim 2.5\,\text{V}$, resulting in severe motor stall under the chassis curb weight and floor friction. Torque has been systematically calibrated and empirically verified on the chassis:
+* **Forward Cruising (`SPEED_FORWARD`):** PWM **`200`** ($\sim 78\%$ duty cycle, $\sim 4.2\,\text{V}$ RMS)
+* **Pivot Skid-Turn (`SPEED_TURN`):** PWM **`210`** ($\sim 82\%$ duty cycle, delivers robust breakaway torque for zero-radius turns)
+* **Reverse Clearance (`SPEED_REVERSE`):** PWM **`190`** ($\sim 75\%$ duty cycle)
 
 ### 2.2 Dual-Rail Isolated Power Distribution
-To prevent inductive noise and voltage drops from triggering Raspberry Pi brownouts, the power system is partitioned into two physically isolated rails:
+To prevent inductive motor back-EMF and switching transients from triggering Raspberry Pi brownouts, the power system is partitioned into two physically isolated rails:
 
 ```
-  MOTOR RAIL (Shared Ground)                         PI 5 RAIL (Isolated)
-  ==========================                         ====================
+  MOTOR & ARDUINO RAIL (Common Ground)               PI 5 RAIL (Isolated)
+  ====================================               ====================
 
   +-------------------------------+                 +-----------------------------------+
   | 2S 18650 Li-Ion Battery Pack  |                 | boAt EnergyShroom PB400 Powerbank |
   |   7.4V Nominal (1500-2500mAh) |                 |   USB-C 5.1V / 5.0A Output        |
   +---------------+---------------+                 +-----------------+-----------------+
                   |                                                   |
-                  v                                                   v
-  +---------------+---------------+                 +-----------------+-----------------+
-  | LM2596 / XL4015 Buck Converter|                 | Raspberry Pi 5 (8GB)              |
-  |   Step-Down 7.4V -> 5.0V / 5A |                 | Broadcom BCM2712 Quad-Core A76    |
-  +-------+---------------+-------+                 +-----------------+-----------------+
-          |               |                                           |
-          v               v                                           | USB-A to USB-B
-     +----+----+    +-----+---------+                                 | Serial Cable
-     |  L298N  |    |  Arduino Uno  |                                 | (Data + Common GND)
-     | Motor   |    |  ATmega328P   |<--------------------------------+
-     | Driver  |    +-------+-------+
-     +----+----+            |
-          |                 v
-          |         +-------+-------+
-          |         | 16-Pin Berg   |
-          |         | Strip Header  |
-          |         +-------+-------+
-          |                 |
-          |       +---------+---------+
-          |       |         |         |
-          v       v         v         v
-     4x TT DC   2x HC-    2x IR     L298N
-      Motors    SR04P    Sensors    Logic
+                  |                                                   v
+                  |                                 +-----------------+-----------------+
+                  |                                 | Raspberry Pi 5 (8GB)              |
+                  |                                 | Broadcom BCM2712 Quad-Core A76    |
+                  |                                 +-----------------+-----------------+
+                  |                                                   |
+                  v                                                   | USB-A to USB-B
+           +------+------+                                            | Serial Cable
+           |    L298N    |                                            | (Data + Common GND)
+           |    Motor    |<-------------------------------------------+
+           |    Driver   |
+           +---+----+----+
+               |    |
+      7.4V VMS |    | Logic 5V / Common GND
+               v    v
+         +-----+----+----+
+         |  Arduino Uno  |
+         |  ATmega328P   |
+         +-------+-------+
+                 |
+                 v
+         +-------+-------+
+         | 16-Pin Berg   |
+         | Strip Header  |
+         +-------+-------+
+                 |
+         +-------+-------+
+         |               |
+         v               v
+     4x TT DC        2x HC-SR04P
+      Motors          Ultrasonics
+   (Skid-Steer)      (Front Array)
 ```
 
-* **Common Ground Principle:** The two power systems share a common ground reference exclusively through the USB-Serial cable shield to preserve logic integrity while preventing ground loops.
-* **16-Pin Berg Strip Header:** Provides organized distribution of the regulated 5V bus:
-  * Pins 1–8: Common +5V Rail (Arduino 5V, 2x Sonar VCC, 2x IR VCC, L298N Logic VCC, 2x Spares).
-  * Pins 9–16: Common GND Rail (Arduino GND, 2x Sonar GND, 2x IR GND, L298N GND, 2x Spares).
+* **Common Ground Principle:** The motor power rail (2S 18650 negative terminal, L298N GND, and Arduino GND) shares a single ground reference with the Raspberry Pi 5 exclusively through the shielded USB-Serial cable. This preserves 5V logic signal integrity while completely isolating high-current inductive motor spikes from the Pi's sensitive power rail.
+* **16-Pin Berg Strip Header:** Provides organized distribution of the regulated 5V bus and ground reference:
+  * Pins 1–8: Common +5V Rail (Arduino 5V output, 2x HC-SR04P VCC, L298N logic VCC, spare headers).
+  * Pins 9–16: Common GND Rail (Arduino GND, 2x HC-SR04P GND, L298N logic GND, spare headers).
 
 ### 2.3 Sensor Array & Spatial Field-of-View (FOV)
 The chassis mounts an overlapping multi-sensor array:
@@ -136,39 +169,41 @@ The chassis mounts an overlapping multi-sensor array:
                ______________________________________
               |                                      |
               |   [US1: Left]          [US2: Right]  |
+              |   (Trig D7,            (Trig D12,    |
+              |    Echo D13)            Echo D4)     |
               |      \                    /          |   US1: 15° Left Divergence
               |       \   Forward Cone   /           |   US2: 15° Right Divergence
               |        \   Overlapping  /            |   Combined Cone: ~60°
-              |         \              /             |   Threshold: < 20.0 cm
-              |          \            /              |
+              |         \              /             |   Threshold: < 25.0 cm (Auto-Brake)
+              |          \            /              |   Debounce: 2 Confirm Reads
               |           \          /               |
               |            \        /                |
               |             \      /                 |
-              |  [IR1]        [CAM]        [IR2]     |   CAM: CSI Camera (120° Wide FOV)
-              |               (CSI)                  |   IR1, IR2: Ground perimeter
+              |               [CAM]                  |   CAM: CSI Camera (OV5647, ~54° HFOV)
+              |               (CSI)                  |   (D2/D3 empty; no IR sensors)
               |                                      |
               |  [FL Wheel]          [FR Wheel]      |   Skid-Steer TT DC Motors
-              |  [RL Wheel]          [RR Wheel]      |   Left Pair: ENA / IN1 / IN2
-              |______________________________________|   Right Pair: ENB / IN3 / IN4
+              |  [RL Wheel]          [RR Wheel]      |   Left Pair: ENA(D5) / IN1(D8) / IN2(D9)
+              |______________________________________|   Right Pair: ENB(D6) / IN3(D10) / IN4(D11)
 
                           REAR OF CHASSIS
 ```
 
-* **HC-SR04P Ultrasonic Transceivers (x2):** Splayed laterally by $15^\circ$ to cover corner obstacles. Effective ranging: $2\,\text{cm}$ to $300\,\text{cm}$. The reflex threshold is parameterized at $20.0\,\text{cm}$ (`OBSTACLE_THRESHOLD_CM` in `protocol.h`).
-* **CSI Monocular Camera:** Wide-angle $120^\circ$ FOV camera mounted $12\,\text{cm}$ above the ground plane, angled downwards at $15^\circ$ pitch to cover both horizon targets and close road surface ($0.3\text{–}4.0\,\text{m}$).
+* **HC-SR04P Ultrasonic Transceivers (x2):** Splayed laterally by $15^\circ$ to cover corner obstacles. Effective ranging: $2\,\text{cm}$ to $300\,\text{cm}$. The reflex auto-brake threshold is calibrated at **$25.0\,\text{cm}$** (`OBSTACLE_CM = 25`) with a 2-sample consecutive debounce filter (`CONFIRM_READS = 2`) across $60\,\text{ms}$ loop cycles to suppress acoustic multipath spikes.
+* **CSI Monocular Camera (OmniVision OV5647 5MP Rev 1.3):** Replaces the damaged Global Shutter camera, interfacing via a 22-pin to 15-pin FPC adapter cable. Features a $53.5^\circ$ horizontal FOV ($3.6\,\text{mm}$ focal length, $1/4''$ sensor). Mounted $12\,\text{cm}$ above the ground plane, angled downwards at $15^\circ$ pitch to cover both horizon targets and road surface ($0.3\text{–}4.0\,\text{m}$). Diagnostic testing is supported via the local low-latency MJPEG streaming utility ([`tools/stream.py`](../tools/stream.py)).
 * **Sensor Blind Spot Coverage:** Horizontal ultrasonic sensors cannot detect road depressions or potholes. Conversely, monocular vision struggles with transparent glass or untextured surfaces at $<10\,\text{cm}$. The multi-modal sensor fusion completely eliminates mutual blind spots.
 
 ---
 
 ## 3. Firmware Architecture & 3-Tier Reflex State Machine
 
-The Arduino Uno firmware (`arduino/point_to_point_control/point_to_point_control.ino`) executes a deterministic, non-blocking finite state machine at a fixed $100\,\text{Hz}$ loop rate ($10\,\text{ms}$ cycle).
+The Arduino Uno firmware executes a deterministic, non-blocking finite state machine at a calibrated loop rate. The verified diagnostic sketch ([`arduino/motor_test/dual_motor_speed_test.ino`](../arduino/motor_test/dual_motor_speed_test.ino)) and production firmware ([`arduino/point_to_point_control/point_to_point_control.ino`](../arduino/point_to_point_control/point_to_point_control.ino)) implement the 3-tier priority hierarchy:
 
 ```mermaid
 stateDiagram-v2
     [*] --> STATE_IDLE : Power On / [TELEM] READY
 
-    STATE_IDLE --> STATE_DRIVING : DRIVE cmd
+    STATE_IDLE --> STATE_DRIVING : DRIVE cmd / 'g' Resume
     STATE_IDLE --> STATE_TURNING : TURN cmd
     STATE_IDLE --> STATE_REVERSING : REV cmd
 
@@ -176,44 +211,49 @@ stateDiagram-v2
     STATE_TURNING --> STATE_IDLE : Timer Expires / [TELEM] DONE TURN
     STATE_REVERSING --> STATE_IDLE : Timer Expires / [TELEM] DONE REV
 
-    STATE_DRIVING --> STATE_AVOIDING : US reading < 20cm (Tier 2 Reflex)
-    STATE_TURNING --> STATE_AVOIDING : US reading < 20cm (Tier 2 Reflex)
-    STATE_REVERSING --> STATE_AVOIDING : US reading < 20cm (Tier 2 Reflex)
+    STATE_DRIVING --> STATE_AVOIDING : US reading < 25cm (Tier 2 Reflex)
+    STATE_TURNING --> STATE_AVOIDING : US reading < 25cm (Tier 2 Reflex)
+    STATE_REVERSING --> STATE_AVOIDING : US reading < 25cm (Tier 2 Reflex)
 
     STATE_AVOIDING --> STATE_IDLE : Avoidance Sequence Done / [TELEM] DONE AVOID
 
-    STATE_DRIVING --> STATE_PI_STOPPED : PI_STOP (Tier 1 Latch)
-    STATE_TURNING --> STATE_PI_STOPPED : PI_STOP (Tier 1 Latch)
-    STATE_REVERSING --> STATE_PI_STOPPED : PI_STOP (Tier 1 Latch)
-    STATE_AVOIDING --> STATE_PI_STOPPED : PI_STOP (Tier 1 Latch)
-    STATE_IDLE --> STATE_PI_STOPPED : PI_STOP (Tier 1 Latch)
+    STATE_DRIVING --> STATE_PI_STOPPED : PI_STOP / Serial 's' (Tier 1 Latch)
+    STATE_TURNING --> STATE_PI_STOPPED : PI_STOP / Serial 's' (Tier 1 Latch)
+    STATE_REVERSING --> STATE_PI_STOPPED : PI_STOP / Serial 's' (Tier 1 Latch)
+    STATE_AVOIDING --> STATE_PI_STOPPED : PI_STOP / Serial 's' (Tier 1 Latch)
+    STATE_IDLE --> STATE_PI_STOPPED : PI_STOP / Serial 's' (Tier 1 Latch)
 
-    STATE_PI_STOPPED --> STATE_IDLE : PI_GO (Latch Released)
+    STATE_PI_STOPPED --> STATE_IDLE : PI_GO / Serial 'g' (Latch Released)
 ```
 
 ### 3.1 Priority Tiers
 
-#### Tier 1: Emergency Latches & Watchdog (Absolute Highest Priority)
-* **`PI_STOP`:** Instantaneous latch. Forces `ENA=0`, `ENB=0`, and transitions to `STATE_PI_STOPPED`. All ongoing actions (including mid-maneuver Tier 2 avoidance) are aborted. The vehicle remains locked until a valid `PI_GO` command is received.
+#### Tier 1: Emergency Latches, Serial Pause & Watchdog (Absolute Highest Priority)
+* **`PI_STOP` / Serial Emergency Halt (`'s'`):** Instantaneous latch. Forces `ENA=0`, `ENB=0` (`stopAll()`), and transitions to `STATE_PI_STOPPED` (or `isStopped = true`). All ongoing actions (including mid-maneuver Tier 2 avoidance) are aborted immediately. The vehicle remains locked until a valid release command is received:
+  * Over USB-Serial protocol: `PI_GO` command releases the latch to `STATE_IDLE`.
+  * Over interactive serial monitor: Sending `'g'` / `'G'` resumes operation.
 * **Watchdog Failsafe:** The firmware monitors incoming serial timestamps. If no valid packet is received within $5000\,\text{ms}$ (`WATCHDOG_TIMEOUT_MS`), the car halts all motors and emits `[TELEM] HEARTBEAT_TIMEOUT`.
 * **Command Blocking:** Any Tier 3 movement command received during `STATE_PI_STOPPED` is rejected with `[ACK] BLOCKED (PI_STOPPED)`.
 
 #### Tier 2: Hard Real-Time Local Avoidance Reflex (Autonomous Microcontroller Loop)
-Triggered whenever either front ultrasonic reads $< 20.0\,\text{cm}$ during forward motion, turning, or reversing. Operates independently of the Raspberry Pi:
-1. **Phase 1 — Reverse (`AVOID_REVERSE_MS = 400ms`):** Reverses both motors at PWM 150 to clear the collision zone.
-2. **Phase 2 — Skid-Turn (`AVOID_TURN_MS = 500ms`):** Turns away from the detected obstacle at PWM 150:
-   * Left sensor triggered $\rightarrow$ Turn **Right** (Left FWD, Right REV).
-   * Right sensor triggered $\rightarrow$ Turn **Left** (Left REV, Right FWD).
-   * Both sensors triggered $\rightarrow$ Check stored `PI_AVOID` hint. If none, default Right.
-   * `PI_AVOID` Hint Override: If the Pi previously sent `PI_AVOID LEFT` or `PI_AVOID RIGHT`, the hint strictly overrides the reflex direction and is consumed.
-3. **Phase 3 — Forward Resume (`AVOID_RESUME_MS = 2000ms`):** Resumes forward travel at `savedDriveSpeed`.
-4. **Cooldown (`AVOID_COOLDOWN_MS = 500ms`):** Suppresses re-triggering immediately after avoidance to prevent hunting oscillations.
+Triggered autonomously whenever either front ultrasonic sensor reads $< 25.0\,\text{cm}$ (`OBSTACLE_CM = 25`) confirmed over 2 consecutive readings (`CONFIRM_READS = 2`). Operates with zero latency independent of the Raspberry Pi:
+1. **Case A: Both Sensors Blocked ($dL < 25\,\text{cm}$ and $dR < 25\,\text{cm}$):**
+   * **Phase 1 — Reverse (`REVERSE_MS = 400ms`):** Reverses both motors at PWM 190 (`SPEED_REVERSE`) to clear the collision zone.
+   * **Phase 2 — Pivot Turn (`BOTH_TURN_MS = 450ms`):** Evaluates sensor clearance and turns toward the more open side ($dL \ge dR \rightarrow$ Turn Left; $dL < dR \rightarrow$ Turn Right) at PWM 210 (`SPEED_TURN`).
+2. **Case B: Right Sensor Blocked Only ($dR < 25\,\text{cm}$):**
+   * Immediately executes a fast skid-turn **Left** (`setLeft(-210)`, `setRight(210)`).
+3. **Case C: Left Sensor Blocked Only ($dL < 25\,\text{cm}$):**
+   * Immediately executes a fast skid-turn **Right** (`setLeft(210)`, `setRight(-210)`).
+4. **Case D: Path Clear ($dL \ge 25\,\text{cm}$ and $dR \ge 25\,\text{cm}$):**
+   * Drives forward at calibrated speed PWM 200 (`SPEED_FORWARD`).
+5. **Phase 3 — Forward Resume & Cooldown:** Resumes forward cruising. Cooldown period ($500\,\text{ms}$) suppresses re-triggering during initial acceleration.
+6. **`PI_AVOID` Hint Override:** If the Pi previously provided an avoidance hint (`PI_AVOID LEFT` or `PI_AVOID RIGHT`), that direction strictly overrides the local decision for both-blocked conditions.
 
 #### Tier 3: High-Level Navigation (Supervised by Raspberry Pi)
-Executes timed movement primitives:
-* `DRIVE <speed> <duration_ms>`
-* `REV <speed> <duration_ms>`
-* `TURN <angle_deg> <speed>` (Negative angle = Left, Positive angle = Right)
+Executes timed movement primitives calibrated for the 4WD skid-steer chassis:
+* `DRIVE <speed> <duration_ms>` (Default cruising speed: PWM 200)
+* `REV <speed> <duration_ms>` (Default reverse speed: PWM 190)
+* `TURN <angle_deg> <speed>` (Negative angle = Left, Positive angle = Right; speed: PWM 210)
 * `STOP` (Non-latched immediate halt to `STATE_IDLE`)
 
 ---
@@ -312,6 +352,8 @@ Implemented in [`car/perception/tracker.py`](../car/perception/tracker.py):
 | **PI_STOP** | `PI_STOP` | None | 1 | Latches vehicle in `STATE_PI_STOPPED`. Forces $PWM=0$. Overrides all states. |
 | **PI_GO** | `PI_GO` | None | 1 | Releases `PI_STOP` latch. Returns car to `STATE_IDLE`. |
 | **PI_AVOID** | `PI_AVOID <dir>` | `LEFT` or `RIGHT` | 1 | Stores one-shot direction hint for the next Tier 2 reflex avoidance. |
+| **'s' / 'S'** | `s` | Single char | 1 | Interactive emergency halt: immediately zeroes all motor outputs. |
+| **'g' / 'G'** | `g` | Single char | 1 | Interactive resume: unpauses car and resumes sensor-driven execution. |
 | **DRIVE** | `DRIVE <spd> <ms>` | `spd`: 0–255, `ms`: Duration | 3 | Drives forward at PWM speed for specified duration, then halts to `IDLE`. |
 | **REV** | `REV <spd> <ms>` | `spd`: 0–255, `ms`: Duration | 3 | Reverses at PWM speed for specified duration, then halts to `IDLE`. |
 | **TURN** | `TURN <deg> <spd>` | `deg`: -180 to +180, `spd`: PWM | 3 | Skid-steer turn by angle ($<0$ Left, $>0$ Right) at specified PWM speed. |
@@ -323,11 +365,12 @@ Implemented in [`car/perception/tracker.py`](../car/perception/tracker.py):
 | Message Header | Format Example | Frequency | Functional Description |
 |---|---|---|---|
 | **[TELEM] READY** | `[TELEM] READY Uno-ATmega328P` | Boot | Emitted upon microcontroller reset and setup completion. |
-| **[TELEM] STATE** | `[TELEM] STATE=DRIVING SPEED=180` | On change | Signals FSM state transition and active drive speed. |
+| **[TELEM] STATE** | `[TELEM] STATE=DRIVING SPEED=200` | On change | Signals FSM state transition and active drive speed. |
 | **[TELEM] US** | `[TELEM] US LEFT=24.5 RIGHT=88.2` | Every $100\,\text{ms}$ | Calibrated distance readings from front ultrasonic sensors. |
+| **Diagnostic Stream** | `L: 24 cm \| R: 88 cm --> CLEAR: Driving FORWARD` | Loop ($60\,\text{ms}$) | Human-readable telemetry emitted by diagnostic obstacle avoidance firmware. |
 | **[TELEM] AVOID** | `[TELEM] AVOID RIGHT` | Event | Emitted when Tier 2 reflex initiates an evasive maneuver. |
 | **[TELEM] DONE** | `[TELEM] DONE DRIVE` | Event | Confirms completion of a timed movement primitive. |
-| **[ACK]** | `[ACK] DRIVE 180 2000` | Immediate | Confirms syntax validity and acceptance of command. |
+| **[ACK]** | `[ACK] DRIVE 200 2000` | Immediate | Confirms syntax validity and acceptance of command. |
 | **[ACK] BLOCKED** | `[ACK] BLOCKED (PI_STOPPED)` | Immediate | Emitted when command rejected due to active Tier 1 latch. |
 
 ---
@@ -351,8 +394,8 @@ The system architecture handles complex real-world conditions through 10 formal 
 * **Resolution:** `PI_STOP` has absolute priority over Tier 2. The moment `PI_STOP` arrives over serial, the Arduino immediately kills motor PWM, aborts the remaining avoidance phases, and latches into `STATE_PI_STOPPED`. When `PI_GO` is subsequently issued, the car does not resume the aborted avoidance; it enters `STATE_IDLE` with a clean slate.
 
 ### Scenario 02: Sudden Physical Obstacle (Tier 2 Ultrasonic Override)
-* **Situation:** While executing a high-level `DRIVE` command from the Pi, a low obstacle or reflective surface appears $18\,\text{cm}$ in front of the left sensor.
-* **Resolution:** The Arduino firmware interrupts Tier 3 navigation locally within $10\,\text{ms}$, transitions to `STATE_AVOIDING`, reverses $400\,\text{ms}$, turns right $500\,\text{ms}$, and notifies the Pi with `[TELEM] AVOID RIGHT`.
+* **Situation:** While executing a high-level `DRIVE` command from the Pi, a low obstacle or reflective surface appears $22\,\text{cm}$ in front of the left sensor (within the calibrated $25\,\text{cm}$ threshold).
+* **Resolution:** The Arduino firmware interrupts Tier 3 navigation locally within $10\,\text{ms}$ (debounced across 2 cycles), transitions to `STATE_AVOIDING`, executes an evasive pivot turn right at PWM 210 (or reverses $400\,\text{ms}$ at PWM 190 followed by turn if both sensors trigger), and notifies the Pi with `[TELEM] AVOID RIGHT`.
 
 ---
 
@@ -381,11 +424,11 @@ model-car-capstone/
 ├── arduino/
 │   ├── PROTOCOL.md                              # Authoritative serial command/telemetry contract
 │   ├── lib/
-│   │   ├── pins.h                               # Hardware pin assignments (single source of truth)
+│   │   ├── pins.h                               # Hardware pin assignments (Architecture v2 single source of truth)
 │   │   └── protocol.h                           # Protocol constants, baud, timing thresholds
 │   ├── motor_test/
 │   │   ├── motor_test.ino                       # Legacy single-motor test (guarded)
-│   │   └── dual_motor_speed_test.ino            # Full dual-motor & PWM ramp diagnostic suite
+│   │   └── dual_motor_speed_test.ino            # Verified working 4WD skid-steer obstacle avoidance & diagnostic suite
 │   ├── dual_motor_speed_test/                   # Dedicated standalone Arduino IDE sketch folder
 │   │   └── dual_motor_speed_test.ino
 │   └── point_to_point_control/
@@ -448,3 +491,24 @@ model-car-capstone/
 ### ADR-0003: Microcontroller Evolution — Future Nano Migration
 * **Decision:** Design all pin assignments and firmware for compatibility with the **Arduino Nano** (ATmega328P).
 * **Rationale:** The Arduino Uno R3 and Arduino Nano share the identical ATmega328P microcontroller core, pin count, register mappings, and hardware timers. Migrating to the Nano in future revisions will reduce chassis footprint by $70\%$ with zero firmware modifications.
+
+### ADR-0004: Hardware Pinout Realignment & IR Sensor Removal
+* **Decision:** Re-assign front ultrasonic transceivers to Left = D7 (Trig) / D13 (Echo) and Right = D12 (Trig) / D4 (Echo), designate pins D2 and D3 as UNCONNECTED/RESERVED, and eliminate IR proximity sensors from the physical design.
+* **Rationale:**
+  1. Physical tracing revealed pins D2 and D3 were completely empty on the physical chassis; phantom code references to IR sensors were legacy artifacts.
+  2. Ultrasonic wiring was physically matched to D7/D13 and D12/D4. D13 on Arduino Uno has an onboard LED that flickers during echo pulses, but provides flawless $1\,\mu\text{s}$ timing resolution.
+  3. Freeing D2 (`INT0`) and D3 (`INT1`) preserves critical hardware interrupt pins for future rotary wheel encoder integration without requiring breadboard multiplexing.
+
+### ADR-0005: TT Motor Polarity Inversion & L298N BJT Torque Compensation
+* **Decision:** Enforce firmware-level direction inversion (`INVERT_MOTOR_POLARITY = true` / `INVERT_DIR = true`) and calibrate operating PWM levels to $190\text{–}210$ (replacing legacy PWM 120/150).
+* **Rationale:**
+  1. Inverted chassis wiring caused reverse travel on forward logic. Modifying wiring violates the borrowed lab hardware constraint; inverting logic bits in firmware completely solves the problem with zero physical risk.
+  2. The L298N's internal bipolar transistors induce a $\approx 2.0\,\text{V}$ drop. From a 2S Li-Ion pack ($7.4\,\text{V}$), only $\sim 5.4\,\text{V}$ reaches the motors. A PWM of 120 provided insufficient torque to break static friction, causing chassis stalls. Operating at PWM 200 (forward) and 210 (pivot turns) delivers reliable breakaway torque and skid-steer maneuvering.
+
+### ADR-0006: Vision Sensor Transition — OmniVision OV5647 5MP Adoption
+* **Decision:** Adopt the **OmniVision OV5647 5MP Camera Module (Rev 1.3)** via a 22-pin to 15-pin FPC adapter cable, replacing the cracked Raspberry Pi Global Shutter camera.
+* **Rationale:**
+  1. Physical glass damage to the borrowed Global Shutter module rendered it non-viable. The OV5647 is widely available, cost-effective, and supported natively by the Raspberry Pi 5 PiSP kernel driver.
+  2. The fixed/manual focus lens provides immediate optical sharpness without the heavy blur caused by un-tuned C/CS manual lenses.
+  3. The optical horizontal FOV shifts from $120^\circ$ (wide angle) to $\approx 53.5^\circ$ (standard $3.6\,\text{mm}$ lens). Perception and zone-scoring logic in `car/perception/config.py` have been aligned to `CAMERA_HFOV_DEG = 53.5`.
+  4. Diagnostic bench viewing is decoupled from high-latency Pi Connect desktop screen-sharing via a dedicated local HTTP MJPEG server ([`tools/stream.py`](../tools/stream.py)). Autonomous driving pipelines bypass streaming entirely, streaming frames in-memory via `picamera2.capture_array()`.
