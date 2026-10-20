@@ -56,7 +56,7 @@ const int PIN_US_LEFT_ECHO = 4;    // D4  — Echo (INPUT, pulse timing)
 
 // Right Ultrasonic (HC-SR04P front-right)
 const int PIN_US_RIGHT_TRIG = 7;   // D7  — Trigger (10μs pulse OUTPUT)
-const int PIN_US_RIGHT_ECHO = 13;  // D13 — Echo (INPUT, pulse timing) — built-in LED flickers (cosmetic only)
+const int PIN_US_RIGHT_ECHO = A0;  // D13 — Echo (INPUT, pulse timing) — built-in LED flickers (cosmetic only)
 
 // =============================================================================
 // IR Proximity Sensors (×2) — wired on D2/D3

@@ -5,8 +5,12 @@
  * the Arduino Uno firmware. Source of truth for the human-readable spec:
  * arduino/PROTOCOL.md
  *
- * All avoidance timing constants are calibrate-able via this file only —
- * never hardcode magic numbers in the .ino sketch.
+ * All constants below are compile-time DEFAULTS. At runtime, they are
+ * loaded into a TunableParams struct and can be overridden via the
+ * serial TUNE command (changes reset on power cycle).
+ *
+ * Never hardcode magic numbers in the .ino sketch — reference these
+ * defines or the tune.xxx runtime values.
  */
 
 #ifndef CAR_PROTOCOL_H
@@ -28,11 +32,35 @@
 // Ultrasonic Obstacle Detection
 // =============================================================================
 #define US_OBSTACLE_DISTANCE_CM  20.0f   // Tier 2 avoidance triggers if either sensor < this
-#define US_PING_INTERVAL_MS      100     // Poll both ultrasonics every 100ms
-#define US_TIMEOUT_US            30000   // pulseIn timeout in µs (~5m max range for HC-SR04P)
+                                         // NOTE: Auto-adjusted after cliff calibration if this
+                                         // value exceeds the ground baseline (tilted sensors).
+#define US_PING_INTERVAL_MS      300     // Poll ultrasonics every 100ms (staggered 50ms per sensor)
+#define US_TIMEOUT_US            15000   // pulseIn timeout in µs (~250cm range; balances detection and loop rate)
 
 // =============================================================================
-// Avoidance Maneuver Timing
+// Cliff Detection (Negative Obstacle) — Tier 1.5
+// -----------------------------------------------------------------------------
+// Sensors are tilted downward at an angle for dual-purpose sensing:
+//   - Obstacle: reading DROPS below threshold (something closer than ground)
+//   - Cliff:    reading JUMPS above baseline + margin (ground disappears)
+//
+// Auto-calibrated at boot: sensors read the ground surface in setup() to
+// establish the baseline. Sanity-checked against plausible range; falls
+// back to CLIFF_BASELINE_DEFAULT_CM if calibration looks wrong.
+// =============================================================================
+#define CLIFF_BASELINE_DEFAULT_CM  30.0f  // Fallback baseline if auto-cal fails (cm)
+#define CLIFF_MARGIN_CM            15.0f  // Cliff triggers when reading > baseline + margin (cm)
+#define CLIFF_CAL_SAMPLES          10     // Number of readings to average during auto-calibration
+#define CLIFF_CAL_MIN_CM           3.0f   // Sanity check: minimum plausible ground baseline (cm)
+#define CLIFF_CAL_MAX_CM           10000.0f  // Sanity check: maximum plausible ground baseline (cm)
+#define CLIFF_CAL_DELAY_MS         200     // Delay between calibration readings (ms)
+#define CLIFF_REVERSE_MS           400    // Reverse burst before latching (ms)
+#define CLIFF_REVERSE_SPEED        150    // PWM speed for cliff reverse burst (0–255)
+#define CLIFF_CONFIRM_COUNT        2      // Consecutive readings above threshold to confirm cliff
+#define CLIFF_ENABLE_DEFAULT       0      // 1 = cliff reflex enabled (table/drop-offs), 0 = disabled (floor driving)
+
+// =============================================================================
+// Avoidance Maneuver Timing — Tier 2
 // Calibrate all three phases on the physical chassis before demo.
 // Phase sequence: Reverse → Skid-turn → Resume forward
 // =============================================================================
@@ -63,5 +91,12 @@
 // Must be measured on the physical chassis. Placeholder = 10ms/deg (uncalibrated).
 // =============================================================================
 #define TURN_MS_PER_DEGREE       10      // ms per degree — UNCALIBRATED, measure on real chassis
+
+// =============================================================================
+// Motor Trim Bias & EEPROM Persistence
+// =============================================================================
+#define MOTOR_TRIM_DEFAULT       0       // Default motor bias trim (-50 to +50; >0 right faster, <0 left faster)
+#define TELEM_STREAM_DEFAULT     0       // 1 = stream periodic US telemetry, 0 = silent (events and STATUS only)
+#define EEPROM_CONFIG_MAGIC      0xCA57  // Magic signature to validate stored EEPROM calibration
 
 #endif // CAR_PROTOCOL_H
