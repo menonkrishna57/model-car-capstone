@@ -20,17 +20,20 @@ CONFIDENCE_THRESHOLD = 0.25            # Detection threshold
 SERIAL_PORT = "/dev/ttyUSB0"
 SERIAL_BAUD = 115200                   # Matches arduino/PROTOCOL.md
 
-# ── Camera (CSI — Global Shutter) ────────────────────────────────────────────
+# ── Camera (CSI — OmniVision OV5647 5MP Rev 1.3) ──────────────────────────────
+# Replaces broken Global Shutter; connected via 22-pin to 15-pin FPC cable.
 # Managed via picamera2 on Pi 5
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
+CAMERA_HFOV_DEG = 53.5                  # Horizontal Field of View (~53.5° for 3.6mm lens)
+CAMERA_AWB_MODE = "Daylight"            # White balance profile matching daylight.jpg
 
 # ── Ultrasonic Sensors (2× HC-SR04P, both front-facing) ──────────────────────
 # Polling is owned by the Arduino Uno to avoid Pi OS GPIO jitter.
 # Distances are received as '[TELEM] US LEFT=x RIGHT=y' serial messages
 # (parsed by MotorController.read_telemetry → SensorManager.read_ultrasonic).
-EMERGENCY_STOP_DISTANCE_CM = 20.0      # Stop immediately if obstacle closer than 20cm
+EMERGENCY_STOP_DISTANCE_CM = 25.0      # Stop immediately if obstacle closer than 25cm (Architecture v2)
 
 # ── IMU (ICM20948 over I2C) ──────────────────────────────────────────────────
 IMU_I2C_BUS = 1

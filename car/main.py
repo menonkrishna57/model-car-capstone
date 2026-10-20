@@ -161,6 +161,15 @@ def run_pipeline(mode: str = "autonomous"):
         )
         picam2.configure(cfg)
         picam2.start()
+        try:
+            from libcamera import controls
+            picam2.set_controls({"AwbMode": controls.AwbModeEnum.Daylight})
+            print("  ☀️ Camera AWB configured to Daylight mode (matching daylight.jpg).")
+        except Exception:
+            try:
+                picam2.set_controls({"AwbMode": 5})
+            except Exception:
+                pass
         use_picam2 = True
         print("  📷 CSI Camera initialised via Picamera2.")
     except Exception:

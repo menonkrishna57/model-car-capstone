@@ -1,302 +1,154 @@
-/**
- * dual_motor_speed_test.ino
- * =============================================================================
- * Dual Motor & PWM Speed Control Diagnostic Sketch
- * 
- * Hardware Setup (L298N Dual H-Bridge & Arduino Uno):
- * ---------------------------------------------------
- *   LEFT MOTOR (Channel B):
- *     - PWM (ENB): Pin D6  (PWM Speed: 0 - 255)
- *     - IN3:       Pin D10 (Direction bit 1: HIGH = Forward)
- *     - IN4:       Pin D11 (Direction bit 2: HIGH = Reverse)
- * 
- *   RIGHT MOTOR (Channel A):
- *     - PWM (ENA): Pin D5  (PWM Speed: 0 - 255)
- *     - IN1:       Pin D8  (Direction bit 1: HIGH = Forward)
- *     - IN2:       Pin D9  (Direction bit 2: HIGH = Reverse)
- * 
- * Test Features:
- * --------------
- *   1. Automated Diagnostic Sequence:
- *      - Left motor individual direction and speed check
- *      - Right motor individual direction and speed check
- *      - Both motors synchronized forward/reverse
- *      - Smooth PWM speed ramping (0 -> 255 -> 0) in steps
- *      - Differential turning (spin left / spin right)
- *   2. Interactive Serial Monitor Commands (at 115200 baud):
- *      - "TEST"        : Run the full automated test suite
- *      - "RAMP"        : Test PWM speed gradient on both motors
- *      - "L <speed>"   : Drive left motor (-255 to 255, negative = reverse)
- *      - "R <speed>"   : Drive right motor (-255 to 255, negative = reverse)
- *      - "BOTH <speed>": Drive both motors (-255 to 255)
- *      - "STOP"        : Immediately stop all motors
- * =============================================================================
- */
+﻿// =============================================================================
+// 4WD SKID-STEER OBSTACLE AVOIDANCE (VERIFIED HARDWARE CONFIG)
+// - Left Sensor : Trig = Pin 7,  Echo = Pin 13
+// - Right Sensor: Trig = Pin 12, Echo = Pin 4
+// - L298N Motors: ENA = Pin 5, IN1 = Pin 8,  IN2 = Pin 9
+//                 ENB = Pin 6, IN3 = Pin 10, IN4 = Pin 11
+//
+// POLARITY: INVERT_DIR = true (fixes reversed TT motor wiring)
+// =============================================================================
 
-// Pin Definitions (Matches physical chassis wiring and pins.h):
-// Left Motor Pair  -> L298N Channel B: ENB = D6, IN3 = D10, IN4 = D11
-// Right Motor Pair -> L298N Channel A: ENA = D5, IN1 = D8,  IN2 = D9
-const int PIN_LEFT_PWM  = 6;   // L298N ENB (Timer0/OC0A)
-const int PIN_LEFT_IN1  = 10;  // L298N IN3 (Dir bit 1)
-const int PIN_LEFT_IN2  = 11;  // L298N IN4 (Dir bit 2)
+// ---------- Pins ----------
+#define LEFT_TRIG_PIN  7
+#define LEFT_ECHO_PIN  13
+#define RIGHT_TRIG_PIN 12
+#define RIGHT_ECHO_PIN 4
 
-const int PIN_RIGHT_PWM = 5;   // L298N ENA (Timer0/OC0B)
-const int PIN_RIGHT_IN1 = 8;   // L298N IN1 (Dir bit 1)
-const int PIN_RIGHT_IN2 = 9;   // L298N IN2 (Dir bit 2)
+#define ENA 5
+#define IN1 8
+#define IN2 9
+#define ENB 6
+#define IN3 10
+#define IN4 11
 
-// Helper functions for motor control
-void setLeftMotor(int speed) {
-  speed = constrain(speed, -255, 255);
-  if (speed > 0) {
-    digitalWrite(PIN_LEFT_IN1, HIGH);
-    digitalWrite(PIN_LEFT_IN2, LOW);
-    analogWrite(PIN_LEFT_PWM, speed);
-  } else if (speed < 0) {
-    digitalWrite(PIN_LEFT_IN1, LOW);
-    digitalWrite(PIN_LEFT_IN2, HIGH);
-    analogWrite(PIN_LEFT_PWM, -speed);
-  } else {
-    digitalWrite(PIN_LEFT_IN1, LOW);
-    digitalWrite(PIN_LEFT_IN2, LOW);
-    analogWrite(PIN_LEFT_PWM, 0);
-  }
+// ---------- Tuning ----------
+const bool          INVERT_DIR      = true;   // Corrects reversed motor wiring
+const bool          SWAP_SIDES      = false;  // true if left/right sides swapped
+const unsigned int  OBSTACLE_CM     = 25;     // Detection threshold (cm)
+const uint8_t       SPEED_FORWARD   = 200;    // Forward torque
+const uint8_t       SPEED_TURN      = 210;    // Pivot turn torque
+const uint8_t       SPEED_REVERSE   = 190;    // Backing up torque
+const unsigned long LOOP_MS         = 60;     // Sensor loop interval
+const unsigned long REVERSE_MS      = 400;    // Backup duration (ms)
+const unsigned long BOTH_TURN_MS    = 450;    // Turn duration after backup (ms)
+const unsigned long SENSOR_TIMEOUT  = 25000;  // 25ms timeout (~4m)
+const uint8_t       CONFIRM_READS   = 2;      // Debounce noisy readings
+
+uint8_t leftHits = 0, rightHits = 0;
+bool isStopped = false;
+
+// ---------- Low-level motor control ----------
+void driveA(int s) {
+  if (INVERT_DIR) s = -s;
+  digitalWrite(IN1, s > 0 ? HIGH : LOW);
+  digitalWrite(IN2, s < 0 ? HIGH : LOW);
+  analogWrite(ENA, abs(s));
 }
 
-void setRightMotor(int speed) {
-  speed = constrain(speed, -255, 255);
-  if (speed > 0) {
-    digitalWrite(PIN_RIGHT_IN1, HIGH);
-    digitalWrite(PIN_RIGHT_IN2, LOW);
-    analogWrite(PIN_RIGHT_PWM, speed);
-  } else if (speed < 0) {
-    digitalWrite(PIN_RIGHT_IN1, LOW);
-    digitalWrite(PIN_RIGHT_IN2, HIGH);
-    analogWrite(PIN_RIGHT_PWM, -speed);
-  } else {
-    digitalWrite(PIN_RIGHT_IN1, LOW);
-    digitalWrite(PIN_RIGHT_IN2, LOW);
-    analogWrite(PIN_RIGHT_PWM, 0);
-  }
+void driveB(int s) {
+  if (INVERT_DIR) s = -s;
+  digitalWrite(IN3, s > 0 ? HIGH : LOW);
+  digitalWrite(IN4, s < 0 ? HIGH : LOW);
+  analogWrite(ENB, abs(s));
 }
 
-void stopMotors() {
-  setLeftMotor(0);
-  setRightMotor(0);
+void setLeft(int speed) {
+  int s = constrain(speed, -255, 255);
+  if (SWAP_SIDES) { driveB(s); } else { driveA(s); }
 }
 
-void printBanner() {
-  Serial.println(F("\n=================================================="));
-  Serial.println(F("     DUAL MOTOR & SPEED TEST DIAGNOSTIC           "));
-  Serial.println(F("=================================================="));
-  Serial.println(F("Pins: Left Motor  [Ch.B] (PWM=6, IN3=10, IN4=11)"));
-  Serial.println(F("      Right Motor [Ch.A] (PWM=5, IN1=8,  IN2=9)"));
-  Serial.println(F("Commands (Serial Monitor at 115200 baud):"));
-  Serial.println(F("  TEST         - Run automated test cycle"));
-  Serial.println(F("  RAMP         - Run PWM speed ramp sweep (0-255)"));
-  Serial.println(F("  L <speed>    - Set left motor speed (-255 to 255)"));
-  Serial.println(F("  R <speed>    - Set right motor speed (-255 to 255)"));
-  Serial.println(F("  BOTH <speed> - Set both motors speed (-255 to 255)"));
-  Serial.println(F("  STOP         - Stop all motors immediately"));
-  Serial.println(F("==================================================\n"));
+void setRight(int speed) {
+  int s = constrain(speed, -255, 255);
+  if (SWAP_SIDES) { driveA(s); } else { driveB(s); }
 }
 
-void runAutomatedTest() {
-  Serial.println(F(">>> STARTING AUTOMATED MOTOR TEST CYCLE <<<"));
-  Serial.println(F("CAUTION: Ensure wheels are elevated off ground!\n"));
+// ---------- Movements ----------
+void forward()   { setLeft(SPEED_FORWARD);  setRight(SPEED_FORWARD); }
+void backward()  { setLeft(-SPEED_REVERSE); setRight(-SPEED_REVERSE); }
+void stopAll()   { setLeft(0); setRight(0); }
+void turnLeft()  { setLeft(-SPEED_TURN); setRight(SPEED_TURN); }
+void turnRight() { setLeft(SPEED_TURN);  setRight(-SPEED_TURN); }
 
-  // -------------------------------------------------------------
-  // Test 1: Left Motor Solo
-  // -------------------------------------------------------------
-  Serial.println(F("[1/5] Testing LEFT MOTOR:"));
-  Serial.println(F("  -> Left Forward @ PWM 130 (Medium)"));
-  setLeftMotor(130);
-  setRightMotor(0);
-  delay(1500);
-
-  Serial.println(F("  -> Left Forward @ PWM 220 (High)"));
-  setLeftMotor(220);
-  delay(1500);
-
-  Serial.println(F("  -> Left STOP"));
-  stopMotors();
-  delay(800);
-
-  Serial.println(F("  -> Left Reverse @ PWM 150"));
-  setLeftMotor(-150);
-  delay(1500);
-
-  Serial.println(F("  -> Left STOP"));
-  stopMotors();
-  delay(800);
-
-  // -------------------------------------------------------------
-  // Test 2: Right Motor Solo
-  // -------------------------------------------------------------
-  Serial.println(F("\n[2/5] Testing RIGHT MOTOR:"));
-  Serial.println(F("  -> Right Forward @ PWM 130 (Medium)"));
-  setLeftMotor(0);
-  setRightMotor(130);
-  delay(1500);
-
-  Serial.println(F("  -> Right Forward @ PWM 220 (High)"));
-  setRightMotor(220);
-  delay(1500);
-
-  Serial.println(F("  -> Right STOP"));
-  stopMotors();
-  delay(800);
-
-  Serial.println(F("  -> Right Reverse @ PWM 150"));
-  setRightMotor(-150);
-  delay(1500);
-
-  Serial.println(F("  -> Right STOP"));
-  stopMotors();
-  delay(800);
-
-  // -------------------------------------------------------------
-  // Test 3: Both Motors Synchronized
-  // -------------------------------------------------------------
-  Serial.println(F("\n[3/5] Testing BOTH MOTORS:"));
-  Serial.println(F("  -> Both Forward @ PWM 140"));
-  setLeftMotor(140);
-  setRightMotor(140);
-  delay(2000);
-
-  Serial.println(F("  -> Both Forward @ PWM 240 (Fast)"));
-  setLeftMotor(240);
-  setRightMotor(240);
-  delay(1500);
-
-  Serial.println(F("  -> Both STOP"));
-  stopMotors();
-  delay(1000);
-
-  Serial.println(F("  -> Both Reverse @ PWM 140"));
-  setLeftMotor(-140);
-  setRightMotor(-140);
-  delay(2000);
-
-  Serial.println(F("  -> Both STOP"));
-  stopMotors();
-  delay(1000);
-
-  // -------------------------------------------------------------
-  // Test 4: Differential Turn (Skid Steer)
-  // -------------------------------------------------------------
-  Serial.println(F("\n[4/5] Testing DIFFERENTIAL TURNS:"));
-  Serial.println(F("  -> Turn RIGHT in place (Left FWD 150, Right REV 150)"));
-  setLeftMotor(150);
-  setRightMotor(-150);
-  delay(1500);
-
-  Serial.println(F("  -> STOP"));
-  stopMotors();
-  delay(800);
-
-  Serial.println(F("  -> Turn LEFT in place (Left REV 150, Right FWD 150)"));
-  setLeftMotor(-150);
-  setRightMotor(150);
-  delay(1500);
-
-  Serial.println(F("  -> STOP"));
-  stopMotors();
-  delay(1000);
-
-  // -------------------------------------------------------------
-  // Test 5: Speed Ramping / PWM Sweep
-  // -------------------------------------------------------------
-  Serial.println(F("\n[5/5] Testing PWM SPEED RAMPING (0 -> 255 -> 0):"));
-  runSpeedRamp();
-
-  Serial.println(F("\n>>> AUTOMATED TEST COMPLETE! <<<\n"));
-}
-
-void runSpeedRamp() {
-  Serial.println(F("  -> Ramping UP speed from 0 to 255..."));
-  for (int spd = 0; spd <= 255; spd += 25) {
-    setLeftMotor(spd);
-    setRightMotor(spd);
-    Serial.print(F("    PWM Speed: "));
-    Serial.println(spd);
-    delay(250);
-  }
-  delay(1000);
-
-  Serial.println(F("  -> Ramping DOWN speed from 255 to 0..."));
-  for (int spd = 255; spd >= 0; spd -= 25) {
-    setLeftMotor(spd);
-    setRightMotor(spd);
-    Serial.print(F("    PWM Speed: "));
-    Serial.println(spd);
-    delay(250);
-  }
-  stopMotors();
-  Serial.println(F("  -> Ramp complete. Motors stopped."));
-}
-
-void parseSerialCommand(String cmd) {
-  cmd.trim();
-  cmd.toUpperCase();
-  if (cmd.length() == 0) return;
-
-  if (cmd == "TEST") {
-    runAutomatedTest();
-  } else if (cmd == "RAMP") {
-    runSpeedRamp();
-  } else if (cmd == "STOP") {
-    stopMotors();
-    Serial.println(F("[ACK] STOP - All motors halted."));
-  } else if (cmd.startsWith("L ")) {
-    int spd = cmd.substring(2).toInt();
-    setLeftMotor(spd);
-    Serial.print(F("[ACK] Left motor speed set to: "));
-    Serial.println(spd);
-  } else if (cmd.startsWith("R ")) {
-    int spd = cmd.substring(2).toInt();
-    setRightMotor(spd);
-    Serial.print(F("[ACK] Right motor speed set to: "));
-    Serial.println(spd);
-  } else if (cmd.startsWith("BOTH ")) {
-    int spd = cmd.substring(5).toInt();
-    setLeftMotor(spd);
-    setRightMotor(spd);
-    Serial.print(F("[ACK] Both motors speed set to: "));
-    Serial.println(spd);
-  } else {
-    Serial.print(F("Unknown command: "));
-    Serial.println(cmd);
-    Serial.println(F("Valid: TEST, RAMP, STOP, L <spd>, R <spd>, BOTH <spd>"));
-  }
+// ---------- Ultrasonic ----------
+unsigned int readCm(uint8_t trig, uint8_t echo) {
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  unsigned long us = pulseIn(echo, HIGH, SENSOR_TIMEOUT);
+  if (us == 0) return 999;
+  return us / 58;
 }
 
 void setup() {
+  pinMode(LEFT_TRIG_PIN, OUTPUT);
+  pinMode(LEFT_ECHO_PIN, INPUT);
+  pinMode(RIGHT_TRIG_PIN, OUTPUT);
+  pinMode(RIGHT_ECHO_PIN, INPUT);
+
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  stopAll();
   Serial.begin(115200);
-  while (!Serial && millis() < 1000); // Wait briefly for USB Serial
+  delay(500);
 
-  // Configure Left Motor Pins (Channel B)
-  pinMode(PIN_LEFT_PWM, OUTPUT);
-  pinMode(PIN_LEFT_IN1, OUTPUT);
-  pinMode(PIN_LEFT_IN2, OUTPUT);
-
-  // Configure Right Motor Pins (Channel A)
-  pinMode(PIN_RIGHT_PWM, OUTPUT);
-  pinMode(PIN_RIGHT_IN1, OUTPUT);
-  pinMode(PIN_RIGHT_IN2, OUTPUT);
-
-  // Ensure all motors are off initially
-  stopMotors();
-
-  printBanner();
-
-  // Run the test cycle once on startup
-  runAutomatedTest();
+  Serial.println("\n=======================================================");
+  Serial.println("  OBSTACLE AVOIDANCE SYSTEM READY");
+  Serial.println("  Type 's' to STOP, 'g' to GO");
+  Serial.println("=======================================================");
 }
 
 void loop() {
-  // Listen for commands in Serial Monitor
   if (Serial.available() > 0) {
-    String input = Serial.readStringUntil('\n');
-    parseSerialCommand(input);
+    char cmd = Serial.read();
+    if (cmd == 's' || cmd == 'S') {
+      isStopped = true;
+      stopAll();
+      Serial.println("\n🛑 >>> [STOP] MOTORS HALTED <<<");
+    } else if (cmd == 'g' || cmd == 'G') {
+      isStopped = false;
+      Serial.println("\n🟢 >>> [RESUME] RUNNING <<<");
+    }
   }
+
+  if (isStopped) {
+    stopAll();
+    delay(50);
+    return;
+  }
+
+  unsigned int dL = readCm(LEFT_TRIG_PIN, LEFT_ECHO_PIN);
+  delay(25);
+  unsigned int dR = readCm(RIGHT_TRIG_PIN, RIGHT_ECHO_PIN);
+
+  leftHits  = (dL < OBSTACLE_CM) ? min(leftHits + 1, 255)  : 0;
+  rightHits = (dR < OBSTACLE_CM) ? min(rightHits + 1, 255) : 0;
+  bool leftBlocked  = leftHits  >= CONFIRM_READS;
+  bool rightBlocked = rightHits >= CONFIRM_READS;
+
+  Serial.print("L: "); Serial.print(dL);
+  Serial.print(" cm | R: "); Serial.print(dR);
+  Serial.print(" cm  --> ");
+
+  if (leftBlocked && rightBlocked) {
+    Serial.println("🛑 BOTH BLOCKED: Backing up & turning");
+    backward();
+    delay(REVERSE_MS);
+    if (dL >= dR) turnLeft(); else turnRight();
+    delay(BOTH_TURN_MS);
+    leftHits = rightHits = 0;
+  } else if (rightBlocked) {
+    Serial.println("↩️ OBSTACLE RIGHT: Steering LEFT");
+    turnLeft();
+  } else if (leftBlocked) {
+    Serial.println("↪️ OBSTACLE LEFT: Steering RIGHT");
+    turnRight();
+  } else {
+    Serial.println("🟢 CLEAR: Driving FORWARD");
+    forward();
+  }
+
+  delay(LOOP_MS);
 }
