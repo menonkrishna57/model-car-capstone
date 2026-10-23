@@ -75,6 +75,11 @@ US_SLOW_DIST_CM = 60.0                  # Cautionary speed reduction zone (< 60 
 CRUISE_SPEED = 200                      # Normal cruising forward PWM
 SLOW_SPEED = 135                        # Cautionary PWM when approaching obstacle
 
+# ── Remote Control & Operating Modes ─────────────────────────────────────────
+control_mode = "autonomous"             # "autonomous" or "manual"
+manual_speed = 185                      # Default manual drive PWM (100 - 255)
+manual_action = "IDLE"                  # Current manual direction / status
+
 # ── 2. Camera Controls & Daylight White Balance ──────────────────────────────
 try:
     from libcamera import controls, Transform
@@ -257,13 +262,16 @@ class ArduinoBridge:
 
 arduino = ArduinoBridge()
 active_action_label = "IDLE (Safety Hold)"
+control_mode = "autonomous"  # "autonomous" or "manual"
+manual_speed = 185           # Default manual PWM speed (130, 185, 235)
+manual_action = "IDLE"       # Current manual command: IDLE, FORWARD, REVERSE, LEFT, RIGHT, STOP
 
 def is_valid_us(dist: float) -> bool:
     """Returns True if reading is a valid obstacle reflection (filters out 0.0 noise & 999 timeout)."""
     return 1.0 < dist < 850.0
 
 def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_dets: list):
-    global active_action_label
+    global active_action_label, control_mode, manual_action
 
     # 1. Camera Obstacle Check (YOLOv10n bounding box size & position)
     obstacle_ahead = False
@@ -275,6 +283,25 @@ def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_
             obstacle_ahead = True
             break
 
+    # ── MANUAL REMOTE CONTROL MODE ───────────────────────────────────────────
+    if control_mode == "manual":
+        # Keep critical collision safety auto-brake active during manual driving
+        us_l = arduino.latest_sonar["left"]
+        us_r = arduino.latest_sonar["right"]
+        v_l = is_valid_us(us_l)
+        v_r = is_valid_us(us_r)
+        if (v_l and us_l < EMERGENCY_STOP_DIST_CM) or (v_r and us_r < EMERGENCY_STOP_DIST_CM):
+            active_action_label = f"🛑 MANUAL SAFETY BRAKE (L:{us_l:.0f}cm R:{us_r:.0f}cm)"
+            arduino.stop()
+            manual_action = "SAFETY_BRAKE"
+            return
+        elif obstacle_ahead:
+            active_action_label = f"⚠️ MANUAL WARN: Obstacle Ahead | {manual_action}"
+        else:
+            active_action_label = f"🎮 MANUAL REMOTE: {manual_action} (PWM {manual_speed})"
+        return
+
+    # ── AUTONOMOUS NAVIGATION MODE ───────────────────────────────────────────
     if obstacle_ahead:
         active_action_label = "🛑 PI_STOP: Obstacle Imminent (Camera)"
         arduino.pi_stop()
@@ -386,6 +413,10 @@ PAGE = """<!DOCTYPE html>
     .badge-invert-on { background: rgba(88, 166, 255, 0.2); color: var(--accent); border: 1px solid var(--accent); }
     .badge-invert-off { background: rgba(139, 148, 158, 0.2); color: var(--muted); border: 1px solid var(--muted); }
     .badge-us { background: rgba(63, 185, 80, 0.2); color: var(--success); border: 1px solid var(--success); }
+    .badge-mode-auto { background: rgba(88, 166, 255, 0.2); color: #58a6ff; border: 1px solid #58a6ff; cursor: pointer; }
+    .badge-mode-manual { background: rgba(63, 185, 80, 0.25); color: #56d364; border: 1px solid #56d364; cursor: pointer; animation: pulse 2s infinite; }
+    @keyframes pulse { 0% { opacity: 0.85; } 50% { opacity: 1; box-shadow: 0 0 12px rgba(63, 185, 80, 0.4); } 100% { opacity: 0.85; } }
+
     .controls-dock {
       position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
       background: var(--card-glass); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
@@ -404,6 +435,74 @@ PAGE = """<!DOCTYPE html>
     button.btn-danger { background: rgba(248, 81, 73, 0.25); border-color: var(--danger); color: #ff7b72; }
     button.btn-success { background: rgba(63, 185, 80, 0.25); border-color: var(--success); color: #56d364; }
     .shortcut-tip { position: absolute; bottom: 6px; right: 12px; font-size: 0.7rem; color: var(--muted); opacity: 0.6; }
+
+    /* Remote Control Glass Panel */
+    .remote-panel {
+      position: absolute; right: 20px; bottom: 74px; z-index: 100;
+      background: var(--card-glass); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--border-glass); border-radius: 20px; padding: 12px 14px;
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.7); width: 194px;
+      transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .remote-panel.minimized {
+      transform: translateY(20px) scale(0.9);
+      opacity: 0; pointer-events: none;
+    }
+    .remote-header {
+      width: 100%; display: flex; justify-content: space-between; align-items: center;
+      font-size: 0.75rem; font-weight: 700; color: var(--accent);
+    }
+    .speed-pills {
+      display: flex; gap: 4px; background: rgba(255,255,255,0.06); border-radius: 12px; padding: 2px;
+    }
+    .btn-speed {
+      padding: 3px 7px; font-size: 0.65rem; border-radius: 10px; border: none; background: transparent; color: var(--muted); cursor: pointer; font-weight: 700;
+    }
+    .btn-speed.active {
+      background: var(--accent); color: #fff;
+    }
+    .dpad-grid {
+      display: grid; grid-template-columns: repeat(3, 48px); grid-template-rows: repeat(3, 48px); gap: 6px;
+      justify-content: center; align-items: center;
+    }
+    .dpad-btn {
+      width: 48px; height: 48px; padding: 0; border-radius: 14px;
+      display: flex; flex-direction: column; justify-content: center; align-items: center;
+      font-size: 1.05rem; font-weight: 700; border: 1px solid var(--border-glass);
+      background: rgba(255, 255, 255, 0.06); color: var(--text); cursor: pointer;
+      transition: all 0.1s ease; touch-action: manipulation;
+    }
+    .dpad-btn .key-hint {
+      font-size: 0.58rem; color: var(--muted); font-weight: 600; margin-top: -2px;
+    }
+    .dpad-btn:hover { background: rgba(255, 255, 255, 0.16); }
+    .dpad-btn:active, .dpad-btn.active {
+      transform: scale(0.92);
+    }
+    .dpad-btn.btn-drive-active {
+      background: rgba(63, 185, 80, 0.4) !important; border-color: var(--success) !important; color: #fff !important;
+      box-shadow: 0 0 16px rgba(63, 185, 80, 0.55);
+    }
+    .dpad-btn.btn-steer-active {
+      background: rgba(88, 166, 255, 0.4) !important; border-color: var(--accent) !important; color: #fff !important;
+      box-shadow: 0 0 16px rgba(88, 166, 255, 0.55);
+    }
+    .dpad-btn.btn-rev-active {
+      background: rgba(227, 179, 65, 0.4) !important; border-color: #e3b341 !important; color: #fff !important;
+      box-shadow: 0 0 16px rgba(227, 179, 65, 0.55);
+    }
+    .dpad-btn.dpad-stop {
+      background: rgba(248, 81, 73, 0.15); border-color: rgba(248, 81, 73, 0.4); color: #ff7b72;
+    }
+    .dpad-btn.dpad-stop:active, .dpad-btn.dpad-stop.active {
+      background: rgba(248, 81, 73, 0.5) !important; border-color: var(--danger) !important; color: #fff !important;
+      box-shadow: 0 0 16px rgba(248, 81, 73, 0.6);
+    }
+    .remote-footer {
+      font-size: 0.65rem; color: var(--muted); text-align: center;
+    }
+
     .modal {
       display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
       background: rgba(0,0,0,0.85); z-index: 1000; justify-content: center; align-items: center; padding: 20px;
@@ -420,6 +519,7 @@ PAGE = """<!DOCTYPE html>
 
   <header id="topbar">
     <div style="font-weight:700; font-size:0.85rem">🏎️ NMIMS MPSTME Capstone</div>
+    <div class="badge badge-mode-auto" id="mode-badge" onclick="toggleControlMode()" title="Click to toggle Mode (C)">MODE: AUTO 🤖</div>
     <div class="badge badge-daylight" id="awb-badge">AWB: DAYLIGHT ☀️</div>
     <div class="badge badge-motors-off" id="motors-badge">MOTORS: OFF ⏸️</div>
     <div class="badge badge-invert-on" id="invert-badge">POLARITY: INVERTED (FWD FIX) 🔄</div>
@@ -428,6 +528,8 @@ PAGE = """<!DOCTYPE html>
 
   <div class="controls-dock" id="dock">
     <button id="btn-motors" class="btn-danger" onclick="toggleMotors()">🚗 Enable Motors (M)</button>
+    <button id="btn-mode" onclick="toggleControlMode()">🎮 Mode: Manual (C)</button>
+    <button id="btn-remote" class="btn-active" onclick="toggleRemoteWidget()">🕹️ Remote</button>
     <button id="btn-invert" class="btn-active" onclick="toggleInvertMotors()">🔄 Polarity: Inverted (I)</button>
     <button class="btn-active" id="btn-daylight" onclick="setAwb('daylight')">☀️ Daylight</button>
     <button onclick="setAwb('auto')">🔄 Auto</button>
@@ -435,11 +537,37 @@ PAGE = """<!DOCTYPE html>
     <button id="btn-pothole-mode" class="btn-active" onclick="togglePotholeMode()">🕳️ Potholes Only</button>
     <button onclick="emergencyStop()" class="btn-danger">🛑 E-STOP (Space)</button>
     <button onclick="toggleFullscreen()">⛶ Fullscreen (F)</button>
-    <button onclick="openRef()">📷 Ref daylight.jpg</button>
+    <button onclick="openRef()">📷 Ref</button>
     <button onclick="toggleDock()" style="padding:7px 10px">👁️</button>
   </div>
 
-  <div class="shortcut-tip">Press <b>F</b> Fullscreen &bull; <b>M</b> Motors &bull; <b>I</b> Invert Polarity &bull; <b>Space</b> E-Stop &bull; <b>P</b> Potholes &bull; <b>H</b> Dock</div>
+  <!-- Floating Remote Control Widget (D-Pad) -->
+  <div class="remote-panel" id="remote-panel">
+    <div class="remote-header">
+      <span>🎮 Remote Control</span>
+      <div class="speed-pills">
+        <button class="btn-speed" onclick="setSpeed(130)" id="spd-130">130</button>
+        <button class="btn-speed active" onclick="setSpeed(185)" id="spd-185">185</button>
+        <button class="btn-speed" onclick="setSpeed(235)" id="spd-235">235</button>
+      </div>
+    </div>
+    <div class="dpad-grid">
+      <div></div>
+      <button class="dpad-btn" id="dpad-up" onmousedown="startDrive('forward')" onmouseup="stopDrive()" onmouseleave="stopDrive()" ontouchstart="startDrive('forward')" ontouchend="stopDrive()">▲<span class="key-hint">W</span></button>
+      <div></div>
+      <button class="dpad-btn" id="dpad-left" onmousedown="startDrive('left')" onmouseup="stopDrive()" onmouseleave="stopDrive()" ontouchstart="startDrive('left')" ontouchend="stopDrive()">◀<span class="key-hint">A</span></button>
+      <button class="dpad-btn dpad-stop" id="dpad-stop" onclick="stopDrive()">■<span class="key-hint">Space</span></button>
+      <button class="dpad-btn" id="dpad-right" onmousedown="startDrive('right')" onmouseup="stopDrive()" onmouseleave="stopDrive()" ontouchstart="startDrive('right')" ontouchend="stopDrive()">▶<span class="key-hint">D</span></button>
+      <div></div>
+      <button class="dpad-btn" id="dpad-down" onmousedown="startDrive('reverse')" onmouseup="stopDrive()" onmouseleave="stopDrive()" ontouchstart="startDrive('reverse')" ontouchend="stopDrive()">▼<span class="key-hint">S</span></button>
+      <div></div>
+    </div>
+    <div class="remote-footer">
+      <span>Drive: <b>WASD</b> or <b>Arrow Keys</b></span>
+    </div>
+  </div>
+
+  <div class="shortcut-tip"><b>WASD/Arrows</b> Drive &bull; <b>C</b> Mode &bull; <b>1/2/3</b> Speed &bull; <b>Space</b> E-Stop &bull; <b>M</b> Motors &bull; <b>I</b> Invert &bull; <b>H</b> Dock</div>
 
   <div class="modal" id="modal" onclick="closeRef()">
     <div class="modal-box" onclick="event.stopPropagation()">
@@ -452,6 +580,12 @@ PAGE = """<!DOCTYPE html>
   </div>
 
   <script>
+    let currentMode = 'autonomous';
+    let currentSpeed = 185;
+    let driveInterval = null;
+    let activeAction = null;
+    let keysPressed = new Set();
+
     function toggleFullscreen() {
       if (!document.fullscreenElement) {
         document.documentElement.requestFullscreen().catch(() => {});
@@ -496,7 +630,97 @@ PAGE = """<!DOCTYPE html>
       });
     }
 
+    function setSpeed(spd) {
+      currentSpeed = spd;
+      fetch('/set_speed?speed=' + spd).then(r => r.json()).then(d => {
+        document.querySelectorAll('.btn-speed').forEach(b => b.classList.remove('active'));
+        const activeBtn = document.getElementById('spd-' + spd);
+        if (activeBtn) activeBtn.classList.add('active');
+      });
+    }
+
+    function toggleControlMode() {
+      fetch('/toggle_control_mode').then(r => r.json()).then(d => {
+        updateModeUI(d.mode);
+      });
+    }
+
+    function updateModeUI(mode) {
+      currentMode = mode;
+      const mb = document.getElementById('mode-badge');
+      const btnMode = document.getElementById('btn-mode');
+      if (mode === 'manual') {
+        mb.innerText = 'MODE: MANUAL REMOTE 🎮';
+        mb.className = 'badge badge-mode-manual';
+        btnMode.innerText = '🤖 Mode: Auto (C)';
+        btnMode.className = 'btn-active';
+      } else {
+        mb.innerText = 'MODE: AUTO 🤖';
+        mb.className = 'badge badge-mode-auto';
+        btnMode.innerText = '🎮 Mode: Manual (C)';
+        btnMode.className = '';
+      }
+    }
+
+    function toggleRemoteWidget() {
+      const rp = document.getElementById('remote-panel');
+      rp.classList.toggle('minimized');
+      const btn = document.getElementById('btn-remote');
+      if (rp.classList.contains('minimized')) {
+        btn.classList.remove('btn-active');
+      } else {
+        btn.classList.add('btn-active');
+      }
+    }
+
+    function sendDriveCmd(action) {
+      fetch(`/control?action=${action}&speed=${currentSpeed}`).catch(() => {});
+    }
+
+    function startDrive(action) {
+      if (currentMode !== 'manual') {
+        fetch('/set_mode?mode=manual').then(r => r.json()).then(d => updateModeUI(d.mode));
+      }
+      if (activeAction === action && driveInterval) return;
+      activeAction = action;
+      highlightDpad(action, true);
+      sendDriveCmd(action);
+      clearInterval(driveInterval);
+      driveInterval = setInterval(() => {
+        sendDriveCmd(action);
+      }, 140);
+    }
+
+    function stopDrive() {
+      clearInterval(driveInterval);
+      driveInterval = null;
+      if (activeAction) {
+        highlightDpad(activeAction, false);
+      }
+      activeAction = null;
+      fetch('/control?action=stop').catch(() => {});
+    }
+
+    function highlightDpad(action, on) {
+      const map = {
+        'forward': { id: 'dpad-up', cls: 'btn-drive-active' },
+        'reverse': { id: 'dpad-down', cls: 'btn-rev-active' },
+        'left': { id: 'dpad-left', cls: 'btn-steer-active' },
+        'right': { id: 'dpad-right', cls: 'btn-steer-active' },
+        'stop': { id: 'dpad-stop', cls: 'active' }
+      };
+      const info = map[action];
+      if (info) {
+        const el = document.getElementById(info.id);
+        if (el) {
+          if (on) el.classList.add(info.cls);
+          else el.classList.remove(info.cls);
+        }
+      }
+    }
+
     function emergencyStop() {
+      stopDrive();
       fetch('/emergency_stop').then(r => r.json()).then(d => {
         const btn = document.getElementById('btn-motors');
         const badge = document.getElementById('motors-badge');
@@ -542,7 +766,7 @@ PAGE = """<!DOCTYPE html>
     function openRef() { document.getElementById('modal').classList.add('show'); }
     function closeRef() { document.getElementById('modal').classList.remove('show'); }
 
-    // Live Telemetry Poller (Ultrasonic & Motors)
+    // Live Telemetry Poller (Ultrasonic & Motors & Mode)
     function pollTelemetry() {
       fetch('/telemetry').then(r => r.json()).then(d => {
         const sb = document.getElementById('sonar-badge');
@@ -564,19 +788,70 @@ PAGE = """<!DOCTYPE html>
             sb.style.color = 'var(--success)';
           }
         }
+        if (d.control_mode && d.control_mode !== currentMode) {
+          updateModeUI(d.control_mode);
+        }
       }).catch(() => {});
     }
     setInterval(pollTelemetry, 300);
 
+    // Laptop Keyboard Event Listeners for WASD / Arrow Keys
     window.addEventListener('keydown', (e) => {
       const k = e.key.toLowerCase();
-      if (k === 'f') toggleFullscreen();
-      if (k === 'm') toggleMotors();
-      if (k === 'i') toggleInvertMotors();
-      if (k === ' ') { e.preventDefault(); emergencyStop(); }
-      if (k === 'h') toggleDock();
-      if (k === 'p') togglePotholeMode();
-      if (k === 'd') setAwb('daylight');
+      if (e.target.tagName === 'INPUT') return;
+
+      if (k === 'w' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        keysPressed.add('up');
+        startDrive('forward');
+      } else if (k === 's' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        keysPressed.add('down');
+        startDrive('reverse');
+      } else if (k === 'a' || e.key === 'ArrowLeft') {
+        e.preventDefault();
+        keysPressed.add('left');
+        startDrive('left');
+      } else if (k === 'd' || e.key === 'ArrowRight') {
+        e.preventDefault();
+        keysPressed.add('right');
+        startDrive('right');
+      } else if (k === ' ' || e.key === 'Spacebar') {
+        e.preventDefault();
+        emergencyStop();
+      } else if (k === 'c') {
+        toggleControlMode();
+      } else if (k === '1') {
+        setSpeed(130);
+      } else if (k === '2') {
+        setSpeed(185);
+      } else if (k === '3') {
+        setSpeed(235);
+      } else if (k === 'f') {
+        toggleFullscreen();
+      } else if (k === 'm') {
+        toggleMotors();
+      } else if (k === 'i') {
+        toggleInvertMotors();
+      } else if (k === 'h') {
+        toggleDock();
+      } else if (k === 'p') {
+        togglePotholeMode();
+      } else if (k === 'd' && !e.ctrlKey && !e.metaKey && keysPressed.size === 0) {
+        // 'd' alone turns right, only set awb if not driving
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      const k = e.key.toLowerCase();
+      if (k === 'w' || e.key === 'ArrowUp') keysPressed.delete('up');
+      if (k === 's' || e.key === 'ArrowDown') keysPressed.delete('down');
+      if (k === 'a' || e.key === 'ArrowLeft') keysPressed.delete('left');
+      if (k === 'd' || e.key === 'ArrowRight') keysPressed.delete('right');
+
+      if (keysPressed.size === 0 && activeAction) {
+        stopDrive();
+      }
     });
   </script>
 </body>
@@ -683,10 +958,14 @@ def detect_loop(cam, output):
         t_prev = now
 
         # HUD Overlays
-        cv2.putText(frame, f"{fps:.1f} FPS (Pi 5 HW) | {current_awb.upper()} AWB", (10, 20 if w < 480 else 26),
+        mode_tag = f"[{control_mode.upper()}]"
+        cv2.putText(frame, f"{fps:.1f} FPS (Pi 5 HW) | {mode_tag} | {current_awb.upper()} AWB", (10, 20 if w < 480 else 26),
                     cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 255, 255), thick)
+        action_col = (0, 255, 0) if ("CRUISING" in active_action_label or "MANUAL REMOTE" in active_action_label) else (0, 165, 255)
+        if "BRAKE" in active_action_label or "STOP" in active_action_label:
+            action_col = (0, 0, 255)
         cv2.putText(frame, f"Action: {active_action_label}", (10, 38 if w < 480 else 52),
-                    cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 255, 0) if "CRUISING" in active_action_label else (0, 165, 255), thick)
+                    cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, action_col, thick)
 
         # Ultrasonic live display with color-coded status
         us_l = arduino.latest_sonar["left"]
@@ -721,7 +1000,7 @@ def detect_loop(cam, output):
 # ── 7. Web Server Handler ────────────────────────────────────────────────────
 class Handler(server.BaseHTTPRequestHandler):
     def do_GET(self):
-        global POTHOLE_ONLY
+        global POTHOLE_ONLY, control_mode, manual_speed, manual_action
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -774,9 +1053,106 @@ class Handler(server.BaseHTTPRequestHandler):
                 "state": arduino.latest_state,
                 "motors_enabled": arduino.motors_enabled,
                 "invert_motors": arduino.invert_motors,
+                "control_mode": control_mode,
+                "manual_speed": manual_speed,
+                "manual_action": manual_action,
                 "action": active_action_label,
             }
             resp = json.dumps(data).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif path == '/toggle_control_mode':
+            control_mode = "manual" if control_mode == "autonomous" else "autonomous"
+            if control_mode == "manual":
+                arduino.stop()
+                manual_action = "IDLE"
+            else:
+                arduino.pi_go()
+                manual_action = "IDLE"
+            print(f"🎮 Control mode toggled: {control_mode.upper()}")
+            resp = json.dumps({"status": "ok", "mode": control_mode}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif path == '/set_mode':
+            req_mode = query.get('mode', ['autonomous'])[0].lower()
+            if req_mode in ('autonomous', 'manual'):
+                control_mode = req_mode
+                if control_mode == "manual":
+                    arduino.stop()
+                    manual_action = "IDLE"
+                else:
+                    arduino.pi_go()
+                    manual_action = "IDLE"
+            print(f"🎮 Control mode set: {control_mode.upper()}")
+            resp = json.dumps({"status": "ok", "mode": control_mode}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif path == '/set_speed':
+            try:
+                spd = int(query.get('speed', [manual_speed])[0])
+                manual_speed = max(100, min(255, spd))
+            except Exception:
+                pass
+            resp = json.dumps({"status": "ok", "speed": manual_speed}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif path == '/control':
+            action = query.get('action', ['stop'])[0].lower()
+            if 'speed' in query:
+                try:
+                    manual_speed = max(100, min(255, int(query['speed'][0])))
+                except Exception:
+                    pass
+
+            control_mode = "manual"
+            manual_action = action.upper()
+
+            # Ultrasonic safety check: prevent moving forward if emergency obstacle is within 25 cm
+            us_l = arduino.latest_sonar["left"]
+            us_r = arduino.latest_sonar["right"]
+            front_blocked = (is_valid_us(us_l) and us_l < EMERGENCY_STOP_DIST_CM) or (is_valid_us(us_r) and us_r < EMERGENCY_STOP_DIST_CM)
+
+            if action == 'forward':
+                if front_blocked:
+                    arduino.stop()
+                    manual_action = "BLOCKED_BRAKE"
+                else:
+                    # 350 ms pulse ensures car stops quickly if laptop heartbeat/network stops
+                    arduino.drive(manual_speed, 350)
+            elif action == 'reverse':
+                arduino.reverse(manual_speed, 350)
+            elif action == 'left':
+                # Turn angle -35 deg
+                arduino.turn(-35, manual_speed)
+            elif action == 'right':
+                # Turn angle +35 deg
+                arduino.turn(35, manual_speed)
+            elif action == 'stop':
+                arduino.stop()
+                manual_action = "STOP"
+
+            resp = json.dumps({
+                "status": "ok",
+                "action": manual_action,
+                "mode": control_mode,
+                "speed": manual_speed
+            }).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(resp)))
