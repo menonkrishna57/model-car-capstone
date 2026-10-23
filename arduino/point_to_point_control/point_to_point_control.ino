@@ -146,6 +146,12 @@ int           serialBufLen        = 0;
  * Range: -255 to +255.
  */
 void setMotors(int leftSpeed, int rightSpeed) {
+  // Invert polarity if chassis TT motors are wired in reverse (corrects backward drive)
+  if (INVERT_MOTOR_POLARITY) {
+    leftSpeed  = -leftSpeed;
+    rightSpeed = -rightSpeed;
+  }
+
   // Apply motor trim when driving forward (corrects chassis mechanical drift)
   if (leftSpeed > 0 && rightSpeed > 0 && tune.motorTrim != 0) {
     if (tune.motorTrim > 0) {
@@ -1038,10 +1044,6 @@ void setup() {
   pinMode(PIN_US_LEFT_ECHO,  INPUT);
   pinMode(PIN_US_RIGHT_TRIG, OUTPUT);
   pinMode(PIN_US_RIGHT_ECHO, INPUT);
-
-  // Configure IR Proximity Pins
-  pinMode(PIN_IR1, INPUT);
-  pinMode(PIN_IR2, INPUT);
 
   // Announce ready
   Serial.println(F("[TELEM] READY Uno-ATmega328P v2.1"));

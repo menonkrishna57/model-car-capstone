@@ -69,8 +69,11 @@ POTHOLE_ONLY = True                     # STRICT FILTER: Only detect D40 pothole
 POTHOLE_EVERY = 2
 
 BBOX_STOP_HEIGHT_FRAC = 0.38
-EMERGENCY_STOP_DIST_CM = 25.0
-CRUISE_SPEED = 200
+EMERGENCY_STOP_DIST_CM = 25.0           # Critical ultrasonic auto-brake distance (< 25 cm)
+US_AVOID_DIST_CM = 42.0                 # Directional ultrasonic avoidance steer zone (< 42 cm)
+US_SLOW_DIST_CM = 60.0                  # Cautionary speed reduction zone (< 60 cm)
+CRUISE_SPEED = 200                      # Normal cruising forward PWM
+SLOW_SPEED = 135                        # Cautionary PWM when approaching obstacle
 
 # ── 2. Camera Controls & Daylight White Balance ──────────────────────────────
 try:
@@ -145,6 +148,10 @@ class ArduinoBridge:
         self.latest_state = "IDLE"
         self.motors_enabled = False
         self.pi_latched = False
+        # Chassis TT motor wiring causes forward/reverse inversion relative to standard L298N polarity.
+        # Default to True so forward cruise commands actually move the car forward.
+        self.invert_motors = True
+        self.last_status_time = 0.0
 
     def auto_connect(self):
         import serial
@@ -152,10 +159,21 @@ class ArduinoBridge:
             try:
                 s = serial.Serial(p, 115200, timeout=0.1)
                 time.sleep(2.0)
+                s.reset_input_buffer()
+                s.reset_output_buffer()
                 self.serial_port = s
                 self.port_name = p
                 self.connected = True
                 print(f"🔌 Arduino connected on {p} @ 115200 baud")
+
+                # Configure Arduino runtime parameters immediately:
+                # 1. Enable continuous ultrasonic telemetry streaming
+                self.send("TUNE SET TELEM_STREAM 1")
+                # 2. Disable cliff detection for flat floor driving (prevents false cliff reverse bursts)
+                self.send("TUNE SET CLIFF_ENABLE 0")
+                # 3. Release any startup latch or cliff stop
+                self.send("PI_GO")
+                self.send("STATUS")
                 return True
             except Exception:
                 continue
@@ -176,19 +194,28 @@ class ArduinoBridge:
 
     def read_telemetry(self):
         if not self.connected or not self.serial_port: return
+        now = time.time()
+        # Periodic health check / request STATUS every 1.5s if telemetry stalls
+        if now - self.last_status_time > 1.5:
+            self.send("STATUS")
+            self.last_status_time = now
+
         try:
             while self.serial_port.in_waiting:
                 line = self.serial_port.readline().decode("utf-8", errors="ignore").strip()
                 if not line: continue
-                if "US LEFT=" in line and "RIGHT=" in line:
-                    for pt in line.split():
+                # Parse ultrasonic telemetry: [TELEM] US LEFT=x.x RIGHT=y.y
+                # or [TELEM] STATE=... US_LEFT=x.x US_RIGHT=y.y or [TELEM] CLIFF LEFT=...
+                if ("LEFT=" in line or "US_LEFT=" in line) and ("RIGHT=" in line or "US_RIGHT=" in line):
+                    norm = line.replace("US_LEFT=", "LEFT=").replace("US_RIGHT=", "RIGHT=")
+                    for pt in norm.split():
                         if pt.startswith("LEFT="):
                             try: self.latest_sonar["left"] = float(pt.split("=")[1])
                             except: pass
                         elif pt.startswith("RIGHT="):
                             try: self.latest_sonar["right"] = float(pt.split("=")[1])
                             except: pass
-                elif "STATE=" in line:
+                if "STATE=" in line:
                     for pt in line.split():
                         if pt.startswith("STATE="):
                             self.latest_state = pt.split("=")[1]
@@ -204,11 +231,26 @@ class ArduinoBridge:
         self.send("PI_GO")
 
     def pi_avoid(self, direction: str):
-        self.send(f"PI_AVOID {direction}")
+        eff_dir = direction.upper()
+        if self.invert_motors:
+            eff_dir = "RIGHT" if eff_dir == "LEFT" else "LEFT"
+        self.send(f"PI_AVOID {eff_dir}")
 
     def drive(self, speed: int, duration_ms: int):
         if self.motors_enabled and not self.pi_latched:
-            self.send(f"DRIVE {speed} {duration_ms}")
+            # If motors are inverted on chassis, REV moves forward physically
+            cmd = f"REV {speed} {duration_ms}" if self.invert_motors else f"DRIVE {speed} {duration_ms}"
+            self.send(cmd)
+
+    def reverse(self, speed: int, duration_ms: int):
+        if self.motors_enabled and not self.pi_latched:
+            cmd = f"DRIVE {speed} {duration_ms}" if self.invert_motors else f"REV {speed} {duration_ms}"
+            self.send(cmd)
+
+    def turn(self, angle: int, speed: int = 150):
+        if self.motors_enabled and not self.pi_latched:
+            eff_angle = -angle if self.invert_motors else angle
+            self.send(f"TURN {eff_angle} {speed}")
 
     def stop(self):
         self.send("STOP")
@@ -216,9 +258,14 @@ class ArduinoBridge:
 arduino = ArduinoBridge()
 active_action_label = "IDLE (Safety Hold)"
 
+def is_valid_us(dist: float) -> bool:
+    """Returns True if reading is a valid obstacle reflection (filters out 0.0 noise & 999 timeout)."""
+    return 1.0 < dist < 850.0
+
 def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_dets: list):
     global active_action_label
 
+    # 1. Camera Obstacle Check (YOLOv10n bounding box size & position)
     obstacle_ahead = False
     for b in obs_boxes:
         x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
@@ -229,21 +276,50 @@ def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_
             break
 
     if obstacle_ahead:
-        active_action_label = "🛑 PI_STOP: Obstacle Imminent"
+        active_action_label = "🛑 PI_STOP: Obstacle Imminent (Camera)"
         arduino.pi_stop()
         return
 
+    # Release Pi latch if previously latched by camera and now clear
     if arduino.pi_latched and not obstacle_ahead:
-        active_action_label = "✅ PI_GO: Path Cleared"
+        active_action_label = "✅ PI_GO: Path Cleared (Camera)"
         arduino.pi_go()
 
-    us_left = arduino.latest_sonar["left"]
-    us_right = arduino.latest_sonar["right"]
-    if us_left < EMERGENCY_STOP_DIST_CM or us_right < EMERGENCY_STOP_DIST_CM:
-        active_action_label = f"⚠️ US AUTO-BRAKE (L:{us_left:.0f}cm R:{us_right:.0f}cm)"
+    # 2. Ultrasonic Sensor Active Processing
+    us_l = arduino.latest_sonar["left"]
+    us_r = arduino.latest_sonar["right"]
+    v_l = is_valid_us(us_l)
+    v_r = is_valid_us(us_r)
+
+    # 2a. Ultrasonic Critical Safety Auto-Brake (< EMERGENCY_STOP_DIST_CM)
+    if (v_l and us_l < EMERGENCY_STOP_DIST_CM) or (v_r and us_r < EMERGENCY_STOP_DIST_CM):
+        active_action_label = f"🛑 US AUTO-BRAKE! (L:{us_l:.0f}cm R:{us_r:.0f}cm)"
+        arduino.stop()
         return
 
-    # Evaluate true potholes
+    # 2b. Front Corridor Blocked: Both sensors detect obstacle (< US_AVOID_DIST_CM)
+    if v_l and v_r and us_l < US_AVOID_DIST_CM and us_r < US_AVOID_DIST_CM:
+        active_action_label = f"⚠️ US OBSTACLE AHEAD (L:{us_l:.0f}cm R:{us_r:.0f}cm) -> STOP"
+        arduino.stop()
+        return
+
+    # 2c. Ultrasonic Directional Avoidance: Left obstacle closer -> Steer RIGHT
+    if v_l and us_l < US_AVOID_DIST_CM and (not v_r or us_l < us_r - 6.0):
+        active_action_label = f"🔀 US AVOID: Left Obs ({us_l:.0f}cm) -> Steering RIGHT"
+        arduino.pi_avoid("RIGHT")
+        if arduino.motors_enabled:
+            arduino.turn(35, 160)
+        return
+
+    # 2d. Ultrasonic Directional Avoidance: Right obstacle closer -> Steer LEFT
+    if v_r and us_r < US_AVOID_DIST_CM and (not v_l or us_r < us_l - 6.0):
+        active_action_label = f"🔀 US AVOID: Right Obs ({us_r:.0f}cm) -> Steering LEFT"
+        arduino.pi_avoid("LEFT")
+        if arduino.motors_enabled:
+            arduino.turn(-35, 160)
+        return
+
+    # 3. Camera Pothole Avoidance (Classical CV + RDD2022 D40)
     danger_left = sum(1.0 for p in pot_dets if p.get("is_pothole") and (p["bbox"][0] + p["bbox"][2]) / 2 < frame_w * 0.5)
     danger_right = sum(1.0 for p in pot_dets if p.get("is_pothole") and (p["bbox"][0] + p["bbox"][2]) / 2 >= frame_w * 0.5)
 
@@ -251,14 +327,24 @@ def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_
         if danger_left > danger_right:
             active_action_label = "🔀 AVOIDING POTHOLE: Steering RIGHT"
             arduino.pi_avoid("RIGHT")
+            if arduino.motors_enabled:
+                arduino.turn(30, 160)
         else:
             active_action_label = "🔀 AVOIDING POTHOLE: Steering LEFT"
             arduino.pi_avoid("LEFT")
+            if arduino.motors_enabled:
+                arduino.turn(-30, 160)
         return
 
+    # 4. Clear Path Cruising (Speed modulated by forward ultrasonic clearance)
     if arduino.motors_enabled:
-        active_action_label = f"🟢 CRUISING FORWARD (PWM {CRUISE_SPEED})"
-        arduino.drive(CRUISE_SPEED, 250)
+        # If an obstacle is detected in caution range (US_SLOW_DIST_CM), reduce speed
+        if (v_l and us_l < US_SLOW_DIST_CM) or (v_r and us_r < US_SLOW_DIST_CM):
+            active_action_label = f"🟡 CRUISING CAUTIOUSLY (PWM {SLOW_SPEED}) [US Near]"
+            arduino.drive(SLOW_SPEED, 250)
+        else:
+            active_action_label = f"🟢 CRUISING FORWARD (PWM {CRUISE_SPEED})"
+            arduino.drive(CRUISE_SPEED, 250)
     else:
         active_action_label = "⏸️ MOTORS DISABLED (Bench Test Safe)"
 
@@ -297,6 +383,9 @@ PAGE = """<!DOCTYPE html>
     .badge-daylight { background: rgba(227, 179, 65, 0.2); color: #e3b341; border: 1px solid #e3b341; }
     .badge-motors-on { background: rgba(63, 185, 80, 0.2); color: var(--success); border: 1px solid var(--success); }
     .badge-motors-off { background: rgba(248, 81, 73, 0.2); color: var(--danger); border: 1px solid var(--danger); }
+    .badge-invert-on { background: rgba(88, 166, 255, 0.2); color: var(--accent); border: 1px solid var(--accent); }
+    .badge-invert-off { background: rgba(139, 148, 158, 0.2); color: var(--muted); border: 1px solid var(--muted); }
+    .badge-us { background: rgba(63, 185, 80, 0.2); color: var(--success); border: 1px solid var(--success); }
     .controls-dock {
       position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
       background: var(--card-glass); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
@@ -333,20 +422,24 @@ PAGE = """<!DOCTYPE html>
     <div style="font-weight:700; font-size:0.85rem">🏎️ NMIMS MPSTME Capstone</div>
     <div class="badge badge-daylight" id="awb-badge">AWB: DAYLIGHT ☀️</div>
     <div class="badge badge-motors-off" id="motors-badge">MOTORS: OFF ⏸️</div>
+    <div class="badge badge-invert-on" id="invert-badge">POLARITY: INVERTED (FWD FIX) 🔄</div>
+    <div class="badge badge-us" id="sonar-badge">US: L=--- R=---</div>
   </header>
 
   <div class="controls-dock" id="dock">
-    <button id="btn-motors" class="btn-danger" onclick="toggleMotors()">🚗 Enable Motors</button>
+    <button id="btn-motors" class="btn-danger" onclick="toggleMotors()">🚗 Enable Motors (M)</button>
+    <button id="btn-invert" class="btn-active" onclick="toggleInvertMotors()">🔄 Polarity: Inverted (I)</button>
     <button class="btn-active" id="btn-daylight" onclick="setAwb('daylight')">☀️ Daylight</button>
     <button onclick="setAwb('auto')">🔄 Auto</button>
     <button onclick="setAwb('indoor')">💡 Indoor</button>
     <button id="btn-pothole-mode" class="btn-active" onclick="togglePotholeMode()">🕳️ Potholes Only</button>
+    <button onclick="emergencyStop()" class="btn-danger">🛑 E-STOP (Space)</button>
     <button onclick="toggleFullscreen()">⛶ Fullscreen (F)</button>
     <button onclick="openRef()">📷 Ref daylight.jpg</button>
     <button onclick="toggleDock()" style="padding:7px 10px">👁️</button>
   </div>
 
-  <div class="shortcut-tip">Press <b>F</b> for Fullscreen &bull; <b>M</b> for Motors &bull; <b>H</b> to Hide Dock &bull; <b>P</b> Pothole Mode</div>
+  <div class="shortcut-tip">Press <b>F</b> Fullscreen &bull; <b>M</b> Motors &bull; <b>I</b> Invert Polarity &bull; <b>Space</b> E-Stop &bull; <b>P</b> Potholes &bull; <b>H</b> Dock</div>
 
   <div class="modal" id="modal" onclick="closeRef()">
     <div class="modal-box" onclick="event.stopPropagation()">
@@ -372,16 +465,45 @@ PAGE = """<!DOCTYPE html>
         const btn = document.getElementById('btn-motors');
         const badge = document.getElementById('motors-badge');
         if (d.motors_enabled) {
-          btn.innerText = '🛑 Disable Motors';
+          btn.innerText = '🛑 Disable Motors (M)';
           btn.className = 'btn-success';
           badge.innerText = 'MOTORS: ACTIVE ⚡';
           badge.className = 'badge badge-motors-on';
         } else {
-          btn.innerText = '🚗 Enable Motors';
+          btn.innerText = '🚗 Enable Motors (M)';
           btn.className = 'btn-danger';
           badge.innerText = 'MOTORS: OFF ⏸️';
           badge.className = 'badge badge-motors-off';
         }
+      });
+    }
+
+    function toggleInvertMotors() {
+      fetch('/toggle_invert_motors').then(r => r.json()).then(d => {
+        const btn = document.getElementById('btn-invert');
+        const badge = document.getElementById('invert-badge');
+        if (d.invert_motors) {
+          btn.innerText = '🔄 Polarity: Inverted (I)';
+          btn.className = 'btn-active';
+          badge.innerText = 'POLARITY: INVERTED (FWD FIX) 🔄';
+          badge.className = 'badge badge-invert-on';
+        } else {
+          btn.innerText = '🔄 Polarity: Normal (I)';
+          btn.className = '';
+          badge.innerText = 'POLARITY: NORMAL ➡️';
+          badge.className = 'badge badge-invert-off';
+        }
+      });
+    }
+
+    function emergencyStop() {
+      fetch('/emergency_stop').then(r => r.json()).then(d => {
+        const btn = document.getElementById('btn-motors');
+        const badge = document.getElementById('motors-badge');
+        btn.innerText = '🚗 Enable Motors (M)';
+        btn.className = 'btn-danger';
+        badge.innerText = 'MOTORS: OFF (E-STOP) 🛑';
+        badge.className = 'badge badge-motors-off';
       });
     }
 
@@ -420,10 +542,38 @@ PAGE = """<!DOCTYPE html>
     function openRef() { document.getElementById('modal').classList.add('show'); }
     function closeRef() { document.getElementById('modal').classList.remove('show'); }
 
+    // Live Telemetry Poller (Ultrasonic & Motors)
+    function pollTelemetry() {
+      fetch('/telemetry').then(r => r.json()).then(d => {
+        const sb = document.getElementById('sonar-badge');
+        if (sb && d.sonar) {
+          const l = (d.sonar.left <= 1.0 || d.sonar.left >= 850.0) ? 'CLR' : d.sonar.left.toFixed(0) + 'cm';
+          const r = (d.sonar.right <= 1.0 || d.sonar.right >= 850.0) ? 'CLR' : d.sonar.right.toFixed(0) + 'cm';
+          sb.innerText = `US: L=${l}  R=${r}`;
+          if ((d.sonar.left > 1.0 && d.sonar.left < 25.0) || (d.sonar.right > 1.0 && d.sonar.right < 25.0)) {
+            sb.style.background = 'rgba(248, 81, 73, 0.35)';
+            sb.style.borderColor = 'var(--danger)';
+            sb.style.color = '#ff7b72';
+          } else if ((d.sonar.left > 1.0 && d.sonar.left < 45.0) || (d.sonar.right > 1.0 && d.sonar.right < 45.0)) {
+            sb.style.background = 'rgba(227, 179, 65, 0.35)';
+            sb.style.borderColor = '#e3b341';
+            sb.style.color = '#e3b341';
+          } else {
+            sb.style.background = 'rgba(63, 185, 80, 0.2)';
+            sb.style.borderColor = 'var(--success)';
+            sb.style.color = 'var(--success)';
+          }
+        }
+      }).catch(() => {});
+    }
+    setInterval(pollTelemetry, 300);
+
     window.addEventListener('keydown', (e) => {
       const k = e.key.toLowerCase();
       if (k === 'f') toggleFullscreen();
       if (k === 'm') toggleMotors();
+      if (k === 'i') toggleInvertMotors();
+      if (k === ' ') { e.preventDefault(); emergencyStop(); }
       if (k === 'h') toggleDock();
       if (k === 'p') togglePotholeMode();
       if (k === 'd') setAwb('daylight');
@@ -538,10 +688,27 @@ def detect_loop(cam, output):
         cv2.putText(frame, f"Action: {active_action_label}", (10, 38 if w < 480 else 52),
                     cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 255, 0) if "CRUISING" in active_action_label else (0, 165, 255), thick)
 
-        us_str = f"US: L={arduino.latest_sonar['left']:.1f}cm  R={arduino.latest_sonar['right']:.1f}cm"
-        ard_str = f"Arduino: {arduino.port_name} [{arduino.latest_state}]"
+        # Ultrasonic live display with color-coded status
+        us_l = arduino.latest_sonar["left"]
+        us_r = arduino.latest_sonar["right"]
+        us_l_disp = f"{us_l:.0f}cm" if (1.0 < us_l < 850.0) else "CLEAR"
+        us_r_disp = f"{us_r:.0f}cm" if (1.0 < us_r < 850.0) else "CLEAR"
+        us_str = f"US: L={us_l_disp} | R={us_r_disp}"
+
+        us_color = (0, 255, 0)  # Green = Clear
+        if (1.0 < us_l < EMERGENCY_STOP_DIST_CM) or (1.0 < us_r < EMERGENCY_STOP_DIST_CM):
+            us_color = (0, 0, 255)    # Red = Critical Stop
+            us_str += " [BRAKE]"
+        elif (1.0 < us_l < US_AVOID_DIST_CM) or (1.0 < us_r < US_AVOID_DIST_CM):
+            us_color = (0, 140, 255)  # Orange = Avoidance
+            us_str += " [AVOID]"
+        elif (1.0 < us_l < US_SLOW_DIST_CM) or (1.0 < us_r < US_SLOW_DIST_CM):
+            us_color = (0, 255, 255)  # Yellow = Caution
+            us_str += " [SLOW]"
+
+        ard_str = f"Arduino: {arduino.port_name} [{arduino.latest_state}] | Polarity: {'INVERTED' if arduino.invert_motors else 'NORMAL'}"
         cv2.putText(frame, us_str, (10, h - (22 if w < 480 else 36)),
-                    cv2.FONT_HERSHEY_SIMPLEX, hud_scale2, (255, 255, 0), thick)
+                    cv2.FONT_HERSHEY_SIMPLEX, hud_scale2, us_color, thick)
         cv2.putText(frame, ard_str, (10, h - (8 if w < 480 else 14)),
                     cv2.FONT_HERSHEY_SIMPLEX, hud_scale2, (200, 200, 200), 1)
 
@@ -573,6 +740,43 @@ class Handler(server.BaseHTTPRequestHandler):
                 arduino.stop()
             print(f"🚗 Motors toggled: {'ENABLED' if arduino.motors_enabled else 'DISABLED'}")
             resp = json.dumps({"status": "ok", "motors_enabled": arduino.motors_enabled}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif path == '/toggle_invert_motors':
+            arduino.invert_motors = not arduino.invert_motors
+            print(f"🔄 Motor polarity toggled: {'INVERTED (FWD Fix)' if arduino.invert_motors else 'NORMAL'}")
+            resp = json.dumps({"status": "ok", "invert_motors": arduino.invert_motors}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif path == '/emergency_stop':
+            arduino.motors_enabled = False
+            arduino.stop()
+            arduino.pi_stop()
+            print("🛑 Emergency Stop triggered!")
+            resp = json.dumps({"status": "ok", "motors_enabled": False}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif path == '/telemetry':
+            data = {
+                "sonar": arduino.latest_sonar,
+                "state": arduino.latest_state,
+                "motors_enabled": arduino.motors_enabled,
+                "invert_motors": arduino.invert_motors,
+                "action": active_action_label,
+            }
+            resp = json.dumps(data).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(resp)))

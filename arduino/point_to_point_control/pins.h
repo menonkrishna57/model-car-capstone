@@ -16,21 +16,25 @@
 #ifndef CAR_PINS_H
 #define CAR_PINS_H
 
-// =============================================================================
-// Left Motor Pair — Channel A (FL + RL motors)
-// L298N: IN1 / IN2 control direction; ENA controls PWM speed (0–255)
-// =============================================================================
-const int PIN_ENA = 5;    // ENA: PWM speed control (Timer0/OC0B) — wired to D5 ✅
-const int PIN_IN1 = 8;    // IN1: Direction bit 1
-const int PIN_IN2 = 9;    // IN2: Direction bit 2
+// Left Motor Pair — Channel B (FL + RL motors)
+// L298N: ENB controls PWM speed (Timer0/OC0A D6); IN3/IN4 control direction (D10, D11)
+const int PIN_LEFT_PWM = 6;    // ENB: PWM speed control
+const int PIN_LEFT_IN1 = 10;   // IN3: Direction bit 1
+const int PIN_LEFT_IN2 = 11;   // IN4: Direction bit 2
 
-// =============================================================================
-// Right Motor Pair — Channel B (FR + RR motors)
-// L298N: IN3 / IN4 control direction; ENB controls PWM speed (0–255)
-// =============================================================================
-const int PIN_ENB = 6;    // ENB: PWM speed control (Timer0/OC0A) — wired to D6 ✅
-const int PIN_IN3 = 10;   // IN3: Direction bit 1
-const int PIN_IN4 = 11;   // IN4: Direction bit 2
+// Right Motor Pair — Channel A (FR + RR motors)
+// L298N: ENA controls PWM speed (Timer0/OC0B D5); IN1/IN2 control direction (D8, D9)
+const int PIN_RIGHT_PWM = 5;   // ENA: PWM speed control
+const int PIN_RIGHT_IN1 = 8;   // IN1: Direction bit 1
+const int PIN_RIGHT_IN2 = 9;   // IN2: Direction bit 2
+
+// Aliases for compatibility
+const int PIN_ENA = PIN_RIGHT_PWM;
+const int PIN_IN1 = PIN_RIGHT_IN1;
+const int PIN_IN2 = PIN_RIGHT_IN2;
+const int PIN_ENB = PIN_LEFT_PWM;
+const int PIN_IN3 = PIN_LEFT_IN1;
+const int PIN_IN4 = PIN_LEFT_IN2;
 
 // Motor Polarity Configuration
 const bool INVERT_MOTOR_POLARITY = true;
