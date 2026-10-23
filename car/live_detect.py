@@ -72,7 +72,7 @@ CRUISE_SPEED = 165
 
 # ── 2. Camera Controls & Daylight White Balance ──────────────────────────────
 try:
-    from libcamera import controls
+    from libcamera import controls, Transform
     AWB_MODES = {
         "daylight": controls.AwbModeEnum.Daylight,
         "auto": controls.AwbModeEnum.Auto,
@@ -81,10 +81,12 @@ try:
         "tungsten": controls.AwbModeEnum.Tungsten,
     }
 except Exception:
+    Transform = None
     AWB_MODES = {"auto": 0, "indoor": 4, "daylight": 5, "cloudy": 6, "tungsten": 2}
 
 current_awb = "daylight"
 swap_rb = True
+hardware_rotated = False
 cam_instance = None
 
 def set_awb_mode(cam, mode_name: str) -> bool:
@@ -447,7 +449,7 @@ def draw_boxes(frame, result, color, prefix=""):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
 def detect_loop(cam, output):
-    global current_awb, swap_rb, POTHOLE_ONLY
+    global current_awb, swap_rb, POTHOLE_ONLY, hardware_rotated
     n = 0
     last_pot_dets = []
     fps = 0.0
@@ -462,6 +464,10 @@ def detect_loop(cam, output):
             frame = cv2.cvtColor(frame_raw, cv2.COLOR_RGB2BGR)
         else:
             frame = frame_raw.copy()
+
+        # Fallback software 180° rotation if hardware ISP transform was not available
+        if not hardware_rotated:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
 
         h, w = frame.shape[:2]
 
@@ -622,15 +628,33 @@ class Server(socketserver.ThreadingMixIn, server.HTTPServer):
     daemon_threads = True
 
 def main():
-    global output, cam_instance
+    global output, cam_instance, hardware_rotated
     logging.basicConfig(level=logging.INFO)
 
     arduino.auto_connect()
 
-    print("🎥 Initializing Picamera2 in BGR888 mode...")
+    print("🎥 Initializing Picamera2 in BGR888 mode (180° rotation)...")
     cam = Picamera2()
     cam_instance = cam
-    cam.configure(cam.create_video_configuration(main={"size": (640, 480), "format": "BGR888"}))
+
+    video_config = None
+    hardware_rotated = False
+    if Transform is not None:
+        try:
+            # 180° rotation natively handled by Raspberry Pi ISP with zero CPU overhead
+            video_config = cam.create_video_configuration(
+                main={"size": (640, 480), "format": "BGR888"},
+                transform=Transform(hflip=1, vflip=1)
+            )
+            hardware_rotated = True
+            print("🔄 Hardware 180° rotation (hflip + vflip via ISP) enabled.")
+        except Exception as e:
+            print(f"⚠️ Could not set hardware transform: {e}")
+
+    if video_config is None:
+        video_config = cam.create_video_configuration(main={"size": (640, 480), "format": "BGR888"})
+
+    cam.configure(video_config)
     cam.start()
 
     set_awb_mode(cam, "daylight")
