@@ -59,6 +59,8 @@ def find_daylight_ref() -> Optional[Path]:
         if p.exists(): return p
     return None
 
+CAM_WIDTH = 320
+CAM_HEIGHT = 240
 IMGSZ = 320
 OBSTACLE_CLASSES = [0, 1, 2, 3, 5, 7]  # person, bicycle, car, motorcycle, bus, truck
 CONF_OBSTACLE = 0.35
@@ -68,7 +70,7 @@ POTHOLE_EVERY = 2
 
 BBOX_STOP_HEIGHT_FRAC = 0.38
 EMERGENCY_STOP_DIST_CM = 25.0
-CRUISE_SPEED = 165
+CRUISE_SPEED = 200
 
 # ── 2. Camera Controls & Daylight White Balance ──────────────────────────────
 try:
@@ -120,10 +122,11 @@ def cv_detect_potholes(frame: np.ndarray) -> List[Dict[str, Any]]:
 
     dets = []
     roi_area = roi.shape[0] * roi.shape[1]
+    min_area = max(150, int(roi_area * 0.0065))
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        # Suppress tiny noise (text/carpet dots) and huge false areas
-        if area < 1200 or area > roi_area * 0.30: continue
+        # Suppress tiny noise (text/carpet dots) and huge false areas (dynamically scaled to resolution)
+        if area < min_area or area > roi_area * 0.30: continue
         x, y, cw, ch = cv2.boundingRect(cnt)
         # Potholes are round/oval cavities (aspect ratio 0.5 to 2.5) — eliminates long lines/cracks
         aspect = cw / max(ch, 1)
@@ -441,12 +444,15 @@ class StreamingOutput(io.BufferedIOBase):
             self.condition.notify_all()
 
 def draw_boxes(frame, result, color, prefix=""):
+    w = frame.shape[1]
+    f_scale = 0.50 if w >= 480 else 0.38
+    thick = 2 if w >= 480 else 1
     for b in result.boxes:
         x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
         label = f"{prefix}{result.names[int(b.cls[0])]} {float(b.conf[0]):.2f}"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, label, (x1, max(18, y1 - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
+        cv2.putText(frame, label, (x1, max(14, y1 - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, f_scale, color, thick)
 
 def detect_loop(cam, output):
     global current_awb, swap_rb, POTHOLE_ONLY, hardware_rotated
@@ -510,29 +516,34 @@ def detect_loop(cam, output):
         draw_boxes(frame, r, (0, 255, 0))
 
         # 5. Render Pothole Boxes (Orange/Red for Potholes, Cyan for Cracks)
+        f_scale = 0.50 if w >= 480 else 0.38
+        hud_scale1 = 0.65 if w >= 480 else 0.45
+        hud_scale2 = 0.55 if w >= 480 else 0.40
+        thick = 2 if w >= 480 else 1
+
         for p in last_pot_dets:
             x1, y1, x2, y2 = p["bbox"]
             color = (0, 69, 255) if p.get("is_pothole") else (255, 200, 0)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, p["label"], (x1, max(18, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
+            cv2.putText(frame, p["label"], (x1, max(14, y1 - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, f_scale, color, thick)
 
         now = time.time()
         fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-6)
         t_prev = now
 
         # HUD Overlays
-        cv2.putText(frame, f"{fps:.1f} FPS (Pi 5 HW) | {current_awb.upper()} AWB", (14, 26),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-        cv2.putText(frame, f"Action: {active_action_label}", (14, 52),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 0) if "CRUISING" in active_action_label else (0, 165, 255), 2)
+        cv2.putText(frame, f"{fps:.1f} FPS (Pi 5 HW) | {current_awb.upper()} AWB", (10, 20 if w < 480 else 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 255, 255), thick)
+        cv2.putText(frame, f"Action: {active_action_label}", (10, 38 if w < 480 else 52),
+                    cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 255, 0) if "CRUISING" in active_action_label else (0, 165, 255), thick)
 
         us_str = f"US: L={arduino.latest_sonar['left']:.1f}cm  R={arduino.latest_sonar['right']:.1f}cm"
         ard_str = f"Arduino: {arduino.port_name} [{arduino.latest_state}]"
-        cv2.putText(frame, us_str, (14, h - 36),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
-        cv2.putText(frame, ard_str, (14, h - 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 200, 200), 1)
+        cv2.putText(frame, us_str, (10, h - (22 if w < 480 else 36)),
+                    cv2.FONT_HERSHEY_SIMPLEX, hud_scale2, (255, 255, 0), thick)
+        cv2.putText(frame, ard_str, (10, h - (8 if w < 480 else 14)),
+                    cv2.FONT_HERSHEY_SIMPLEX, hud_scale2, (200, 200, 200), 1)
 
         ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if ok:
@@ -633,7 +644,7 @@ def main():
 
     arduino.auto_connect()
 
-    print("🎥 Initializing Picamera2 in BGR888 mode (180° rotation)...")
+    print(f"🎥 Initializing Picamera2 in BGR888 mode ({CAM_WIDTH}x{CAM_HEIGHT}, 180° rotation)...")
     cam = Picamera2()
     cam_instance = cam
 
@@ -643,7 +654,7 @@ def main():
         try:
             # 180° rotation natively handled by Raspberry Pi ISP with zero CPU overhead
             video_config = cam.create_video_configuration(
-                main={"size": (640, 480), "format": "BGR888"},
+                main={"size": (CAM_WIDTH, CAM_HEIGHT), "format": "BGR888"},
                 transform=Transform(hflip=1, vflip=1)
             )
             hardware_rotated = True
@@ -652,7 +663,7 @@ def main():
             print(f"⚠️ Could not set hardware transform: {e}")
 
     if video_config is None:
-        video_config = cam.create_video_configuration(main={"size": (640, 480), "format": "BGR888"})
+        video_config = cam.create_video_configuration(main={"size": (CAM_WIDTH, CAM_HEIGHT), "format": "BGR888"})
 
     cam.configure(video_config)
     cam.start()
