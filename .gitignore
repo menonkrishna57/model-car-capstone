@@ -72,3 +72,4 @@ extracted_mentrpi/
 ~$*.pptx
 *.onnx
 yolov10n_openvino_model/
+yolov10n_ncnn_model/

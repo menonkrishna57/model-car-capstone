@@ -11,3 +11,6 @@ annotated_video.mp4
 # Python bytecode
 __pycache__/
 *.py[cod]
+
+# Output folder for annotated videos and images
+outputs/

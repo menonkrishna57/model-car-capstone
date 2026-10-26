@@ -124,15 +124,22 @@ class PotholeDetector:
         h, w = frame.shape[:2]
         
         # Determine ROI based on camera mount perspective
-        if self.mode == "cabin":
+        # For general road photos / full mode: use the entire frame so potholes are never chopped off
+        if self.mode == "full":
+            roi_y1, roi_y2 = 0, h
+            roi_x1, roi_x2 = 0, w
+        elif self.mode == "cabin":
             # For cabin POV video with interior steering wheel & A-pillars
-            roi_y1, roi_y2 = int(h * 0.22), int(h * 0.49)
-            roi_x1, roi_x2 = int(w * 0.28), int(w * 0.67)
-        else:
-            # Standard Dashcam / RC Car camera (e.g. pothole_test_2.mp4, bumper cam)
-            # The drivable road surface occupies the lower ~50% of the frame
-            roi_y1, roi_y2 = int(h * 0.44), int(h * 0.92)
-            roi_x1, roi_x2 = int(w * 0.08), int(w * 0.92)
+            roi_y1, roi_y2 = int(h * 0.20), int(h * 0.55)
+            roi_x1, roi_x2 = int(w * 0.25), int(w * 0.75)
+        elif self.mode == "dashcam":
+            # Keep the entire road surface (discards only the top 15% sky)
+            roi_y1, roi_y2 = int(h * 0.15), h
+            roi_x1, roi_x2 = 0, w
+        else: # "auto"
+            # Auto: full frame for photos, wide road crop for dashcam video
+            roi_y1, roi_y2 = 0, h
+            roi_x1, roi_x2 = 0, w
 
         sub_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
         eff_w, eff_h = roi_x2 - roi_x1, roi_y2 - roi_y1
@@ -162,7 +169,7 @@ class PotholeDetector:
                     "label": lbl,
                     "is_pothole": is_pothole
                 })
-        except Exception:
+        except Exception as e:
             pass
 
         # 2. Secondary Model for Enhanced Recall
@@ -191,13 +198,13 @@ class PotholeDetector:
                             "label": lbl,
                             "is_pothole": is_pothole
                         })
-            except Exception:
+            except Exception as e:
                 pass
 
         # 3. Obstacles (Vehicles / People)
         if self.coco_model:
             try:
-                res_c = self.coco_model.predict(sub_frame, conf=0.30, imgsz=416, verbose=False)[0]
+                res_c = self.coco_model.predict(sub_frame, conf=0.25, imgsz=416, verbose=False)[0]
                 for box in res_c.boxes:
                     cls_id = int(box.cls[0])
                     if cls_id in [0, 1, 2, 3, 5, 7]:
@@ -210,7 +217,7 @@ class PotholeDetector:
                             "label": name.upper(),
                             "is_pothole": False
                         })
-            except Exception:
+            except Exception as e:
                 pass
 
         # 4. Danger Scoring
@@ -277,7 +284,7 @@ class PotholeDetector:
         return detections, scores, swerve_text, subtext, color, (roi_x1, roi_y1, eff_w, eff_h)
 
 
-def draw_annotations(frame, detections, scores, swerve_text, subtext, color, roi, fps, frame_idx, total_frames):
+def draw_annotations(frame, detections, scores, swerve_text, subtext, color, roi, fps, frame_idx=1, total_frames=1, is_image=False, latency_ms=None):
     h, w = frame.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_bold = cv2.FONT_HERSHEY_DUPLEX
@@ -321,10 +328,11 @@ def draw_annotations(frame, detections, scores, swerve_text, subtext, color, roi
     (stw, _), _ = cv2.getTextSize(subtext, font, 0.40, 1)
     cv2.putText(frame, subtext, ((w - stw) // 2, 48), font, 0.40, (170, 170, 170), 1, cv2.LINE_AA)
 
-    cv2.putText(frame, f"FPS: {fps:.1f}", (14, 24), font, 0.45, COLOR_TEXT, 1, cv2.LINE_AA)
+    speed_lbl = f"{latency_ms:.1f}ms" if (is_image and latency_ms is not None) else f"FPS: {fps:.1f}"
+    cv2.putText(frame, speed_lbl, (14, 24), font, 0.45, COLOR_TEXT, 1, cv2.LINE_AA)
     cv2.putText(frame, "YOLOv10n (D40)", (14, 44), font, 0.38, (0, 190, 255), 1, cv2.LINE_AA)
 
-    prog = f"{frame_idx}/{total_frames}"
+    prog = "IMAGE" if is_image else f"{frame_idx}/{total_frames}"
     (ptw, _), _ = cv2.getTextSize(prog, font, 0.42, 1)
     cv2.putText(frame, prog, (w - ptw - 14, 25), font, 0.42, (170, 170, 170), 1, cv2.LINE_AA)
 
@@ -358,54 +366,61 @@ def draw_annotations(frame, detections, scores, swerve_text, subtext, color, roi
     return frame
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Pothole Detection & Swerve Indicator")
-    parser.add_argument("--video", default=None, help="Input video path (default: pothole_test_2.mp4 or test_video.mp4)")
-    parser.add_argument("--output", default=None, help="Output video path (default: annotated_<name>.mp4)")
-    parser.add_argument("--duration", type=float, default=None, help="Process first N seconds")
-    parser.add_argument("--mode", choices=["auto", "dashcam", "cabin"], default="auto", help="Camera perspective (auto, dashcam, cabin)")
-    parser.add_argument("--conf", type=float, default=0.07, help="Detection confidence threshold")
-    parser.add_argument("--show", action="store_true", help="Display live window")
-    args = parser.parse_args()
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv"}
+DEFAULT_OUTPUT_DIR = ROOT_DIR / "outputs"
 
-    # Auto-select input video if not provided
-    if args.video:
-        video_path = Path(args.video)
-    elif (ROOT_DIR / "pothole_test_2.mp4").exists():
-        video_path = ROOT_DIR / "pothole_test_2.mp4"
-    elif DEFAULT_VIDEO:
-        video_path = Path(DEFAULT_VIDEO)
-    else:
-        print("Error: No video found in directory.", file=sys.stderr)
-        sys.exit(1)
 
-    if not video_path.exists():
-        print(f"Error: Video file not found: {video_path}", file=sys.stderr)
-        sys.exit(1)
+def process_single_image(detector, image_path: Path, output_path: Path, args):
+    """Processes a single image, annotates potholes/obstacles/corridors, and saves to output_path."""
+    frame = cv2.imread(str(image_path))
+    if frame is None:
+        print(f"❌ Error: Could not read image: {image_path}", file=sys.stderr)
+        return False
 
-    # Auto-detect camera mode
-    if args.mode == "auto":
-        mode = "cabin" if "test_video" in video_path.name.lower() else "dashcam"
-    else:
-        mode = args.mode
+    t0 = time.perf_counter()
+    dets, scores, swerve_text, subtext, color, roi = detector.process_frame(frame)
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    fps = 1000.0 / max(latency_ms, 0.001)
 
-    # Output video path
-    if args.output:
-        output_path = Path(args.output)
-    else:
-        output_path = ROOT_DIR / f"annotated_{video_path.stem}.mp4"
+    annotated = draw_annotations(frame, dets, scores, swerve_text, subtext, color, roi,
+                                 fps=fps, is_image=True, latency_ms=latency_ms)
 
-    print(f"[+] Camera Perspective : {mode.upper()} mode")
-    print(f"[+] Detection Conf Thresh: {args.conf}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), annotated)
 
-    detector = PotholeDetector(conf_thresh=args.conf, mode=mode)
+    potholes = [d for d in dets if d.get("is_pothole")]
+    obstacles = [d for d in dets if not d.get("is_pothole")]
+    print(f"\n✅ Image Processed in {latency_ms:.1f} ms:")
+    print(f"   [+] Input        : {image_path.name}")
+    print(f"   [+] Detections   : {len(potholes)} Potholes, {len(obstacles)} Obstacles")
+    for d in dets:
+        print(f"       - {d['label']} (Conf: {d['conf']*100:.1f}%) at {d['bbox']}")
+    print(f"   [+] Corridor Risk: Left {int(scores['left']*100)}% | Center {int(scores['center']*100)}% | Right {int(scores['right']*100)}%")
+    print(f"   [+] Guidance     : {swerve_text} ({subtext})")
+    print(f"   [+] Saved Output : {output_path}\n")
+
+    if args.show:
+        cv2.imshow(f"Pothole Detection - {image_path.name} (Press any key)", annotated)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    return True
+
+
+def process_single_video(detector, video_path: Path, output_path: Path, args):
+    """Processes a video file, annotates frame by frame, and writes output video."""
     cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print(f"❌ Error: Could not open video: {video_path}", file=sys.stderr)
+        return False
+
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frames_to_run = min(int(args.duration * fps), total_frames) if args.duration else total_frames
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     out = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (fw, fh))
 
     print(f"\n[+] Input Video  : {video_path} ({frames_to_run} frames, {frames_to_run/fps:.1f}s)")
@@ -421,7 +436,8 @@ def main():
         dets, scores, swerve_text, subtext, color, roi = detector.process_frame(frame)
         cur_fps = 1.0 / max(time.perf_counter() - t0, 0.001)
 
-        annotated = draw_annotations(frame, dets, scores, swerve_text, subtext, color, roi, cur_fps, i + 1, frames_to_run)
+        annotated = draw_annotations(frame, dets, scores, swerve_text, subtext, color, roi,
+                                     fps=cur_fps, frame_idx=i + 1, total_frames=frames_to_run)
         out.write(annotated)
 
         if (i + 1) % 30 == 0 or i == 0 or (i + 1) == frames_to_run:
@@ -439,7 +455,127 @@ def main():
         cv2.destroyAllWindows()
 
     print(f"\n[+] Complete in {time.time() - t_start:.1f}s! Saved to: {output_path}\n")
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pothole & Obstacle Detection with Swerve Guidance (Images & Videos)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Process an image and save to outputs/
+  python run_detection.py --image sample_road.jpg
+  python run_detection.py sample_road.jpg
+
+  # Process a video and save to outputs/
+  python run_detection.py --video pothole_test_2.mp4
+  python run_detection.py pothole_test_2.mp4
+
+  # Process all images/videos inside a folder
+  python run_detection.py --input path/to/folder
+
+  # Preview with live display window
+  python run_detection.py sample_road.jpg --show
+        """
+    )
+    parser.add_argument("pos_input", nargs="?", default=None, help="Input image, video, or folder path")
+    parser.add_argument("--input", "-in", default=None, help="Input image, video, or folder path")
+    parser.add_argument("--image", "-i", default=None, help="Input image path (or folder of images)")
+    parser.add_argument("--video", "-v", default=None, help="Input video path")
+    parser.add_argument("--output", "-o", default=None, help="Output destination file or directory")
+    parser.add_argument("--out-dir", default=None, help="Directory to save annotated outputs (default: pothole_detection/outputs)")
+    parser.add_argument("--duration", type=float, default=None, help="Process first N seconds of video")
+    parser.add_argument("--mode", choices=["auto", "full", "dashcam", "cabin"], default="auto", help="Camera perspective (auto, full, dashcam, cabin)")
+    parser.add_argument("--conf", type=float, default=0.05, help="Detection confidence threshold (default: 0.05)")
+    parser.add_argument("--show", action="store_true", help="Display live preview window")
+    args = parser.parse_args()
+
+    # Determine input source
+    target_input = args.image or args.video or args.input or args.pos_input
+    
+    # Destination output directory
+    out_dir = Path(args.out_dir) if args.out_dir else DEFAULT_OUTPUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Fallback to default sample if no input provided
+    if not target_input:
+        if (ROOT_DIR / "sample_road.jpg").exists():
+            target_input = str(ROOT_DIR / "sample_road.jpg")
+            print(f"[!] No input specified. Defaulting to sample image: {target_input}")
+        elif (ROOT_DIR / "pothole_test_2.mp4").exists():
+            target_input = str(ROOT_DIR / "pothole_test_2.mp4")
+            print(f"[!] No input specified. Defaulting to sample video: {target_input}")
+        elif DEFAULT_VIDEO:
+            target_input = str(DEFAULT_VIDEO)
+            print(f"[!] No input specified. Defaulting to: {target_input}")
+        else:
+            print("❌ Error: No input file provided. Use: python run_detection.py <image_or_video>", file=sys.stderr)
+            sys.exit(1)
+
+    in_path = Path(target_input)
+    # Smart path discovery (check CWD and ROOT_DIR)
+    if not in_path.exists():
+        if (ROOT_DIR / target_input).exists():
+            in_path = ROOT_DIR / target_input
+        elif (ROOT_DIR / in_path.name).exists():
+            in_path = ROOT_DIR / in_path.name
+        elif (Path.cwd() / target_input).exists():
+            in_path = Path.cwd() / target_input
+
+    if not in_path.exists():
+        print(f"❌ Error: Input path does not exist: {in_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Auto-detect camera mode
+    is_image = in_path.is_file() and in_path.suffix.lower() in IMAGE_EXTS
+    if args.mode == "auto":
+        if is_image:
+            mode = "full"
+        elif "test_video" in in_path.name.lower():
+            mode = "cabin"
+        else:
+            mode = "dashcam"
+    else:
+        mode = args.mode
+
+    print(f"[+] Camera Perspective   : {mode.upper()} mode")
+    print(f"[+] Confidence Threshold : {args.conf}")
+    print(f"[+] Output Directory     : {out_dir}")
+
+    detector = PotholeDetector(conf_thresh=args.conf, mode=mode)
+
+    # 1. Directory Input (Batch process all media)
+    if in_path.is_dir():
+        media_files = [f for f in in_path.iterdir() if f.suffix.lower() in (IMAGE_EXTS | VIDEO_EXTS)]
+        if not media_files:
+            print(f"⚠️ No images or videos found in directory: {in_path}")
+            return
+        print(f"\n📂 Processing folder: {in_path} ({len(media_files)} files found)\n")
+        for f in media_files:
+            dest = out_dir / f"annotated_{f.stem}{f.suffix}"
+            if f.suffix.lower() in IMAGE_EXTS:
+                process_single_image(detector, f, dest, args)
+            else:
+                process_single_video(detector, f, dest, args)
+
+    # 2. Single Image Input
+    elif in_path.suffix.lower() in IMAGE_EXTS:
+        dest = Path(args.output) if args.output else out_dir / f"annotated_{in_path.stem}{in_path.suffix}"
+        process_single_image(detector, in_path, dest, args)
+
+    # 3. Single Video Input
+    elif in_path.suffix.lower() in VIDEO_EXTS:
+        dest = Path(args.output) if args.output else out_dir / f"annotated_{in_path.stem}.mp4"
+        process_single_video(detector, in_path, dest, args)
+
+    else:
+        # Fallback trial as image, then video
+        dest = Path(args.output) if args.output else out_dir / f"annotated_{in_path.stem}.jpg"
+        if not process_single_image(detector, in_path, dest, args):
+            process_single_video(detector, in_path, dest.with_suffix(".mp4"), args)
 
 
 if __name__ == "__main__":
     main()
+
