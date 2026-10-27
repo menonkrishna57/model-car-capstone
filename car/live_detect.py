@@ -105,7 +105,7 @@ CAM_HEIGHT = 240
 IMGSZ = 320
 OBSTACLE_CLASSES = [0, 1, 2, 3, 5, 7]  # person, bicycle, car, motorcycle, bus, truck
 CONF_OBSTACLE = 0.35
-CONF_POTHOLE = 0.08                     # High sensitivity for fine-tuned D40 potholes
+CONF_POTHOLE = 0.20                     # Standard threshold for actual D40 potholes
 POTHOLE_ONLY = True                     # STRICT FILTER: Only detect D40 potholes
 POTHOLE_EVERY = 2
 
@@ -170,54 +170,39 @@ def enhance_contrast(roi: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(cv2.merge((clahe.apply(l_c), a_c, b_c)), cv2.COLOR_LAB2BGR)
 
 def cv_detect_potholes(frame: np.ndarray) -> List[Dict[str, Any]]:
-    """Noise-resilient classical CV pothole detector with Black-Hat dark-cavity extraction."""
+    """Classical CV pothole detector on road surface (filters out carpet/texture false positives)."""
     if frame is None or getattr(frame, "size", 0) == 0:
         return []
     h, w = frame.shape[:2]
-    roi_y1 = int(h * 0.18)
-    roi = frame[roi_y1:, :]
-    rh, rw = roi.shape[:2]
-    if rh < 24 or rw < 24:
+    roi_y = int(h * 0.40)
+    roi = frame[roi_y:, :]
+    if roi.size == 0:
         return []
 
-    gray_raw = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray_raw, (5, 5), 0)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    gray = clahe.apply(blur)
-
-    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    lap = cv2.Laplacian(blur, cv2.CV_64F)
     lap_u = np.uint8(np.clip(np.absolute(lap), 0, 255))
-    _, edge_thresh = cv2.threshold(lap_u, 22, 255, cv2.THRESH_BINARY)
-
-    bh_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, bh_kernel)
-    _, dark_thresh = cv2.threshold(blackhat, 24, 255, cv2.THRESH_BINARY)
-
-    combined = cv2.bitwise_or(edge_thresh, dark_thresh)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    _, thresh = cv2.threshold(lap_u, 32, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
-
     contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    dets = []
-    roi_area = rh * rw
-    min_area = max(150, int(roi_area * 0.005))
-    max_area = int(roi_area * 0.28)
 
+    dets = []
+    roi_area = roi.shape[0] * roi.shape[1]
+    min_area = max(150, int(roi_area * 0.0065))
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < min_area or area > max_area:
+        if area < min_area or area > roi_area * 0.30:
             continue
         x, y, cw, ch = cv2.boundingRect(cnt)
-        # Reject border-touching artifacts (paper/screen margins)
-        if x <= 2 or y <= 2 or (x + cw) >= (rw - 2) or (y + ch) >= (rh - 2):
-            continue
         aspect = cw / max(ch, 1)
-        if not (0.35 < aspect < 3.8):
+        if not (0.5 < aspect < 2.5):
             continue
         dets.append({
-            "bbox": [x, y + roi_y1, x + cw, y + roi_y1 + ch],
-            "conf": 0.55,
+            "bbox": [x, y + roi_y, x + cw, y + roi_y + ch],
+            "conf": 0.45,
             "label": "POTHOLE (CV)",
             "is_pothole": True
         })
@@ -1028,9 +1013,6 @@ def detect_loop(cam, output):
             if pot_model is not None:
                 try:
                     res_p = pot_model.predict(frame, imgsz=IMGSZ, conf=CONF_POTHOLE, verbose=False)[0]
-                    # CLAHE fallback if no detection (counteracts washed-out printout/screen contrast)
-                    if len(res_p.boxes) == 0:
-                        res_p = pot_model.predict(enhance_contrast(frame), imgsz=IMGSZ, conf=CONF_POTHOLE, verbose=False)[0]
 
                     for box in res_p.boxes:
                         cls_id = int(box.cls[0])

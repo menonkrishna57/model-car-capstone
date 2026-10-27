@@ -3,7 +3,7 @@
 run_detection.py
 =================
 Pothole Detection & Directional Swerve Avoidance System
-Trained on RDD2022 India (D40 Pothole Benchmark) + Noise & Held-Photo Augmentation
+Trained on RDD2022 India (D40 Pothole Benchmark)
 
 Usage:
   python run_detection.py               # Annotates test_video.mp4 -> annotated_video.mp4
@@ -26,7 +26,7 @@ except ImportError:
 ROOT_DIR = Path(__file__).resolve().parent
 SUB_DIR = ROOT_DIR / "negative_obstacle_detection"
 
-# Locate weights (Prioritize newly fine-tuned custom best.pt)
+# Locate weights (Prioritize newly trained custom best.pt)
 MODEL_PATHS = [
     ROOT_DIR / "best.pt",
     ROOT_DIR / "rdd2022_yolov8n.pt",
@@ -81,47 +81,34 @@ def enhance_contrast(roi):
 
 
 def cv_detect_surface_defects(roi, base_x=0, base_y=0):
-    """Noise-resilient Classical CV fallback for road damage and held-up pothole photos."""
+    """Classical CV fallback for road damage."""
     h, w = roi.shape[:2]
-    if h < 30 or w < 30:
-        return []
-    road_surf = roi[int(h * 0.12):, :]
-    rh, rw = road_surf.shape[:2]
-    gray_raw = cv2.cvtColor(road_surf, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray_raw, (5, 5), 0)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    gray = clahe.apply(blur)
-
-    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    road_surf = roi[int(h * 0.4):, :]
+    gray = cv2.cvtColor(road_surf, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    lap = cv2.Laplacian(blur, cv2.CV_64F)
     lap_u = np.uint8(np.clip(np.absolute(lap), 0, 255))
-    _, edge_thresh = cv2.threshold(lap_u, 22, 255, cv2.THRESH_BINARY)
 
-    bh_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (23, 23))
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, bh_kernel)
-    _, dark_thresh = cv2.threshold(blackhat, 25, 255, cv2.THRESH_BINARY)
-
-    combined = cv2.bitwise_or(edge_thresh, dark_thresh)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    _, thresh = cv2.threshold(lap_u, 26, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
 
     contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     dets = []
-    surf_area = rh * rw
+    surf_area = road_surf.shape[0] * road_surf.shape[1]
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 400 or area > surf_area * 0.28:
+        if area < 500 or area > surf_area * 0.35:
             continue
         x, y, cw, ch = cv2.boundingRect(cnt)
-        if x <= 2 or y <= 2 or (x + cw) >= (rw - 2) or (y + ch) >= (rh - 2):
-            continue
         if 0.3 < cw / max(ch, 1) < 5.0:
-            actual_y = y + int(h * 0.12) + base_y
+            actual_y = y + int(h * 0.4) + base_y
             actual_x = x + base_x
             dets.append({
                 "bbox": [actual_x, actual_y, actual_x + cw, actual_y + ch],
-                "conf": 0.55,
+                "conf": 0.45,
                 "label": "ROAD DAMAGE (CV)",
                 "is_pothole": True
             })
@@ -175,8 +162,6 @@ class PotholeDetector:
         # 1. Primary Model Inference (best.pt, with CLAHE fallback for noisy / held-photo frames)
         try:
             res = self.pothole_model.predict(sub_frame, conf=self.conf, imgsz=640, verbose=False)[0]
-            if len(res.boxes) == 0:
-                res = self.pothole_model.predict(enhance_contrast(sub_frame), conf=self.conf, imgsz=640, verbose=False)[0]
             for box in res.boxes:
                 cls_id = int(box.cls[0])
                 name = res.names.get(cls_id, "pothole")
@@ -357,7 +342,7 @@ def draw_annotations(frame, detections, scores, swerve_text, subtext, color, roi
 
     speed_lbl = f"{latency_ms:.1f}ms" if (is_image and latency_ms is not None) else f"FPS: {fps:.1f}"
     cv2.putText(frame, speed_lbl, (14, 24), font, 0.45, COLOR_TEXT, 1, cv2.LINE_AA)
-    cv2.putText(frame, "YOLOv10n (D40 Noise-FT)", (14, 44), font, 0.38, (0, 190, 255), 1, cv2.LINE_AA)
+    cv2.putText(frame, "YOLOv10n (D40)", (14, 44), font, 0.38, (0, 190, 255), 1, cv2.LINE_AA)
 
     prog = "IMAGE" if is_image else f"{frame_idx}/{total_frames}"
     (ptw, _), _ = cv2.getTextSize(prog, font, 0.42, 1)

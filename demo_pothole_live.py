@@ -2,10 +2,8 @@
 """
 LIVE DEMO: Pothole Detection & Directional Swerve Avoidance
 ===========================================================
-Dedicated standalone script for evaluating Pothole Detection on RDD2022 D40 benchmark
-and live held-up road photos / noisy camera feeds.
-- High-recall ensemble: Primary fine-tuned best.pt + Specialist + Noise-Resilient Classical CV
-- CLAHE contrast recovery for printed/screen pothole photos held in front of the car
+Dedicated standalone script for evaluating Pothole Detection on RDD2022 D40 benchmark.
+- High-recall ensemble: Primary best.pt + Specialist + Classical CV
 - Dynamic corridor risk meters (Left, Center, Right)
 - Real-time steering swerve recommendations (<< SWERVE LEFT, SWERVE RIGHT >>)
 - Accepts ANY video path from ANY drive or folder
@@ -56,59 +54,37 @@ def resolve_video_path(raw_path):
     return None
 
 
-def enhance_contrast(roi):
-    """CLAHE contrast normalization for held-up road photos, printouts, and noisy feeds."""
-    if roi is None or roi.size == 0:
-        return roi
-    denoised = cv2.GaussianBlur(roi, (3, 3), 0)
-    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
-    l_c, a_c, b_c = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    return cv2.cvtColor(cv2.merge((clahe.apply(l_c), a_c, b_c)), cv2.COLOR_LAB2BGR)
-
-
 def cv_detect_surface_defects(roi, base_x=0, base_y=0):
-    """Noise-resilient Classical CV fallback for road damage and held-up pothole photos."""
+    """Classical CV fallback for road damage."""
     h, w = roi.shape[:2]
     if h < 30 or w < 30:
         return []
-    road_surf = roi[int(h * 0.12):, :]
-    rh, rw = road_surf.shape[:2]
-    gray_raw = cv2.cvtColor(road_surf, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray_raw, (5, 5), 0)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    gray = clahe.apply(blur)
-
-    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    road_surf = roi[int(h * 0.35):, :]
+    gray = cv2.cvtColor(road_surf, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    lap = cv2.Laplacian(blur, cv2.CV_64F)
     lap_u = np.uint8(np.clip(np.absolute(lap), 0, 255))
-    _, edge_thresh = cv2.threshold(lap_u, 22, 255, cv2.THRESH_BINARY)
 
-    bh_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (23, 23))
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, bh_kernel)
-    _, dark_thresh = cv2.threshold(blackhat, 25, 255, cv2.THRESH_BINARY)
-
-    combined = cv2.bitwise_or(edge_thresh, dark_thresh)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    _, thresh = cv2.threshold(lap_u, 24, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
 
     contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     dets = []
-    surf_area = rh * rw
+    surf_area = road_surf.shape[0] * road_surf.shape[1]
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 350 or area > surf_area * 0.25:
+        if area < 350 or area > surf_area * 0.30:
             continue
         x, y, cw, ch = cv2.boundingRect(cnt)
-        if x <= 2 or y <= 2 or (x + cw) >= (rw - 2) or (y + ch) >= (rh - 2):
-            continue
-        if 0.30 < cw / max(ch, 1) < 4.8:
-            actual_y = y + int(h * 0.12) + base_y
+        if 0.35 < cw / max(ch, 1) < 4.5:
+            actual_y = y + int(h * 0.35) + base_y
             actual_x = x + base_x
             dets.append({
                 "bbox": [actual_x, actual_y, actual_x + cw, actual_y + ch],
-                "conf": 0.55,
+                "conf": 0.42,
                 "label": "POTHOLE (CV)"
             })
     return dets
@@ -206,19 +182,17 @@ def main():
             h, w = frame.shape[:2]
             t0 = time.perf_counter()
 
-            # Expanded Road surface + held-photo ROI (15%..98%)
-            roi_y1, roi_y2 = int(h * 0.15), int(h * 0.98)
+            # Road surface ROI
+            roi_y1, roi_y2 = int(h * 0.35), int(h * 0.98)
             roi_x1, roi_x2 = int(w * 0.02), int(w * 0.98)
             sub_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
             eff_w, eff_h = roi_x2 - roi_x1, roi_y2 - roi_y1
 
             detections = []
 
-            # 1. Primary Model (with CLAHE fallback for noisy / held-photo inputs)
+            # 1. Primary Model
             try:
                 results = model.predict(sub_frame, conf=conf_level, imgsz=args.imgsz, verbose=False)[0]
-                if len(results.boxes) == 0:
-                    results = model.predict(enhance_contrast(sub_frame), conf=conf_level, imgsz=args.imgsz, verbose=False)[0]
                 for box in results.boxes:
                     c_val = float(box.conf[0])
                     cls_id = int(box.cls[0])
@@ -348,7 +322,7 @@ def main():
 
             cv2.putText(frame, "AUTONOMOUS POTHOLE AVOIDANCE SYSTEM", (16, 26),
                         cv2.FONT_HERSHEY_DUPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(frame, f"Model: RDD2022 D40 (Noise Fine-Tuned) | Potholes Detected: {len(detections)}", (16, 44),
+            cv2.putText(frame, f"Model: RDD2022 D40 Benchmark | Potholes Detected: {len(detections)}", (16, 44),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 220, 255), 1, cv2.LINE_AA)
 
             hud_r = f"FPS: {fps:.1f} | Latency: {latency_ms:.1f} ms | Sens: {conf_level:.2f}"

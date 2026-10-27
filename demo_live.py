@@ -3,13 +3,26 @@
 CAPSTONE LIVE DEMO: YOLOv10n Obstacle Detection + Pothole Swerve Avoidance
 ==========================================================================
 Interactive real-time demonstration for live teacher/reviewer evaluation.
-- High-recall Pothole Detection (Noise-Fine-Tuned RDD2022 D40 + Specialist + Classical CV)
-- CLAHE contrast recovery for printed/screen road photos held in front of the car
+- High-recall Pothole Detection (RDD2022 D40 + specialist + Classical CV)
 - Full-frame YOLOv10n Obstacle Detection (Vehicles, pedestrians, hazards)
 - Corridor Risk Telemetry (Left, Center, Right danger corridors)
 - Autonomous Directional Swerve Guidance (<< SWERVE LEFT, SWERVE RIGHT >>)
 - Supports ANY video stored in ANY directory on your system
 - Zero video saving at the end (pure real-time OpenCV display)
+
+Usage:
+    python demo_live.py "C:\\path\\to\\any_downloaded_video.mp4"
+    python demo_live.py --video "D:\\videos\\traffic.mp4"
+    python demo_live.py --mode yolo "path_to_video.mp4"
+    python demo_live.py --mode pothole "path_to_video.mp4"
+    python demo_live.py --webcam
+
+Interactive Live Controls:
+    [SPACE]   : Pause / Resume playback
+    [M]       : Toggle Mode (COMBINED -> POTHOLE ONLY -> YOLO ONLY)
+    [+] / [-] : Increase / Decrease pothole detection sensitivity
+    [R]       : Replay video from frame 0
+    [Q] / ESC : Exit immediately (no files saved)
 """
 
 import argparse
@@ -49,65 +62,44 @@ def resolve_video_path(raw_path):
     p = Path(cleaned).expanduser()
     if p.exists() and p.is_file():
         return str(p.resolve())
+    # Try relative to current working dir
     p_rel = (Path.cwd() / cleaned).resolve()
     if p_rel.exists() and p_rel.is_file():
         return str(p_rel)
     return None
 
 
-def enhance_contrast(roi):
-    """CLAHE contrast normalization for held-up road photos, printouts, and noisy feeds."""
-    if roi is None or roi.size == 0:
-        return roi
-    denoised = cv2.GaussianBlur(roi, (3, 3), 0)
-    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
-    l_c, a_c, b_c = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    return cv2.cvtColor(cv2.merge((clahe.apply(l_c), a_c, b_c)), cv2.COLOR_LAB2BGR)
-
-
 def cv_detect_surface_defects(roi, base_x=0, base_y=0):
-    """Noise-resilient Classical CV fallback for road surface cavities and held-up pothole photos."""
+    """Classical Computer Vision fallback for road surface cavities and dark asphalt depressions."""
     h, w = roi.shape[:2]
     if h < 30 or w < 30:
         return []
-    road_surf = roi[int(h * 0.12):, :]
-    rh, rw = road_surf.shape[:2]
-    gray_raw = cv2.cvtColor(road_surf, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray_raw, (5, 5), 0)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    gray = clahe.apply(blur)
-
-    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    road_surf = roi[int(h * 0.35):, :]
+    gray = cv2.cvtColor(road_surf, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    lap = cv2.Laplacian(blur, cv2.CV_64F)
     lap_u = np.uint8(np.clip(np.absolute(lap), 0, 255))
-    _, edge_thresh = cv2.threshold(lap_u, 22, 255, cv2.THRESH_BINARY)
 
-    bh_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (23, 23))
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, bh_kernel)
-    _, dark_thresh = cv2.threshold(blackhat, 25, 255, cv2.THRESH_BINARY)
-
-    combined = cv2.bitwise_or(edge_thresh, dark_thresh)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    _, thresh = cv2.threshold(lap_u, 24, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
 
     contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     dets = []
-    surf_area = rh * rw
+    surf_area = road_surf.shape[0] * road_surf.shape[1]
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 350 or area > surf_area * 0.25:
+        if area < 350 or area > surf_area * 0.30:
             continue
         x, y, cw, ch = cv2.boundingRect(cnt)
-        if x <= 2 or y <= 2 or (x + cw) >= (rw - 2) or (y + ch) >= (rh - 2):
-            continue
-        if 0.30 < cw / max(ch, 1) < 4.8:
-            actual_y = y + int(h * 0.12) + base_y
+        if 0.35 < cw / max(ch, 1) < 4.5:
+            actual_y = y + int(h * 0.35) + base_y
             actual_x = x + base_x
             dets.append({
                 "bbox": [actual_x, actual_y, actual_x + cw, actual_y + ch],
-                "conf": 0.55,
+                "conf": 0.42,
                 "label": "POTHOLE (CV)",
                 "type": "pothole"
             })
@@ -142,7 +134,7 @@ class CapstoneLiveDemo:
         print(f"[*] Loading YOLOv10n Model: {yolo_path}")
         self.yolo_model = YOLO(yolo_path)
 
-        # 2. Load Primary Pothole Model (best.pt trained on RDD2022 D40 + noise)
+        # 2. Load Primary Pothole Model (best.pt trained on RDD2022 D40)
         pothole_path = find_model(["pothole_best.pt", "best.pt"])
         if pothole_path:
             print(f"[*] Loading Primary Pothole Model: {pothole_path}")
@@ -166,14 +158,15 @@ class CapstoneLiveDemo:
             7: 'TRUCK', 9: 'TRAFFIC LIGHT', 11: 'STOP SIGN', 15: 'CAT', 16: 'DOG'
         }
 
+        # Tracked pothole memory for smooth non-flicker display
         self.recent_potholes = []
 
     def process_frame(self, frame):
         h, w = frame.shape[:2]
         t0 = time.perf_counter()
 
-        # Expanded road surface + held-photo ROI (15%..98% of camera frame)
-        roi_y1, roi_y2 = int(h * 0.15), int(h * 0.98)
+        # Drivable road surface ROI (lower ~65% of camera frame)
+        roi_y1, roi_y2 = int(h * 0.35), int(h * 0.98)
         roi_x1, roi_x2 = int(w * 0.02), int(w * 0.98)
         sub_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
         eff_w, eff_h = roi_x2 - roi_x1, roi_y2 - roi_y1
@@ -185,17 +178,15 @@ class CapstoneLiveDemo:
         # 1. POTHOLE DETECTION (High-Recall Ensemble)
         # ==========================================
         if self.mode in ["combined", "pothole"]:
-            # A. Primary Model (best.pt at high sensitivity, with CLAHE fallback)
+            # A. Primary Model (best.pt at high sensitivity)
             try:
                 res_p = self.pothole_model.predict(sub_frame, conf=self.pothole_conf, imgsz=640, verbose=False)[0]
-                if len(res_p.boxes) == 0:
-                    res_p = self.pothole_model.predict(enhance_contrast(sub_frame), conf=self.pothole_conf, imgsz=640, verbose=False)[0]
                 for box in res_p.boxes:
                     c_val = float(box.conf[0])
                     cls_id = int(box.cls[0])
                     name = res_p.names.get(cls_id, "pothole").lower()
                     x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
-
+                    
                     is_pothole = ("pothole" in name or "d40" in name or cls_id == 0)
                     lbl = "POTHOLE (D40)" if is_pothole else "ROAD CRACK"
                     raw_potholes.append({
@@ -218,6 +209,7 @@ class CapstoneLiveDemo:
                         x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
                         gx1, gy1, gx2, gy2 = x1 + roi_x1, y1 + roi_y1, x2 + roi_x1, y2 + roi_y1
 
+                        # Avoid duplicate overlaps
                         overlap = False
                         for ex in raw_potholes:
                             ex1, ey1, ex2, ey2 = ex["bbox"]
@@ -235,7 +227,7 @@ class CapstoneLiveDemo:
                 except Exception:
                     pass
 
-            # C. Classical CV Surface Defect Fallback
+            # C. Classical CV Surface Defect Fallback (detects dark cavities on road surface)
             try:
                 cv_dets = cv_detect_surface_defects(sub_frame, base_x=roi_x1, base_y=roi_y1)
                 for cd in cv_dets:
@@ -251,6 +243,7 @@ class CapstoneLiveDemo:
             except Exception:
                 pass
 
+            # Temporal Smoothing (prevents flickering)
             for p in raw_potholes:
                 detections.append(p)
 
@@ -264,12 +257,13 @@ class CapstoneLiveDemo:
                     cls_id = int(box.cls[0])
                     c_val = float(box.conf[0])
                     x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
-
+                    
                     label = self.obstacle_classes.get(cls_id, None)
                     if label or (self.mode == "yolo" and c_val >= self.yolo_conf):
                         if not label:
                             label = res_y.names.get(cls_id, "OBSTACLE").upper()
 
+                        # Proximity estimate based on bounding box height relative to frame
                         h_ratio = (y2 - y1) / float(h)
                         prox = "CLOSE" if h_ratio > 0.35 else ("MED" if h_ratio > 0.16 else "FAR")
 
@@ -286,6 +280,7 @@ class CapstoneLiveDemo:
         t1 = time.perf_counter()
         latency_ms = (t1 - t0) * 1000
 
+        # Corridor Risk Analysis & Directional Swerve Guidance
         scores, directive, subtext, alert_color = self.analyze_corridor(detections, roi_x1, roi_y1, eff_w, eff_h)
 
         return detections, scores, directive, subtext, alert_color, (roi_x1, roi_y1, eff_w, eff_h), latency_ms
@@ -317,6 +312,7 @@ class CapstoneLiveDemo:
         for k in scores:
             scores[k] = min(scores[k], 1.0)
 
+        # Swerve Decision Matrix
         L, C, R = scores["left"], scores["center"], scores["right"]
         T = DANGER_THRESHOLD
 
@@ -357,6 +353,7 @@ class CapstoneLiveDemo:
         overlay = frame.copy()
         rx, ry, rw, rh = roi
 
+        # 1. Corridor Guidelines
         zl = int(rx + rw * ZONE_LEFT_MAX)
         zr = int(rx + rw * ZONE_RIGHT_MIN)
         cl = COLOR_ALERT if scores["left"] >= DANGER_THRESHOLD else (70, 70, 80)
@@ -364,20 +361,24 @@ class CapstoneLiveDemo:
         cv2.line(overlay, (zl, ry), (zl, ry + rh), cl, 2, cv2.LINE_AA)
         cv2.line(overlay, (zr, ry), (zr, ry + rh), cr, 2, cv2.LINE_AA)
 
+        # 2. Header Panel
         cv2.rectangle(overlay, (0, 0), (w, 54), COLOR_DARK, -1)
         cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
 
+        # Title & Mode
         cv2.putText(frame, "CAPSTONE AUTONOMOUS VISION", (16, 24), cv2.FONT_HERSHEY_DUPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
         mode_text = f"MODE: {self.mode.upper()}  [Press M to switch]"
         cv2.putText(frame, mode_text, (16, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180, 210, 255), 1, cv2.LINE_AA)
 
+        # FPS, Latency & Sensitivity
         hud_telemetry = f"FPS: {fps:.1f} | Latency: {latency_ms:.1f} ms | Pothole Sens: {self.pothole_conf:.2f}"
         (tw, _), _ = cv2.getTextSize(hud_telemetry, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
         cv2.putText(frame, hud_telemetry, (w - tw - 16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (100, 255, 160), 1, cv2.LINE_AA)
-        models_lbl = "YOLOv10n Engine + RDD2022 Pothole (Noise Fine-Tuned)"
+        models_lbl = "YOLOv10n Engine + RDD2022 Pothole Benchmark"
         (bw, _), _ = cv2.getTextSize(models_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
         cv2.putText(frame, models_lbl, (w - bw - 16, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1, cv2.LINE_AA)
 
+        # 3. Draw Bounding Boxes
         for det in detections:
             x1, y1, x2, y2 = det["bbox"]
             is_pot = (det["type"] == "pothole")
@@ -390,6 +391,7 @@ class CapstoneLiveDemo:
             cv2.rectangle(frame, (x1, max(y1 - lh - 7, 0)), (x1 + lw + 6, y1), box_col, -1)
             cv2.putText(frame, lbl, (x1 + 3, y1 - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1, cv2.LINE_AA)
 
+        # 4. Swerve Directive Banner (Center Top)
         bw_dim, bh_dim = min(int(w * 0.72), 640), 48
         bx = (w - bw_dim) // 2
         by = 64
@@ -401,6 +403,7 @@ class CapstoneLiveDemo:
         (st_w, _), _ = cv2.getTextSize(subtext, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
         cv2.putText(frame, subtext, (bx + (bw_dim - st_w)//2, by + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1, cv2.LINE_AA)
 
+        # 5. Risk Gauges (Bottom Left)
         gy = h - 70
         cv2.rectangle(frame, (14, gy - 6), (250, h - 14), (20, 20, 25), -1)
         cv2.rectangle(frame, (14, gy - 6), (250, h - 14), (60, 60, 70), 1)
@@ -416,6 +419,7 @@ class CapstoneLiveDemo:
                 cv2.rectangle(frame, (42, zy - 7), (42 + bfill, zy + 1), bcol, -1)
             cv2.putText(frame, f"{int(val*100)}%", (188, zy), cv2.FONT_HERSHEY_SIMPLEX, 0.35, bcol, 1, cv2.LINE_AA)
 
+        # 6. Bottom Controls Bar
         ctrl_hint = "[Q: Quit | SPACE: Pause | M: Switch Mode | +/-: Sensitivity | R: Replay]"
         (cw, _), _ = cv2.getTextSize(ctrl_hint, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
         cv2.putText(frame, ctrl_hint, (w - cw - 16, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (150, 150, 160), 1, cv2.LINE_AA)
@@ -432,6 +436,7 @@ def main():
     parser.add_argument("--conf", type=float, default=0.07, help="Pothole sensitivity threshold (default 0.07)")
     args = parser.parse_args()
 
+    # Resolve Video Input
     raw_video = args.video or args.video_pos
     video_source = None
 
@@ -444,6 +449,7 @@ def main():
             print("   Make sure the path is correct or enclosed in quotes.")
             return
 
+    # Fallback to local test videos if none specified
     if video_source is None and not args.webcam:
         for candidate in ["pothole_test_2.mp4", "pothole_detection/pothole_test_2.mp4", "dashcam_test.mp4"]:
             if Path(candidate).exists():
@@ -451,6 +457,7 @@ def main():
                 print(f"[*] Auto-detected test video: {candidate}")
                 break
 
+    # If still not found, ask interactively
     if video_source is None and not args.webcam:
         user_input = input("Enter path to MP4 video file: ").strip().strip('"').strip("'")
         video_source = resolve_video_path(user_input)
@@ -514,10 +521,10 @@ def main():
             print(f"[Mode Switched]: {demo.mode.upper()}")
         elif key in [ord('r'), ord('R')]:
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        elif key in [ord('-'), ord('_')]:
+        elif key in [ord('-'), ord('_')]:  # Increase sensitivity (lower threshold)
             demo.pothole_conf = max(round(demo.pothole_conf - 0.02, 2), 0.02)
             print(f"[Pothole Sensitivity Increased]: conf = {demo.pothole_conf}")
-        elif key in [ord('+'), ord('=')]:
+        elif key in [ord('+'), ord('=')]:  # Decrease sensitivity (higher threshold)
             demo.pothole_conf = min(round(demo.pothole_conf + 0.02, 2), 0.50)
             print(f"[Pothole Sensitivity Filtered]: conf = {demo.pothole_conf}")
 

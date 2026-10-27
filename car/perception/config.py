@@ -14,7 +14,7 @@ MODEL_PATH = str(REPO_ROOT / "benchmarking" / "models" / "yolov10n_ncnn_model")
 POTHOLE_MODEL_PATH = str(REPO_ROOT / "pothole_detection" / "best.pt")
 IMGSZ = 320                            # Optimal resolution identified in benchmarks
 CONFIDENCE_THRESHOLD = 0.25            # Detection threshold for positive obstacles
-POTHOLE_CONFIDENCE_THRESHOLD = 0.08    # High-sensitivity threshold for fine-tuned pothole model
+POTHOLE_CONFIDENCE_THRESHOLD = 0.22    # Confidence threshold for D40 pothole model (rejects false positives)
 
 # ── Serial Link (Pi 5 ↔ Arduino Uno) ─────────────────────────────────────────
 # Default transport: USB-serial (/dev/ttyUSB0 or /dev/ttyACM0).
