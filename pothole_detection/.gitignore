@@ -1,6 +1,8 @@
 # Ignore raw Kaggle datasets and temporary YOLO caches
 train/
 rdd_yolo_dataset/
+noisy_pothole_dataset/
+.ultralytics_cfg/
 *.cache
 labels.cache
 
@@ -14,3 +16,7 @@ __pycache__/
 
 # Output folder for annotated videos and images
 outputs/
+
+# Temporary fine-tuning weights and training run directories
+best_pre_noise_backup.pt
+runs_rdd/noisy_finetuned_pothole_model/

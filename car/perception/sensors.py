@@ -59,7 +59,7 @@ class SensorManager:
         """
         if self.motor is not None:
             return dict(self.motor.latest_sonar)  # Copy to avoid mutation
-        return {"left": 999.0, "right": 999.0}
+        return {"left": 999.0, "right": 999.0, "rear": 999.0}
 
     def is_obstacle_ahead(self, threshold_cm: float = 20.0) -> bool:
         """

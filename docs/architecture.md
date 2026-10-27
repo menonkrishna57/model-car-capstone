@@ -32,7 +32,7 @@ To overcome the fundamental failure modes of monolithic, single-board robotics s
 |   |                                  |             | • Serial Halt ('s'/'g' Pause)|   |
 |   +----------------------------------+             +------------------------------+   |
 |                    ^                                               ^                  |
-|                    | Isolated 5.1V/5A                              | 7.4V (2S 18650)  |
+|                    | Dedicated 5.1V/5A                             | 7.4V (2S 18650)  |
 |   +----------------------------------+             +---------------+--------------+   |
 |   | boAt EnergyShroom PB400 Battery  |             | 2S 18650 Li-Ion + Common GND |   |
 |   +----------------------------------+             +------------------------------+   |
@@ -58,8 +58,8 @@ Our architecture enforces strict physical and functional isolation:
 | **Motor PWM Generation** | Software GPIO (jittery under load, $\pm 25\,\text{ms}$) | Hardware 8-bit Timer0/Timer1/Timer2 (rock-solid, $< 4\,\mu\text{s}$) |
 | **Ultrasonic Echo Timing** | User-space polling (unreliable, pulse truncation) | Dedicated microcontroller `pulseIn()` timing ($1\,\mu\text{s}$ precision) |
 | **Emergency Reflex Loop** | Soft real-time (60–120 ms round trip) | Hard real-time Tier 2 reflex ($< 10\,\text{ms}$ autonomous trigger) |
-| **Crash Protection** | Motors latch at previous state on crash | Hardware Watchdog halts all motors if Pi heartbeat lost ($> 500\,\text{ms}$) |
-| **Electrical Stability** | Motor back-EMF couples directly into SBC power rail | Dual-rail isolated supplies eliminate brownout resets |
+| **Crash Protection** | Motors latch at previous state on crash | Hardware Watchdog halts all motors if Pi heartbeat lost ($> 5000\,\text{ms}$, configurable) |
+| **Electrical Stability** | Motor back-EMF couples directly into SBC power rail | Dual-rail supplies with common signal ground eliminate brownout resets |
 | **BOM Cost** | $\$250\text{–}\$350$ (expensive single boards / carrier kits) | $\sim \$120\text{–}\$150$ (accessible, modular academic components) |
 
 ---
@@ -110,11 +110,11 @@ The legacy default PWM speed value of $120$ ($\approx 47\%$ duty cycle) delivere
 * **Pivot Skid-Turn (`SPEED_TURN`):** PWM **`210`** ($\sim 82\%$ duty cycle, delivers robust breakaway torque for zero-radius turns)
 * **Reverse Clearance (`SPEED_REVERSE`):** PWM **`190`** ($\sim 75\%$ duty cycle)
 
-### 2.2 Dual-Rail Isolated Power Distribution
+### 2.2 Dual-Rail Power Distribution (Common Ground Reference)
 To prevent inductive motor back-EMF and switching transients from triggering Raspberry Pi brownouts, the power system is partitioned into two physically isolated rails:
 
 ```
-  MOTOR & ARDUINO RAIL (Common Ground)               PI 5 RAIL (Isolated)
+  MOTOR & ARDUINO RAIL (Common Ground)               PI 5 RAIL (Dedicated boAt PB400)
   ====================================               ====================
 
   +-------------------------------+                 +-----------------------------------+
@@ -294,7 +294,7 @@ graph TD
 ### 4.2 Negative Obstacle & Pothole Detection: Dual-Path Engine
 Negative obstacles are depressions in the road plane that cannot reflect horizontal acoustic waves. Our system provides two complementary detection layers:
 
-#### Path A: Custom RDD2022 YOLOv8n Deep Model (`pothole_detection/`)
+#### Path A: Custom RDD2022 YOLOv10n Deep Model (`pothole_detection/`)
 * **Training Dataset:** Road Damage Dataset 2022 (RDD2022 India Sub-dataset, Class D40 Pothole).
 * **Weights:** [`pothole_detection/best.pt`](../pothole_detection/best.pt) and [`pothole_detection/rdd2022_yolov8n.pt`](../pothole_detection/rdd2022_yolov8n.pt).
 * **Dynamic Corridor & Directional Swerve Module:** Implemented in [`pothole_detection/run_detection.py`](../pothole_detection/run_detection.py):

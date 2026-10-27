@@ -2,7 +2,8 @@
 """
 live_detect.py — Fullscreen Live Perception & Autonomous Control System
 NMIMS MPSTME Capstone — Raspberry Pi 5 + Arduino Uno
-Optimized: Pothole D40 Filtering (No Carpet/Newspaper False Positives)
+Optimized: Pothole D40 Filtering + Noise-Augmented Fine-Tuned Model Loading
+Feature: Manual Control Obstacle Override Toggle (Web UI & 'O' Key)
 """
 
 import io
@@ -19,7 +20,10 @@ from typing import List, Dict, Any, Optional
 
 import cv2
 import numpy as np
-from picamera2 import Picamera2
+try:
+    from picamera2 import Picamera2
+except Exception:
+    Picamera2 = None
 from ultralytics import YOLO
 
 # ── 1. Model & Path Resolution ───────────────────────────────────────────────
@@ -30,29 +34,66 @@ def find_model_path(rel_path: str) -> Optional[Path]:
         Path.home() / "model-car-capstone" / rel_path,
         Path.cwd() / rel_path,
         Path(__file__).resolve().parent / rel_path,
+        Path(__file__).resolve().parent.parent / rel_path,
     ]
     for p in candidates:
-        if p.exists(): return p
+        if p.exists():
+            return p
     return None
 
-obs_path = find_model_path("benchmarking/models/yolov10n_ncnn_model")
+obs_candidates = [
+    "benchmarking/models/yolov10n_ncnn_model",
+    "benchmarking/models/yolov10n.pt",
+    "yolov10n.pt",
+]
+obs_path = None
+for cand in obs_candidates:
+    p = find_model_path(cand)
+    if p and p.exists():
+        obs_path = p
+        break
+
 if not obs_path:
     obs_path = Path("/home/capstone/model/yolov10n_ncnn_model")
 
-pot_path = find_model_path("pothole_detection/best_ncnn_model")
-
 print(f"📦 Loading YOLOv10n obstacle model: {obs_path}")
-obs_model = YOLO(str(obs_path), task="detect")
+try:
+    obs_model = YOLO(str(obs_path), task="detect")
+except Exception as e:
+    print(f"⚠️ Failed to load primary obstacle model ({obs_path}): {e}")
+    pt_fallback = find_model_path("yolov10n.pt") or find_model_path("benchmarking/models/yolov10n.pt")
+    if pt_fallback:
+        print(f"📦 Falling back to PyTorch weights: {pt_fallback}")
+        obs_model = YOLO(str(pt_fallback), task="detect")
+    else:
+        obs_model = None
+
+# Pothole Model Candidates (prioritizing newly noise-fine-tuned best.pt)
+pot_candidates = [
+    "pothole_best.pt",
+    "pothole_detection/best.pt",
+    "pothole_detection/runs_rdd/noisy_finetuned_pothole_model/weights/best.pt",
+    "pothole_detection/best_ncnn_model",
+    "pothole_detection/runs_rdd/custom_pothole_model/weights/best.pt",
+    "pothole_detection/rdd2022_yolov8n.pt",
+]
+
+pot_path = None
+for cand in pot_candidates:
+    p = find_model_path(cand)
+    if p and p.exists():
+        pot_path = p
+        break
 
 pot_model = None
 if pot_path and pot_path.exists():
-    print(f"📦 Loading Pothole model: {pot_path}")
+    print(f"📦 Loading Fine-Tuned Pothole model: {pot_path}")
     try:
         pot_model = YOLO(str(pot_path), task="detect")
     except Exception as e:
-        print(f"⚠️ Could not load NCNN pothole model: {e}")
+        print(f"⚠️ Could not load pothole model ({pot_path}): {e}")
 else:
-    print("ℹ️ Using classical CV Laplacian pothole detector as fallback.")
+    print("ℹ️ Using noise-resilient classical CV pothole detector as fallback.")
 
 def find_daylight_ref() -> Optional[Path]:
     for p in [Path("/home/capstone/daylight.jpg"), Path("/home/capstone/model/daylight.jpg"), Path.home() / "daylight.jpg"]:
@@ -64,8 +105,8 @@ CAM_HEIGHT = 240
 IMGSZ = 320
 OBSTACLE_CLASSES = [0, 1, 2, 3, 5, 7]  # person, bicycle, car, motorcycle, bus, truck
 CONF_OBSTACLE = 0.35
-CONF_POTHOLE = 0.20                     # Sensitive threshold for actual D40 potholes
-POTHOLE_ONLY = True                     # STRICT FILTER: Only detect D40 potholes; ignore alligator/longitudinal cracks
+CONF_POTHOLE = 0.08                     # High sensitivity for fine-tuned D40 potholes
+POTHOLE_ONLY = True                     # STRICT FILTER: Only detect D40 potholes
 POTHOLE_EVERY = 2
 
 BBOX_STOP_HEIGHT_FRAC = 0.38
@@ -77,6 +118,7 @@ SLOW_SPEED = 135                        # Cautionary PWM when approaching obstac
 
 # ── Remote Control & Operating Modes ─────────────────────────────────────────
 control_mode = "autonomous"             # "autonomous" or "manual"
+manual_override_obstacles = False       # True = Ignore all obstacles & ultrasonic brake in manual mode
 manual_speed = 185                      # Default manual drive PWM (100 - 255)
 manual_action = "IDLE"                  # Current manual direction / status
 
@@ -104,6 +146,9 @@ def set_awb_mode(cam, mode_name: str) -> bool:
     mode_name = mode_name.lower().strip()
     if mode_name not in AWB_MODES: return False
     val = AWB_MODES[mode_name]
+    if cam is None:
+        current_awb = mode_name
+        return True
     try:
         cam.set_controls({"AwbMode": val})
         current_awb = mode_name
@@ -113,33 +158,69 @@ def set_awb_mode(cam, mode_name: str) -> bool:
         print(f"⚠️ Failed to set AwbMode: {e}")
         return False
 
-# ── 3. Classical CV Pothole Fallback (Enhanced Against Carpet/Text) ──────────
-def cv_detect_potholes(frame: np.ndarray) -> List[Dict[str, Any]]:
-    h, w = frame.shape[:2]
-    roi_y = int(h * 0.40)
-    roi = frame[roi_y:, :]
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (7, 7), 0)
-    lap = cv2.Laplacian(blur, cv2.CV_64F)
-    lap_u = np.uint8(np.clip(np.absolute(lap), 0, 255))
-    _, thresh = cv2.threshold(lap_u, 32, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
-    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+# ── 3. Noise-Resilient CLAHE & Classical CV Pothole Detection ────────────────
+def enhance_contrast(roi: np.ndarray) -> np.ndarray:
+    """CLAHE contrast normalization for held-up road photos, printouts, and noisy feeds."""
+    if roi is None or getattr(roi, "size", 0) == 0:
+        return roi
+    denoised = cv2.GaussianBlur(roi, (3, 3), 0)
+    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
+    l_c, a_c, b_c = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    return cv2.cvtColor(cv2.merge((clahe.apply(l_c), a_c, b_c)), cv2.COLOR_LAB2BGR)
 
+def cv_detect_potholes(frame: np.ndarray) -> List[Dict[str, Any]]:
+    """Noise-resilient classical CV pothole detector with Black-Hat dark-cavity extraction."""
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return []
+    h, w = frame.shape[:2]
+    roi_y1 = int(h * 0.18)
+    roi = frame[roi_y1:, :]
+    rh, rw = roi.shape[:2]
+    if rh < 24 or rw < 24:
+        return []
+
+    gray_raw = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray_raw, (5, 5), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    gray = clahe.apply(blur)
+
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    lap_u = np.uint8(np.clip(np.absolute(lap), 0, 255))
+    _, edge_thresh = cv2.threshold(lap_u, 22, 255, cv2.THRESH_BINARY)
+
+    bh_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, bh_kernel)
+    _, dark_thresh = cv2.threshold(blackhat, 24, 255, cv2.THRESH_BINARY)
+
+    combined = cv2.bitwise_or(edge_thresh, dark_thresh)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     dets = []
-    roi_area = roi.shape[0] * roi.shape[1]
-    min_area = max(150, int(roi_area * 0.0065))
+    roi_area = rh * rw
+    min_area = max(150, int(roi_area * 0.005))
+    max_area = int(roi_area * 0.28)
+
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        # Suppress tiny noise (text/carpet dots) and huge false areas (dynamically scaled to resolution)
-        if area < min_area or area > roi_area * 0.30: continue
+        if area < min_area or area > max_area:
+            continue
         x, y, cw, ch = cv2.boundingRect(cnt)
-        # Potholes are round/oval cavities (aspect ratio 0.5 to 2.5) — eliminates long lines/cracks
+        # Reject border-touching artifacts (paper/screen margins)
+        if x <= 2 or y <= 2 or (x + cw) >= (rw - 2) or (y + ch) >= (rh - 2):
+            continue
         aspect = cw / max(ch, 1)
-        if not (0.5 < aspect < 2.5): continue
-        dets.append({"bbox": [x, y + roi_y, x + cw, y + roi_y + ch], "conf": 0.45, "label": "POTHOLE (CV)", "is_pothole": True})
+        if not (0.35 < aspect < 3.8):
+            continue
+        dets.append({
+            "bbox": [x, y + roi_y1, x + cw, y + roi_y1 + ch],
+            "conf": 0.55,
+            "label": "POTHOLE (CV)",
+            "is_pothole": True
+        })
     return dets
 
 # ── 4. Arduino Uno Parallel Serial Bridge ────────────────────────────────────
@@ -153,13 +234,16 @@ class ArduinoBridge:
         self.latest_state = "IDLE"
         self.motors_enabled = False
         self.pi_latched = False
-        # Chassis TT motor wiring causes forward/reverse inversion relative to standard L298N polarity.
-        # Default to True so forward cruise commands actually move the car forward.
         self.invert_motors = True
         self.last_status_time = 0.0
 
     def auto_connect(self):
-        import serial
+        try:
+            import serial
+        except ImportError:
+            print("⚠️ pyserial not installed. Operating in DRY-RUN mode.")
+            return False
+
         for p in ["/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyUSB1", "/dev/ttyACM1"]:
             try:
                 s = serial.Serial(p, 115200, timeout=0.1)
@@ -171,12 +255,8 @@ class ArduinoBridge:
                 self.connected = True
                 print(f"🔌 Arduino connected on {p} @ 115200 baud")
 
-                # Configure Arduino runtime parameters immediately:
-                # 1. Enable continuous ultrasonic telemetry streaming
                 self.send("TUNE SET TELEM_STREAM 1")
-                # 2. Disable cliff detection for flat floor driving (prevents false cliff reverse bursts)
                 self.send("TUNE SET CLIFF_ENABLE 0")
-                # 3. Release any startup latch or cliff stop
                 self.send("PI_GO")
                 self.send("STATUS")
                 return True
@@ -200,7 +280,6 @@ class ArduinoBridge:
     def read_telemetry(self):
         if not self.connected or not self.serial_port: return
         now = time.time()
-        # Periodic health check / request STATUS every 1.5s if telemetry stalls
         if now - self.last_status_time > 1.5:
             self.send("STATUS")
             self.last_status_time = now
@@ -209,8 +288,6 @@ class ArduinoBridge:
             while self.serial_port.in_waiting:
                 line = self.serial_port.readline().decode("utf-8", errors="ignore").strip()
                 if not line: continue
-                # Parse ultrasonic telemetry: [TELEM] US LEFT=x.x RIGHT=y.y
-                # or [TELEM] STATE=... US_LEFT=x.x US_RIGHT=y.y or [TELEM] CLIFF LEFT=...
                 if ("LEFT=" in line or "US_LEFT=" in line) and ("RIGHT=" in line or "US_RIGHT=" in line):
                     norm = line.replace("US_LEFT=", "LEFT=").replace("US_RIGHT=", "RIGHT=")
                     for pt in norm.split():
@@ -241,19 +318,18 @@ class ArduinoBridge:
             eff_dir = "RIGHT" if eff_dir == "LEFT" else "LEFT"
         self.send(f"PI_AVOID {eff_dir}")
 
-    def drive(self, speed: int, duration_ms: int):
-        if self.motors_enabled and not self.pi_latched:
-            # If motors are inverted on chassis, REV moves forward physically
+    def drive(self, speed: int, duration_ms: int, force: bool = False):
+        if self.motors_enabled and (force or not self.pi_latched):
             cmd = f"REV {speed} {duration_ms}" if self.invert_motors else f"DRIVE {speed} {duration_ms}"
             self.send(cmd)
 
-    def reverse(self, speed: int, duration_ms: int):
-        if self.motors_enabled and not self.pi_latched:
+    def reverse(self, speed: int, duration_ms: int, force: bool = False):
+        if self.motors_enabled and (force or not self.pi_latched):
             cmd = f"DRIVE {speed} {duration_ms}" if self.invert_motors else f"REV {speed} {duration_ms}"
             self.send(cmd)
 
-    def turn(self, angle: int, speed: int = 150):
-        if self.motors_enabled and not self.pi_latched:
+    def turn(self, angle: int, speed: int = 150, force: bool = False):
+        if self.motors_enabled and (force or not self.pi_latched):
             eff_angle = -angle if self.invert_motors else angle
             self.send(f"TURN {eff_angle} {speed}")
 
@@ -262,18 +338,15 @@ class ArduinoBridge:
 
 arduino = ArduinoBridge()
 active_action_label = "IDLE (Safety Hold)"
-control_mode = "autonomous"  # "autonomous" or "manual"
-manual_speed = 185           # Default manual PWM speed (130, 185, 235)
-manual_action = "IDLE"       # Current manual command: IDLE, FORWARD, REVERSE, LEFT, RIGHT, STOP
 
 def is_valid_us(dist: float) -> bool:
     """Returns True if reading is a valid obstacle reflection (filters out 0.0 noise & 999 timeout)."""
     return 1.0 < dist < 850.0
 
 def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_dets: list):
-    global active_action_label, control_mode, manual_action
+    global active_action_label, control_mode, manual_action, manual_override_obstacles
 
-    # 1. Camera Obstacle Check (YOLOv10n bounding box size & position)
+    # 1. Camera Obstacle Check
     obstacle_ahead = False
     for b in obs_boxes:
         x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
@@ -285,20 +358,28 @@ def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_
 
     # ── MANUAL REMOTE CONTROL MODE ───────────────────────────────────────────
     if control_mode == "manual":
-        # Keep critical collision safety auto-brake active during manual driving
         us_l = arduino.latest_sonar["left"]
         us_r = arduino.latest_sonar["right"]
         v_l = is_valid_us(us_l)
         v_r = is_valid_us(us_r)
-        if (v_l and us_l < EMERGENCY_STOP_DIST_CM) or (v_r and us_r < EMERGENCY_STOP_DIST_CM):
-            active_action_label = f"🛑 MANUAL SAFETY BRAKE (L:{us_l:.0f}cm R:{us_r:.0f}cm)"
-            arduino.stop()
-            manual_action = "SAFETY_BRAKE"
-            return
-        elif obstacle_ahead:
-            active_action_label = f"⚠️ MANUAL WARN: Obstacle Ahead | {manual_action}"
+        front_blocked = (v_l and us_l < EMERGENCY_STOP_DIST_CM) or (v_r and us_r < EMERGENCY_STOP_DIST_CM)
+
+        if manual_override_obstacles:
+            # Full manual override: driver has complete authority through obstacles/potholes
+            if front_blocked or obstacle_ahead:
+                active_action_label = f"⚠️ MANUAL [OVERRIDE]: {manual_action} (Obstacle Ignored)"
+            else:
+                active_action_label = f"🎮 MANUAL [OVERRIDE]: {manual_action} (PWM {manual_speed})"
         else:
-            active_action_label = f"🎮 MANUAL REMOTE: {manual_action} (PWM {manual_speed})"
+            if front_blocked:
+                active_action_label = f"🛑 MANUAL SAFETY BRAKE (L:{us_l:.0f}cm R:{us_r:.0f}cm)"
+                arduino.stop()
+                manual_action = "SAFETY_BRAKE"
+                return
+            elif obstacle_ahead:
+                active_action_label = f"⚠️ MANUAL WARN: Obstacle Ahead | {manual_action}"
+            else:
+                active_action_label = f"🎮 MANUAL REMOTE: {manual_action} (PWM {manual_speed})"
         return
 
     # ── AUTONOMOUS NAVIGATION MODE ───────────────────────────────────────────
@@ -307,7 +388,6 @@ def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_
         arduino.pi_stop()
         return
 
-    # Release Pi latch if previously latched by camera and now clear
     if arduino.pi_latched and not obstacle_ahead:
         active_action_label = "✅ PI_GO: Path Cleared (Camera)"
         arduino.pi_go()
@@ -346,7 +426,7 @@ def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_
             arduino.turn(-35, 160)
         return
 
-    # 3. Camera Pothole Avoidance (Classical CV + RDD2022 D40)
+    # 3. Camera Pothole Avoidance (Fine-Tuned YOLO + Noise-Resilient CV)
     danger_left = sum(1.0 for p in pot_dets if p.get("is_pothole") and (p["bbox"][0] + p["bbox"][2]) / 2 < frame_w * 0.5)
     danger_right = sum(1.0 for p in pot_dets if p.get("is_pothole") and (p["bbox"][0] + p["bbox"][2]) / 2 >= frame_w * 0.5)
 
@@ -363,9 +443,8 @@ def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_
                 arduino.turn(-30, 160)
         return
 
-    # 4. Clear Path Cruising (Speed modulated by forward ultrasonic clearance)
+    # 4. Clear Path Cruising
     if arduino.motors_enabled:
-        # If an obstacle is detected in caution range (US_SLOW_DIST_CM), reduce speed
         if (v_l and us_l < US_SLOW_DIST_CM) or (v_r and us_r < US_SLOW_DIST_CM):
             active_action_label = f"🟡 CRUISING CAUTIOUSLY (PWM {SLOW_SPEED}) [US Near]"
             arduino.drive(SLOW_SPEED, 250)
@@ -386,7 +465,7 @@ PAGE = """<!DOCTYPE html>
       --bg: #000000;
       --card-glass: rgba(18, 22, 30, 0.75);
       --border-glass: rgba(255, 255, 255, 0.12);
-      --accent: #58a6ff; --success: #3fb950; --danger: #f85149; --text: #f0f6fc; --muted: #8b949e;
+      --accent: #58a6ff; --success: #3fb950; --danger: #f85149; --warning: #d29922; --text: #f0f6fc; --muted: #8b949e;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
@@ -412,10 +491,12 @@ PAGE = """<!DOCTYPE html>
     .badge-motors-off { background: rgba(248, 81, 73, 0.2); color: var(--danger); border: 1px solid var(--danger); }
     .badge-invert-on { background: rgba(88, 166, 255, 0.2); color: var(--accent); border: 1px solid var(--accent); }
     .badge-invert-off { background: rgba(139, 148, 158, 0.2); color: var(--muted); border: 1px solid var(--muted); }
+    .badge-override-off { background: rgba(139, 148, 158, 0.2); color: var(--muted); border: 1px solid var(--muted); }
+    .badge-override-on { background: rgba(227, 179, 65, 0.35); color: #e3b341; border: 1px solid #e3b341; animation: pulse-override 1.8s infinite; font-weight: 800; }
+    @keyframes pulse-override { 0% { opacity: 0.85; } 50% { opacity: 1; box-shadow: 0 0 12px rgba(227, 179, 65, 0.55); } 100% { opacity: 0.85; } }
     .badge-us { background: rgba(63, 185, 80, 0.2); color: var(--success); border: 1px solid var(--success); }
     .badge-mode-auto { background: rgba(88, 166, 255, 0.2); color: #58a6ff; border: 1px solid #58a6ff; cursor: pointer; }
-    .badge-mode-manual { background: rgba(63, 185, 80, 0.25); color: #56d364; border: 1px solid #56d364; cursor: pointer; animation: pulse 2s infinite; }
-    @keyframes pulse { 0% { opacity: 0.85; } 50% { opacity: 1; box-shadow: 0 0 12px rgba(63, 185, 80, 0.4); } 100% { opacity: 0.85; } }
+    .badge-mode-manual { background: rgba(63, 185, 80, 0.25); color: #56d364; border: 1px solid #56d364; cursor: pointer; }
 
     .controls-dock {
       position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
@@ -432,6 +513,7 @@ PAGE = """<!DOCTYPE html>
     }
     button:hover { background: rgba(255, 255, 255, 0.18); }
     button.btn-active { background: #1f6feb; border-color: #58a6ff; }
+    button.btn-warning-active { background: rgba(227, 179, 65, 0.35); border-color: #e3b341; color: #fff; }
     button.btn-danger { background: rgba(248, 81, 73, 0.25); border-color: var(--danger); color: #ff7b72; }
     button.btn-success { background: rgba(63, 185, 80, 0.25); border-color: var(--success); color: #56d364; }
     .shortcut-tip { position: absolute; bottom: 6px; right: 12px; font-size: 0.7rem; color: var(--muted); opacity: 0.6; }
@@ -520,6 +602,7 @@ PAGE = """<!DOCTYPE html>
   <header id="topbar">
     <div style="font-weight:700; font-size:0.85rem">🏎️ NMIMS MPSTME Capstone</div>
     <div class="badge badge-mode-auto" id="mode-badge" onclick="toggleControlMode()" title="Click to toggle Mode (C)">MODE: AUTO 🤖</div>
+    <div class="badge badge-override-off" id="override-badge" onclick="toggleOverride()" style="cursor:pointer" title="Toggle Manual Obstacle Override (O)">OVERRIDE: OFF 🛡️</div>
     <div class="badge badge-daylight" id="awb-badge">AWB: DAYLIGHT ☀️</div>
     <div class="badge badge-motors-off" id="motors-badge">MOTORS: OFF ⏸️</div>
     <div class="badge badge-invert-on" id="invert-badge">POLARITY: INVERTED (FWD FIX) 🔄</div>
@@ -529,6 +612,7 @@ PAGE = """<!DOCTYPE html>
   <div class="controls-dock" id="dock">
     <button id="btn-motors" class="btn-danger" onclick="toggleMotors()">🚗 Enable Motors (M)</button>
     <button id="btn-mode" onclick="toggleControlMode()">🎮 Mode: Manual (C)</button>
+    <button id="btn-override" onclick="toggleOverride()">🔓 Override Obstacles (O)</button>
     <button id="btn-remote" class="btn-active" onclick="toggleRemoteWidget()">🕹️ Remote</button>
     <button id="btn-invert" class="btn-active" onclick="toggleInvertMotors()">🔄 Polarity: Inverted (I)</button>
     <button class="btn-active" id="btn-daylight" onclick="setAwb('daylight')">☀️ Daylight</button>
@@ -567,7 +651,7 @@ PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="shortcut-tip"><b>WASD/Arrows</b> Drive &bull; <b>C</b> Mode &bull; <b>1/2/3</b> Speed &bull; <b>Space</b> E-Stop &bull; <b>M</b> Motors &bull; <b>I</b> Invert &bull; <b>H</b> Dock</div>
+  <div class="shortcut-tip"><b>WASD/Arrows</b> Drive &bull; <b>C</b> Mode &bull; <b>O</b> Override Obstacles &bull; <b>1/2/3</b> Speed &bull; <b>Space</b> E-Stop &bull; <b>M</b> Motors &bull; <b>I</b> Invert &bull; <b>H</b> Dock</div>
 
   <div class="modal" id="modal" onclick="closeRef()">
     <div class="modal-box" onclick="event.stopPropagation()">
@@ -584,6 +668,7 @@ PAGE = """<!DOCTYPE html>
     let currentSpeed = 185;
     let driveInterval = null;
     let activeAction = null;
+    let manualOverride = false;
     let keysPressed = new Set();
 
     function toggleFullscreen() {
@@ -628,6 +713,25 @@ PAGE = """<!DOCTYPE html>
           badge.className = 'badge badge-invert-off';
         }
       });
+    }
+
+    function toggleOverride() {
+      fetch('/toggle_override').then(r => r.json()).then(d => {
+        updateOverrideUI(d.override);
+      });
+    }
+
+    function updateOverrideUI(enabled) {
+      manualOverride = enabled;
+      const b = document.getElementById('override-badge');
+      const btn = document.getElementById('btn-override');
+      if (enabled) {
+        if (b) { b.innerText = 'OVERRIDE: ON 🔓'; b.className = 'badge badge-override-on'; }
+        if (btn) { btn.innerText = '🛡️ Override: ON (O)'; btn.className = 'btn-warning-active'; }
+      } else {
+        if (b) { b.innerText = 'OVERRIDE: OFF 🛡️'; b.className = 'badge badge-override-off'; }
+        if (btn) { btn.innerText = '🔓 Override Obstacles (O)'; btn.className = ''; }
+      }
     }
 
     function setSpeed(spd) {
@@ -766,7 +870,7 @@ PAGE = """<!DOCTYPE html>
     function openRef() { document.getElementById('modal').classList.add('show'); }
     function closeRef() { document.getElementById('modal').classList.remove('show'); }
 
-    // Live Telemetry Poller (Ultrasonic & Motors & Mode)
+    // Live Telemetry Poller
     function pollTelemetry() {
       fetch('/telemetry').then(r => r.json()).then(d => {
         const sb = document.getElementById('sonar-badge');
@@ -791,11 +895,14 @@ PAGE = """<!DOCTYPE html>
         if (d.control_mode && d.control_mode !== currentMode) {
           updateModeUI(d.control_mode);
         }
+        if (d.manual_override_obstacles !== undefined && d.manual_override_obstacles !== manualOverride) {
+          updateOverrideUI(d.manual_override_obstacles);
+        }
       }).catch(() => {});
     }
     setInterval(pollTelemetry, 300);
 
-    // Laptop Keyboard Event Listeners for WASD / Arrow Keys
+    // Laptop Keyboard Event Listeners for WASD / Arrow Keys & O for Override
     window.addEventListener('keydown', (e) => {
       const k = e.key.toLowerCase();
       if (e.target.tagName === 'INPUT') return;
@@ -821,6 +928,8 @@ PAGE = """<!DOCTYPE html>
         emergencyStop();
       } else if (k === 'c') {
         toggleControlMode();
+      } else if (k === 'o') {
+        toggleOverride();
       } else if (k === '1') {
         setSpeed(130);
       } else if (k === '2') {
@@ -837,8 +946,6 @@ PAGE = """<!DOCTYPE html>
         toggleDock();
       } else if (k === 'p') {
         togglePotholeMode();
-      } else if (k === 'd' && !e.ctrlKey && !e.metaKey && keysPressed.size === 0) {
-        // 'd' alone turns right, only set awb if not driving
       }
     });
 
@@ -869,6 +976,8 @@ class StreamingOutput(io.BufferedIOBase):
             self.condition.notify_all()
 
 def draw_boxes(frame, result, color, prefix=""):
+    if result is None or getattr(result, "boxes", None) is None:
+        return
     w = frame.shape[1]
     f_scale = 0.50 if w >= 480 else 0.38
     thick = 2 if w >= 480 else 1
@@ -890,55 +999,71 @@ def detect_loop(cam, output):
     while True:
         arduino.read_telemetry()
 
-        frame_raw = cam.capture_array()
-        if swap_rb:
-            frame = cv2.cvtColor(frame_raw, cv2.COLOR_RGB2BGR)
+        if cam is not None:
+            frame_raw = cam.capture_array()
+            if swap_rb:
+                frame = cv2.cvtColor(frame_raw, cv2.COLOR_RGB2BGR)
+            else:
+                frame = frame_raw.copy()
         else:
-            frame = frame_raw.copy()
+            frame = np.zeros((CAM_HEIGHT, CAM_WIDTH, 3), dtype=np.uint8)
 
-        # Fallback software 180° rotation if hardware ISP transform was not available
         if not hardware_rotated:
             frame = cv2.rotate(frame, cv2.ROTATE_180)
 
         h, w = frame.shape[:2]
 
-        # 1. Obstacle Detection (YOLOv10n NCNN)
-        r = obs_model.predict(frame, imgsz=IMGSZ, conf=CONF_OBSTACLE,
-                              classes=OBSTACLE_CLASSES, verbose=False)[0]
+        # 1. Obstacle Detection (YOLOv10n)
+        r = None
+        if obs_model is not None:
+            try:
+                r = obs_model.predict(frame, imgsz=IMGSZ, conf=CONF_OBSTACLE,
+                                      classes=OBSTACLE_CLASSES, verbose=False)[0]
+            except Exception:
+                r = None
 
-        # 2. Pothole Detection with Strict Filtering
+        # 2. Pothole Detection with Fine-Tuned Model & CLAHE Contrast Recovery
         if n % POTHOLE_EVERY == 0:
             last_pot_dets = []
             if pot_model is not None:
-                res_p = pot_model.predict(frame, imgsz=IMGSZ, conf=CONF_POTHOLE, verbose=False)[0]
-                for box in res_p.boxes:
-                    cls_id = int(box.cls[0])
-                    name = res_p.names.get(cls_id, "pothole").lower()
-                    c_val = float(box.conf[0])
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                try:
+                    res_p = pot_model.predict(frame, imgsz=IMGSZ, conf=CONF_POTHOLE, verbose=False)[0]
+                    # CLAHE fallback if no detection (counteracts washed-out printout/screen contrast)
+                    if len(res_p.boxes) == 0:
+                        res_p = pot_model.predict(enhance_contrast(frame), imgsz=IMGSZ, conf=CONF_POTHOLE, verbose=False)[0]
 
-                    # D40 Pothole Check (Class 0 in RDD2022)
-                    is_pothole = (cls_id == 0 or "pothole" in name or "d40" in name)
+                    for box in res_p.boxes:
+                        cls_id = int(box.cls[0])
+                        name = res_p.names.get(cls_id, "pothole").lower()
+                        c_val = float(box.conf[0])
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
 
-                    # If POTHOLE_ONLY is on, ignore alligator/longitudinal cracks completely
-                    if POTHOLE_ONLY and not is_pothole:
-                        continue
+                        is_pothole = (cls_id == 0 or "pothole" in name or "d40" in name)
+                        if POTHOLE_ONLY and not is_pothole:
+                            continue
 
-                    lbl = f"POTHOLE (D40) {c_val:.2f}" if is_pothole else f"CRACK {c_val:.2f}"
-                    last_pot_dets.append({
-                        "bbox": [x1, y1, x2, y2],
-                        "conf": c_val,
-                        "label": lbl,
-                        "is_pothole": is_pothole
-                    })
-            else:
-                last_pot_dets = cv_detect_potholes(frame)
+                        lbl = f"POTHOLE (D40) {c_val:.2f}" if is_pothole else f"CRACK {c_val:.2f}"
+                        last_pot_dets.append({
+                            "bbox": [x1, y1, x2, y2],
+                            "conf": c_val,
+                            "label": lbl,
+                            "is_pothole": is_pothole
+                        })
+                except Exception:
+                    pass
+
+            # Fuse noise-resilient classical CV detector if no YOLO potholes found
+            if len(last_pot_dets) == 0:
+                cv_dets = cv_detect_potholes(frame)
+                last_pot_dets.extend(cv_dets)
 
         # 3. Decision Engine
-        evaluate_autonomous_action(w, h, r.boxes, last_pot_dets)
+        obs_boxes = r.boxes if r is not None else []
+        evaluate_autonomous_action(w, h, obs_boxes, last_pot_dets)
 
         # 4. Render Obstacle Boxes (Green)
-        draw_boxes(frame, r, (0, 255, 0))
+        if r is not None:
+            draw_boxes(frame, r, (0, 255, 0))
 
         # 5. Render Pothole Boxes (Orange/Red for Potholes, Cyan for Cracks)
         f_scale = 0.50 if w >= 480 else 0.38
@@ -958,31 +1083,32 @@ def detect_loop(cam, output):
         t_prev = now
 
         # HUD Overlays
-        mode_tag = f"[{control_mode.upper()}]"
-        cv2.putText(frame, f"{fps:.1f} FPS (Pi 5 HW) | {mode_tag} | {current_awb.upper()} AWB", (10, 20 if w < 480 else 26),
+        ov_text = " [OVERRIDE]" if (control_mode == "manual" and manual_override_obstacles) else ""
+        mode_tag = f"[{control_mode.upper()}{ov_text}]"
+        cv2.putText(frame, f"{fps:.1f} FPS | {mode_tag} | {current_awb.upper()} AWB", (10, 20 if w < 480 else 26),
                     cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 255, 255), thick)
-        action_col = (0, 255, 0) if ("CRUISING" in active_action_label or "MANUAL REMOTE" in active_action_label) else (0, 165, 255)
+        action_col = (0, 255, 0) if ("CRUISING" in active_action_label or "MANUAL" in active_action_label) else (0, 165, 255)
         if "BRAKE" in active_action_label or "STOP" in active_action_label:
             action_col = (0, 0, 255)
         cv2.putText(frame, f"Action: {active_action_label}", (10, 38 if w < 480 else 52),
                     cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, action_col, thick)
 
-        # Ultrasonic live display with color-coded status
+        # Ultrasonic live display
         us_l = arduino.latest_sonar["left"]
         us_r = arduino.latest_sonar["right"]
         us_l_disp = f"{us_l:.0f}cm" if (1.0 < us_l < 850.0) else "CLEAR"
         us_r_disp = f"{us_r:.0f}cm" if (1.0 < us_r < 850.0) else "CLEAR"
         us_str = f"US: L={us_l_disp} | R={us_r_disp}"
 
-        us_color = (0, 255, 0)  # Green = Clear
+        us_color = (0, 255, 0)
         if (1.0 < us_l < EMERGENCY_STOP_DIST_CM) or (1.0 < us_r < EMERGENCY_STOP_DIST_CM):
-            us_color = (0, 0, 255)    # Red = Critical Stop
+            us_color = (0, 0, 255)
             us_str += " [BRAKE]"
         elif (1.0 < us_l < US_AVOID_DIST_CM) or (1.0 < us_r < US_AVOID_DIST_CM):
-            us_color = (0, 140, 255)  # Orange = Avoidance
+            us_color = (0, 140, 255)
             us_str += " [AVOID]"
         elif (1.0 < us_l < US_SLOW_DIST_CM) or (1.0 < us_r < US_SLOW_DIST_CM):
-            us_color = (0, 255, 255)  # Yellow = Caution
+            us_color = (0, 255, 255)
             us_str += " [SLOW]"
 
         ard_str = f"Arduino: {arduino.port_name} [{arduino.latest_state}] | Polarity: {'INVERTED' if arduino.invert_motors else 'NORMAL'}"
@@ -1000,7 +1126,7 @@ def detect_loop(cam, output):
 # ── 7. Web Server Handler ────────────────────────────────────────────────────
 class Handler(server.BaseHTTPRequestHandler):
     def do_GET(self):
-        global POTHOLE_ONLY, control_mode, manual_speed, manual_action
+        global POTHOLE_ONLY, control_mode, manual_speed, manual_action, manual_override_obstacles
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -1035,6 +1161,16 @@ class Handler(server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(resp)
 
+        elif path == '/toggle_override':
+            manual_override_obstacles = not manual_override_obstacles
+            print(f"🔓 Manual obstacle override toggled: {'ENABLED (Driver Override)' if manual_override_obstacles else 'DISABLED (Safety Auto-Brake)'}")
+            resp = json.dumps({"status": "ok", "override": manual_override_obstacles}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
         elif path == '/emergency_stop':
             arduino.motors_enabled = False
             arduino.stop()
@@ -1054,6 +1190,7 @@ class Handler(server.BaseHTTPRequestHandler):
                 "motors_enabled": arduino.motors_enabled,
                 "invert_motors": arduino.invert_motors,
                 "control_mode": control_mode,
+                "manual_override_obstacles": manual_override_obstacles,
                 "manual_speed": manual_speed,
                 "manual_action": manual_action,
                 "action": active_action_label,
@@ -1123,26 +1260,23 @@ class Handler(server.BaseHTTPRequestHandler):
             control_mode = "manual"
             manual_action = action.upper()
 
-            # Ultrasonic safety check: prevent moving forward if emergency obstacle is within 25 cm
+            # Ultrasonic safety check
             us_l = arduino.latest_sonar["left"]
             us_r = arduino.latest_sonar["right"]
             front_blocked = (is_valid_us(us_l) and us_l < EMERGENCY_STOP_DIST_CM) or (is_valid_us(us_r) and us_r < EMERGENCY_STOP_DIST_CM)
 
             if action == 'forward':
-                if front_blocked:
+                if front_blocked and not manual_override_obstacles:
                     arduino.stop()
                     manual_action = "BLOCKED_BRAKE"
                 else:
-                    # 350 ms pulse ensures car stops quickly if laptop heartbeat/network stops
-                    arduino.drive(manual_speed, 350)
+                    arduino.drive(manual_speed, 350, force=manual_override_obstacles)
             elif action == 'reverse':
-                arduino.reverse(manual_speed, 350)
+                arduino.reverse(manual_speed, 350, force=manual_override_obstacles)
             elif action == 'left':
-                # Turn angle -35 deg
-                arduino.turn(-35, manual_speed)
+                arduino.turn(-35, manual_speed, force=manual_override_obstacles)
             elif action == 'right':
-                # Turn angle +35 deg
-                arduino.turn(35, manual_speed)
+                arduino.turn(35, manual_speed, force=manual_override_obstacles)
             elif action == 'stop':
                 arduino.stop()
                 manual_action = "STOP"
@@ -1151,7 +1285,8 @@ class Handler(server.BaseHTTPRequestHandler):
                 "status": "ok",
                 "action": manual_action,
                 "mode": control_mode,
-                "speed": manual_speed
+                "speed": manual_speed,
+                "override": manual_override_obstacles
             }).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -1224,31 +1359,35 @@ def main():
 
     arduino.auto_connect()
 
-    print(f"🎥 Initializing Picamera2 in BGR888 mode ({CAM_WIDTH}x{CAM_HEIGHT}, 180° rotation)...")
-    cam = Picamera2()
-    cam_instance = cam
-
-    video_config = None
-    hardware_rotated = False
-    if Transform is not None:
+    cam = None
+    if Picamera2 is not None:
         try:
-            # 180° rotation natively handled by Raspberry Pi ISP with zero CPU overhead
-            video_config = cam.create_video_configuration(
-                main={"size": (CAM_WIDTH, CAM_HEIGHT), "format": "BGR888"},
-                transform=Transform(hflip=1, vflip=1)
-            )
-            hardware_rotated = True
-            print("🔄 Hardware 180° rotation (hflip + vflip via ISP) enabled.")
+            print(f"🎥 Initializing Picamera2 in BGR888 mode ({CAM_WIDTH}x{CAM_HEIGHT}, 180° rotation)...")
+            cam = Picamera2()
+            cam_instance = cam
+
+            video_config = None
+            hardware_rotated = False
+            if Transform is not None:
+                try:
+                    video_config = cam.create_video_configuration(
+                        main={"size": (CAM_WIDTH, CAM_HEIGHT), "format": "BGR888"},
+                        transform=Transform(hflip=1, vflip=1)
+                    )
+                    hardware_rotated = True
+                    print("🔄 Hardware 180° rotation (hflip + vflip via ISP) enabled.")
+                except Exception as e:
+                    print(f"⚠️ Could not set hardware transform: {e}")
+
+            if video_config is None:
+                video_config = cam.create_video_configuration(main={"size": (CAM_WIDTH, CAM_HEIGHT), "format": "BGR888"})
+
+            cam.configure(video_config)
+            cam.start()
+            set_awb_mode(cam, "daylight")
         except Exception as e:
-            print(f"⚠️ Could not set hardware transform: {e}")
-
-    if video_config is None:
-        video_config = cam.create_video_configuration(main={"size": (CAM_WIDTH, CAM_HEIGHT), "format": "BGR888"})
-
-    cam.configure(video_config)
-    cam.start()
-
-    set_awb_mode(cam, "daylight")
+            print(f"⚠️ Picamera2 initialization failed: {e}")
+            cam = None
 
     output = StreamingOutput()
     worker = threading.Thread(target=detect_loop, args=(cam, output), daemon=True)
@@ -1262,8 +1401,9 @@ def main():
         print("\n🛑 Stopping system...")
     finally:
         arduino.stop()
-        cam.stop()
-        cam.close()
+        if cam is not None:
+            cam.stop()
+            cam.close()
         print("Hardware safely released.")
 
 if __name__ == '__main__':

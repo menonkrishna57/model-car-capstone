@@ -11,8 +11,10 @@ from pathlib import Path
 # Relative to repo root or car/ runtime directory
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 MODEL_PATH = str(REPO_ROOT / "benchmarking" / "models" / "yolov10n_ncnn_model")
+POTHOLE_MODEL_PATH = str(REPO_ROOT / "pothole_detection" / "best.pt")
 IMGSZ = 320                            # Optimal resolution identified in benchmarks
-CONFIDENCE_THRESHOLD = 0.25            # Detection threshold
+CONFIDENCE_THRESHOLD = 0.25            # Detection threshold for positive obstacles
+POTHOLE_CONFIDENCE_THRESHOLD = 0.08    # High-sensitivity threshold for fine-tuned pothole model
 
 # ── Serial Link (Pi 5 ↔ Arduino Uno) ─────────────────────────────────────────
 # Default transport: USB-serial (/dev/ttyUSB0 or /dev/ttyACM0).
