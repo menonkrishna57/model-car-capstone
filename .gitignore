@@ -55,6 +55,7 @@ ehthumbs.db
 
 # Ultralytics & YOLO training/inference runs & outputs
 runs/
+pothole_detection/datasets/
 *.errors.txt
 *_annotated.mp4
 dashcam_annotated.mp4

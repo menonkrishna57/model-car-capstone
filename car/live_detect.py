@@ -2,7 +2,7 @@
 """
 live_detect.py — Fullscreen Live Perception & Autonomous Control System
 NMIMS MPSTME Capstone — Raspberry Pi 5 + Arduino Uno
-Optimized: Pothole D40 Filtering + Noise-Augmented Fine-Tuned Model Loading
+Optimized: GPU Fine-Tuned Printout Pothole Model + Lower Camera Section ROI Filtering
 Feature: Manual Control Obstacle Override Toggle (Web UI & 'O' Key)
 """
 
@@ -68,11 +68,11 @@ except Exception as e:
     else:
         obs_model = None
 
-# Pothole Model Candidates (prioritizing newly noise-fine-tuned best.pt)
+# Pothole Model Candidates (prioritizing GPU printout-fine-tuned best.pt)
 pot_candidates = [
     "pothole_best.pt",
     "pothole_detection/best.pt",
-    "pothole_detection/runs_rdd/noisy_finetuned_pothole_model/weights/best.pt",
+    "pothole_detection/runs_rdd/printout_gpu_pothole_model/weights/best.pt",
     "pothole_detection/best_ncnn_model",
     "pothole_detection/runs_rdd/custom_pothole_model/weights/best.pt",
     "pothole_detection/rdd2022_yolov8n.pt",
@@ -87,13 +87,13 @@ for cand in pot_candidates:
 
 pot_model = None
 if pot_path and pot_path.exists():
-    print(f"📦 Loading Fine-Tuned Pothole model: {pot_path}")
+    print(f"📦 Loading GPU Fine-Tuned Pothole model: {pot_path}")
     try:
         pot_model = YOLO(str(pot_path), task="detect")
     except Exception as e:
         print(f"⚠️ Could not load pothole model ({pot_path}): {e}")
 else:
-    print("ℹ️ Using noise-resilient classical CV pothole detector as fallback.")
+    print("ℹ️ Using classical CV pothole detector as fallback (no YOLO pothole weights found).")
 
 def find_daylight_ref() -> Optional[Path]:
     for p in [Path("/home/capstone/daylight.jpg"), Path("/home/capstone/model/daylight.jpg"), Path.home() / "daylight.jpg"]:
@@ -105,7 +105,9 @@ CAM_HEIGHT = 240
 IMGSZ = 320
 OBSTACLE_CLASSES = [0, 1, 2, 3, 5, 7]  # person, bicycle, car, motorcycle, bus, truck
 CONF_OBSTACLE = 0.35
-CONF_POTHOLE = 0.20                     # Standard threshold for actual D40 potholes
+CONF_POTHOLE = 0.24                     # High-precision threshold for D40 potholes on held printouts
+POTHOLE_LOWER_Y_MIN_FRAC = 0.40         # Pothole vertical center must lie in lower 60% of camera (yc >= 0.40*h)
+POTHOLE_PERSIST_FRAMES = 2              # Consecutive pothole detections required before autonomous swerve
 POTHOLE_ONLY = True                     # STRICT FILTER: Only detect D40 potholes
 POTHOLE_EVERY = 2
 
@@ -158,7 +160,7 @@ def set_awb_mode(cam, mode_name: str) -> bool:
         print(f"⚠️ Failed to set AwbMode: {e}")
         return False
 
-# ── 3. Noise-Resilient CLAHE & Classical CV Pothole Detection ────────────────
+# ── 3. Noise-Resilient CLAHE & Classical CV Fallback Pothole Detection ───────
 def enhance_contrast(roi: np.ndarray) -> np.ndarray:
     """CLAHE contrast normalization for held-up road photos, printouts, and noisy feeds."""
     if roi is None or getattr(roi, "size", 0) == 0:
@@ -166,15 +168,15 @@ def enhance_contrast(roi: np.ndarray) -> np.ndarray:
     denoised = cv2.GaussianBlur(roi, (3, 3), 0)
     lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
     l_c, a_c, b_c = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
     return cv2.cvtColor(cv2.merge((clahe.apply(l_c), a_c, b_c)), cv2.COLOR_LAB2BGR)
 
 def cv_detect_potholes(frame: np.ndarray) -> List[Dict[str, Any]]:
-    """Classical CV pothole detector on road surface (filters out carpet/texture false positives)."""
+    """Classical CV pothole fallback detector (used ONLY when YOLO pot_model is None)."""
     if frame is None or getattr(frame, "size", 0) == 0:
         return []
     h, w = frame.shape[:2]
-    roi_y = int(h * 0.40)
+    roi_y = int(h * 0.45)
     roi = frame[roi_y:, :]
     if roi.size == 0:
         return []
@@ -183,7 +185,7 @@ def cv_detect_potholes(frame: np.ndarray) -> List[Dict[str, Any]]:
     blur = cv2.GaussianBlur(gray, (7, 7), 0)
     lap = cv2.Laplacian(blur, cv2.CV_64F)
     lap_u = np.uint8(np.clip(np.absolute(lap), 0, 255))
-    _, thresh = cv2.threshold(lap_u, 32, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(lap_u, 36, 255, cv2.THRESH_BINARY)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
@@ -191,10 +193,10 @@ def cv_detect_potholes(frame: np.ndarray) -> List[Dict[str, Any]]:
 
     dets = []
     roi_area = roi.shape[0] * roi.shape[1]
-    min_area = max(150, int(roi_area * 0.0065))
+    min_area = max(250, int(roi_area * 0.01))
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < min_area or area > roi_area * 0.30:
+        if area < min_area or area > roi_area * 0.22:
             continue
         x, y, cw, ch = cv2.boundingRect(cnt)
         aspect = cw / max(ch, 1)
@@ -411,7 +413,7 @@ def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_
             arduino.turn(-35, 160)
         return
 
-    # 3. Camera Pothole Avoidance (Fine-Tuned YOLO + Noise-Resilient CV)
+    # 3. Camera Pothole Avoidance (GPU Fine-Tuned YOLO, Lower Camera Section)
     danger_left = sum(1.0 for p in pot_dets if p.get("is_pothole") and (p["bbox"][0] + p["bbox"][2]) / 2 < frame_w * 0.5)
     danger_right = sum(1.0 for p in pot_dets if p.get("is_pothole") and (p["bbox"][0] + p["bbox"][2]) / 2 >= frame_w * 0.5)
 
@@ -977,10 +979,12 @@ def detect_loop(cam, output):
     global current_awb, swap_rb, POTHOLE_ONLY, hardware_rotated
     n = 0
     last_pot_dets = []
+    confirmed_pot_dets = []
+    pothole_streak = 0
     fps = 0.0
     t_prev = time.time()
 
-    print("🚀 Parallel Detection & Control Loop Active!")
+    print("🚀 Parallel Detection & Control Loop Active! (Lower-Section Printout Pothole Tuning)")
     while True:
         arduino.read_telemetry()
 
@@ -1007,25 +1011,52 @@ def detect_loop(cam, output):
             except Exception:
                 r = None
 
-        # 2. Pothole Detection with Fine-Tuned Model & CLAHE Contrast Recovery
+        # 2. Pothole Detection with GPU Printout-Fine-Tuned Model (Lower Camera Section)
         if n % POTHOLE_EVERY == 0:
-            last_pot_dets = []
+            raw_pot_dets = []
             if pot_model is not None:
                 try:
-                    res_p = pot_model.predict(frame, imgsz=IMGSZ, conf=CONF_POTHOLE, verbose=False)[0]
+                    # Crop top 22% ceiling/wall while keeping full lower-section road/printout context
+                    roi_y1, roi_y2 = int(h * 0.22), h
+                    roi_x1, roi_x2 = int(w * 0.03), int(w * 0.97)
+                    sub_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                    frame_area = float(h * w)
+
+                    res_p = pot_model.predict(sub_frame, imgsz=IMGSZ, conf=CONF_POTHOLE, verbose=False)[0]
 
                     for box in res_p.boxes:
                         cls_id = int(box.cls[0])
                         name = res_p.names.get(cls_id, "pothole").lower()
                         c_val = float(box.conf[0])
-                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
+                        x1, y1 = bx1 + roi_x1, by1 + roi_y1
+                        x2, y2 = bx2 + roi_x1, by2 + roi_y1
 
                         is_pothole = (cls_id == 0 or "pothole" in name or "d40" in name)
                         if POTHOLE_ONLY and not is_pothole:
                             continue
 
+                        # Lower-section & bounding-box geometry sanity filter
+                        bw = x2 - x1
+                        bh = y2 - y1
+                        yc = (y1 + y2) / 2.0
+                        box_area = float(bw * bh)
+
+                        # 1. Must be in the lower section of the camera frame
+                        if yc < h * POTHOLE_LOWER_Y_MIN_FRAC or y2 < h * 0.45:
+                            continue
+                        # 2. Reject giant whole-printout border boxes or tiny specks
+                        if bw > w * 0.62 or bh > h * 0.48 or box_area > frame_area * 0.22:
+                            continue
+                        if bw < w * 0.025 or bh < h * 0.02 or box_area < frame_area * 0.0015:
+                            continue
+                        # 3. Aspect ratio check
+                        aspect = bw / max(bh, 1.0)
+                        if not (0.25 <= aspect <= 4.5):
+                            continue
+
                         lbl = f"POTHOLE (D40) {c_val:.2f}" if is_pothole else f"CRACK {c_val:.2f}"
-                        last_pot_dets.append({
+                        raw_pot_dets.append({
                             "bbox": [x1, y1, x2, y2],
                             "conf": c_val,
                             "label": lbl,
@@ -1033,25 +1064,35 @@ def detect_loop(cam, output):
                         })
                 except Exception:
                     pass
+            else:
+                # Only use classical CV fallback if no YOLO pothole model is loaded
+                raw_pot_dets = cv_detect_potholes(frame)
 
-            # Fuse noise-resilient classical CV detector if no YOLO potholes found
-            if len(last_pot_dets) == 0:
-                cv_dets = cv_detect_potholes(frame)
-                last_pot_dets.extend(cv_dets)
+            last_pot_dets = raw_pot_dets
+            if any(p.get("is_pothole") for p in raw_pot_dets):
+                pothole_streak += 1
+            else:
+                pothole_streak = 0
 
-        # 3. Decision Engine
+            # Temporal persistence filter: require POTHOLE_PERSIST_FRAMES consecutive scans for steering
+            confirmed_pot_dets = last_pot_dets if pothole_streak >= POTHOLE_PERSIST_FRAMES else []
+
+        # 3. Decision Engine (uses temporally confirmed potholes to prevent 1-frame false swerves)
         obs_boxes = r.boxes if r is not None else []
-        evaluate_autonomous_action(w, h, obs_boxes, last_pot_dets)
+        evaluate_autonomous_action(w, h, obs_boxes, confirmed_pot_dets)
 
         # 4. Render Obstacle Boxes (Green)
         if r is not None:
             draw_boxes(frame, r, (0, 255, 0))
 
-        # 5. Render Pothole Boxes (Orange/Red for Potholes, Cyan for Cracks)
+        # 5. Render Lower-Section Pothole Scan Horizon & Pothole Boxes
         f_scale = 0.50 if w >= 480 else 0.38
         hud_scale1 = 0.65 if w >= 480 else 0.45
         hud_scale2 = 0.55 if w >= 480 else 0.40
         thick = 2 if w >= 480 else 1
+
+        roi_line_y = int(h * POTHOLE_LOWER_Y_MIN_FRAC)
+        cv2.line(frame, (0, roi_line_y), (w, roi_line_y), (75, 75, 75), 1)
 
         for p in last_pot_dets:
             x1, y1, x2, y2 = p["bbox"]

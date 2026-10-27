@@ -3,10 +3,10 @@
 run_detection.py
 =================
 Pothole Detection & Directional Swerve Avoidance System
-Trained on RDD2022 India (D40 Pothole Benchmark)
+Trained on RDD2022 India (D40 Pothole Benchmark) + GPU Fine-Tuned for Held Printouts (Lower Camera Section)
 
 Usage:
-  python run_detection.py               # Annotates test_video.mp4 -> annotated_video.mp4
+  python run_detection.py               # Annotates sample_road.jpg / test video -> outputs/
   python run_detection.py --show        # Also shows live preview window
 """
 
@@ -26,9 +26,11 @@ except ImportError:
 ROOT_DIR = Path(__file__).resolve().parent
 SUB_DIR = ROOT_DIR / "negative_obstacle_detection"
 
-# Locate weights (Prioritize newly trained custom best.pt)
+# Locate weights (Prioritize GPU printout-fine-tuned best.pt)
 MODEL_PATHS = [
     ROOT_DIR / "best.pt",
+    ROOT_DIR.parent / "pothole_best.pt",
+    ROOT_DIR / "runs_rdd" / "printout_gpu_pothole_model" / "weights" / "best.pt",
     ROOT_DIR / "rdd2022_yolov8n.pt",
     SUB_DIR / "best.pt",
     SUB_DIR / "rdd2022_yolov8n.pt",
@@ -67,6 +69,7 @@ COLOR_BG = (20, 20, 25)
 ZONE_LEFT_MAX = 0.33
 ZONE_RIGHT_MIN = 0.67
 DANGER_THRESHOLD = 0.20
+POTHOLE_LOWER_Y_MIN_FRAC = 0.40
 
 
 def enhance_contrast(roi):
@@ -76,82 +79,35 @@ def enhance_contrast(roi):
     denoised = cv2.GaussianBlur(roi, (3, 3), 0)
     lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
     l_c, a_c, b_c = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
     return cv2.cvtColor(cv2.merge((clahe.apply(l_c), a_c, b_c)), cv2.COLOR_LAB2BGR)
 
 
-def cv_detect_surface_defects(roi, base_x=0, base_y=0):
-    """Classical CV fallback for road damage."""
-    h, w = roi.shape[:2]
-    road_surf = roi[int(h * 0.4):, :]
-    gray = cv2.cvtColor(road_surf, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    lap = cv2.Laplacian(blur, cv2.CV_64F)
-    lap_u = np.uint8(np.clip(np.absolute(lap), 0, 255))
-
-    _, thresh = cv2.threshold(lap_u, 26, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
-
-    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    dets = []
-    surf_area = road_surf.shape[0] * road_surf.shape[1]
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 500 or area > surf_area * 0.35:
-            continue
-        x, y, cw, ch = cv2.boundingRect(cnt)
-        if 0.3 < cw / max(ch, 1) < 5.0:
-            actual_y = y + int(h * 0.4) + base_y
-            actual_x = x + base_x
-            dets.append({
-                "bbox": [actual_x, actual_y, actual_x + cw, actual_y + ch],
-                "conf": 0.45,
-                "label": "ROAD DAMAGE (CV)",
-                "is_pothole": True
-            })
-    return dets
-
-
 class PotholeDetector:
-    def __init__(self, conf_thresh=0.07, mode="auto"):
+    def __init__(self, conf_thresh=0.24, mode="auto"):
         self.conf = conf_thresh
         self.mode = mode
         print(f"[+] Loading Primary Pothole Model: {MODEL_PATH.name}")
         self.pothole_model = YOLO(str(MODEL_PATH))
 
-        # Load secondary pothole specialist for enhanced recall
-        self.specialist_model = None
-        spec_path = ROOT_DIR / "rdd2022_yolov8n.pt"
-        if not spec_path.exists():
-            spec_path = SUB_DIR / "rdd2022_yolov8n.pt"
-        if spec_path.exists() and spec_path != MODEL_PATH:
-            print(f"[+] Loading Secondary Model: {spec_path.name}")
-            self.specialist_model = YOLO(str(spec_path))
-
         self.coco_model = YOLO(str(COCO_PATH)) if COCO_PATH.exists() else None
 
     def process_frame(self, frame):
         h, w = frame.shape[:2]
+        frame_area = float(h * w)
 
         # Determine ROI based on camera mount perspective
-        # For general road photos / full mode: use the entire frame so potholes are never chopped off
         if self.mode == "full":
-            roi_y1, roi_y2 = 0, h
+            roi_y1, roi_y2 = int(h * 0.22), h
             roi_x1, roi_x2 = 0, w
         elif self.mode == "cabin":
-            # For cabin POV video with interior steering wheel & A-pillars
             roi_y1, roi_y2 = int(h * 0.20), int(h * 0.55)
             roi_x1, roi_x2 = int(w * 0.25), int(w * 0.75)
         elif self.mode == "dashcam":
-            # Keep the entire road surface + held photo (discards only top 15% sky)
-            roi_y1, roi_y2 = int(h * 0.15), h
+            roi_y1, roi_y2 = int(h * 0.22), h
             roi_x1, roi_x2 = 0, w
-        else: # "auto"
-            # Auto: full frame for photos, wide road crop for dashcam video
-            roi_y1, roi_y2 = 0, h
+        else:  # "auto"
+            roi_y1, roi_y2 = int(h * 0.22), h
             roi_x1, roi_x2 = 0, w
 
         sub_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
@@ -159,64 +115,46 @@ class PotholeDetector:
 
         detections = []
 
-        # 1. Primary Model Inference (best.pt, with CLAHE fallback for noisy / held-photo frames)
+        # 1. Primary Model Inference (GPU fine-tuned best.pt, focused on lower camera section)
         try:
-            res = self.pothole_model.predict(sub_frame, conf=self.conf, imgsz=640, verbose=False)[0]
+            res = self.pothole_model.predict(sub_frame, conf=self.conf, imgsz=416, verbose=False)[0]
             for box in res.boxes:
                 cls_id = int(box.cls[0])
-                name = res.names.get(cls_id, "pothole")
+                name = str(res.names.get(cls_id, "pothole")).lower()
                 conf = float(box.conf[0])
                 x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
+                gx1, gy1, gx2, gy2 = x1 + roi_x1, y1 + roi_y1, x2 + roi_x1, y2 + roi_y1
 
-                is_pothole = "pothole" in name.lower() or "crack" in name.lower() or cls_id in [0, 1, 2, 3] or name == "0"
-                if "pothole" in name.lower() or cls_id == 0:
-                    lbl = "POTHOLE (D40)"
-                elif "crack" in name.lower():
-                    lbl = "ROAD CRACK"
-                else:
-                    lbl = name.replace("_", " ").upper()
+                is_pothole = (cls_id == 0 or "pothole" in name or "d40" in name)
+                if not is_pothole:
+                    continue
+
+                bw = gx2 - gx1
+                bh = gy2 - gy1
+                gyc = (gy1 + gy2) / 2.0
+                box_area = float(bw * bh)
+
+                # Enforce lower-section camera constraint (except in legacy cabin mode)
+                if self.mode != "cabin" and (gyc < h * POTHOLE_LOWER_Y_MIN_FRAC or gy2 < h * 0.45):
+                    continue
+                if bw > w * 0.62 or bh > h * 0.48 or box_area > frame_area * 0.22:
+                    continue
+                if bw < w * 0.025 or bh < h * 0.02 or box_area < frame_area * 0.0015:
+                    continue
 
                 detections.append({
-                    "bbox": [x1 + roi_x1, y1 + roi_y1, x2 + roi_x1, y2 + roi_y1],
+                    "bbox": [gx1, gy1, gx2, gy2],
                     "conf": conf,
-                    "label": lbl,
-                    "is_pothole": is_pothole
+                    "label": "POTHOLE (D40)",
+                    "is_pothole": True
                 })
-        except Exception as e:
+        except Exception:
             pass
 
-        # 2. Secondary Model for Enhanced Recall
-        if self.specialist_model:
-            try:
-                res2 = self.specialist_model.predict(sub_frame, conf=self.conf, imgsz=640, verbose=False)[0]
-                for box in res2.boxes:
-                    cls_id = int(box.cls[0])
-                    name = self.specialist_model.names.get(cls_id, "road_damage")
-                    conf = float(box.conf[0])
-                    x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
-
-                    overlap = False
-                    for existing in detections:
-                        ex1, ey1, ex2, ey2 = existing["bbox"]
-                        if abs((x1 + roi_x1) - ex1) < 50 and abs((y1 + roi_y1) - ey1) < 50:
-                            overlap = True
-                            break
-                    if not overlap:
-                        is_pothole = "pothole" in name.lower() or "crack" in name.lower() or cls_id in [0, 1, 2, 3]
-                        lbl = "POTHOLE (D40)" if "pothole" in name.lower() else "ROAD DAMAGE"
-                        detections.append({
-                            "bbox": [x1 + roi_x1, y1 + roi_y1, x2 + roi_x1, y2 + roi_y1],
-                            "conf": conf,
-                            "label": lbl,
-                            "is_pothole": is_pothole
-                        })
-            except Exception as e:
-                pass
-
-        # 3. Obstacles (Vehicles / People)
+        # 2. Obstacles (Vehicles / People)
         if self.coco_model:
             try:
-                res_c = self.coco_model.predict(sub_frame, conf=0.25, imgsz=416, verbose=False)[0]
+                res_c = self.coco_model.predict(sub_frame, conf=0.30, imgsz=416, verbose=False)[0]
                 for box in res_c.boxes:
                     cls_id = int(box.cls[0])
                     if cls_id in [0, 1, 2, 3, 5, 7]:
@@ -229,12 +167,12 @@ class PotholeDetector:
                             "label": name.upper(),
                             "is_pothole": False
                         })
-            except Exception as e:
+            except Exception:
                 pass
 
-        # 4. Danger Scoring
+        # 3. Danger Scoring
         scores = {"left": 0.0, "center": 0.0, "right": 0.0}
-        road_area = eff_w * eff_h
+        road_area = max(eff_w * eff_h, 1)
 
         for det in detections:
             x1, y1, x2, y2 = det["bbox"]
@@ -243,12 +181,12 @@ class PotholeDetector:
             conf = det["conf"]
             weight = 2.2 if det["is_pothole"] else 1.0
 
-            norm_y = min(max((cy - roi_y1) / eff_h, 0.0), 1.0)
+            norm_y = min(max((cy - roi_y1) / max(eff_h, 1), 0.0), 1.0)
             proximity = 0.5 + 0.8 * norm_y
             area_factor = min(max((x2 - x1) * (y2 - y1), 1) / road_area * 10.0, 1.0)
             danger = conf * weight * proximity * (0.3 + 0.7 * area_factor)
 
-            norm_x = (cx - roi_x1) / eff_w
+            norm_x = (cx - roi_x1) / max(eff_w, 1)
             if norm_x < ZONE_LEFT_MAX:
                 scores["left"] += danger
             elif norm_x > ZONE_RIGHT_MIN:
@@ -259,7 +197,7 @@ class PotholeDetector:
         for k in scores:
             scores[k] = min(scores[k], 1.0)
 
-        # 5. Steering Swerve Guidance
+        # 4. Steering Swerve Guidance
         L, C, R = scores["left"], scores["center"], scores["right"]
         T = DANGER_THRESHOLD
 
@@ -302,7 +240,10 @@ def draw_annotations(frame, detections, scores, swerve_text, subtext, color, roi
     font_bold = cv2.FONT_HERSHEY_DUPLEX
     rx, ry, rw, rh = roi
 
-    # 1. Zone Dividing Lines
+    # 1. Zone Dividing Lines & Lower Section Horizon Line
+    lower_y = int(h * POTHOLE_LOWER_Y_MIN_FRAC)
+    cv2.line(frame, (0, lower_y), (w, lower_y), (75, 75, 75), 1, cv2.LINE_AA)
+
     z_left_x = int(rx + rw * ZONE_LEFT_MAX)
     z_right_x = int(rx + rw * ZONE_RIGHT_MIN)
     c_left = COLOR_ALERT if scores["left"] >= DANGER_THRESHOLD else (70, 70, 70)
@@ -342,7 +283,7 @@ def draw_annotations(frame, detections, scores, swerve_text, subtext, color, roi
 
     speed_lbl = f"{latency_ms:.1f}ms" if (is_image and latency_ms is not None) else f"FPS: {fps:.1f}"
     cv2.putText(frame, speed_lbl, (14, 24), font, 0.45, COLOR_TEXT, 1, cv2.LINE_AA)
-    cv2.putText(frame, "YOLOv10n (D40)", (14, 44), font, 0.38, (0, 190, 255), 1, cv2.LINE_AA)
+    cv2.putText(frame, "YOLOv10n (D40 Lower ROI)", (14, 44), font, 0.38, (0, 190, 255), 1, cv2.LINE_AA)
 
     prog = "IMAGE" if is_image else f"{frame_idx}/{total_frames}"
     (ptw, _), _ = cv2.getTextSize(prog, font, 0.42, 1)
@@ -499,7 +440,7 @@ Examples:
     parser.add_argument("--out-dir", default=None, help="Directory to save annotated outputs (default: pothole_detection/outputs)")
     parser.add_argument("--duration", type=float, default=None, help="Process first N seconds of video")
     parser.add_argument("--mode", choices=["auto", "full", "dashcam", "cabin"], default="auto", help="Camera perspective (auto, full, dashcam, cabin)")
-    parser.add_argument("--conf", type=float, default=0.05, help="Detection confidence threshold (default: 0.05)")
+    parser.add_argument("--conf", type=float, default=0.24, help="Detection confidence threshold (default: 0.24)")
     parser.add_argument("--show", action="store_true", help="Display live preview window")
     args = parser.parse_args()
 
@@ -526,7 +467,6 @@ Examples:
             sys.exit(1)
 
     in_path = Path(target_input)
-    # Smart path discovery (check CWD and ROOT_DIR)
     if not in_path.exists():
         if (ROOT_DIR / target_input).exists():
             in_path = ROOT_DIR / target_input
@@ -582,7 +522,6 @@ Examples:
         process_single_video(detector, in_path, dest, args)
 
     else:
-        # Fallback trial as image, then video
         dest = Path(args.output) if args.output else out_dir / f"annotated_{in_path.stem}.jpg"
         if not process_single_image(detector, in_path, dest, args):
             process_single_video(detector, in_path, dest.with_suffix(".mp4"), args)
@@ -590,4 +529,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-

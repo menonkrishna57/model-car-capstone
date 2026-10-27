@@ -347,3 +347,33 @@ def test_live_detect_fine_tuned_model_candidates():
 
 
 
+
+def test_lower_section_pothole_filter_and_zero_false_positives():
+    """
+    Verify that the GPU printout-tuned pothole detector:
+    1. Does NOT run classical CV Laplacian edge false-positives when the YOLO pothole model is loaded.
+    2. Produces ZERO false positives on synthetic indoor floor tiles, shadows, and blank paper borders.
+    3. Enforces the lower-section camera constraint (POTHOLE_LOWER_Y_MIN_FRAC = 0.40).
+    """
+    import cv2
+    import car.live_detect as ld
+    from car.perception.detector import Detector
+
+    assert ld.POTHOLE_LOWER_Y_MIN_FRAC == 0.40
+    assert ld.POTHOLE_PERSIST_FRAMES == 2
+
+    det = Detector()
+    assert det.enable_pothole_cv is False
+    assert det.pothole_model is not None
+
+    # Create a hard-negative frame with floor tile lines and a blank white paper sheet border
+    neg_frame = np.full((240, 320, 3), 150, dtype=np.uint8)
+    for x in range(0, 320, 60):
+        cv2.line(neg_frame, (x, 0), (x, 240), (100, 100, 100), 1)
+    for y in range(90, 240, 45):
+        cv2.line(neg_frame, (0, y), (320, y), (100, 100, 100), 1)
+    cv2.rectangle(neg_frame, (40, 70), (280, 225), (235, 235, 235), -1)
+    cv2.rectangle(neg_frame, (40, 70), (280, 225), (45, 45, 45), 2)
+
+    potholes = det._detect_yolo_potholes(neg_frame)
+    assert potholes == [], f"Expected 0 false positives on blank paper border / floor tiles, got {potholes}"

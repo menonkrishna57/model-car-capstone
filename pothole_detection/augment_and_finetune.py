@@ -2,502 +2,535 @@
 """
 augment_and_finetune.py
 =======================
-Builds a noise-augmented and "held-photo / printout in front of camera" pothole
-dataset from available road footage and RDD2022 validation tiles, then fine-tunes
-the YOLOv10n pothole model (best.pt) so the RC car reliably detects potholes even
-when a photo/printout/screen of a road with a pothole is held in front of the camera.
+High-Precision GPU Fine-Tuning Pipeline for Held Printout Potholes (Lower Camera Section)
+NMIMS MPSTME Capstone — Autonomous RC Car
 
-Augmentations applied:
-  1. Held-photo / Printout perspective & framing simulation (scales & tilts road
-     image inside a larger camera frame with paper/screen borders + bbox transform)
-  2. Gaussian sensor noise & ISO grain (sigma 10..35)
-  3. Salt-and-pepper impulse noise & Poisson shot noise
-  4. Close-range camera defocus blur & directional motion blur
-  5. Printout/screen contrast washout, gamma shift & overhead specular glare spots
-  6. Screen moire/halftone grid & JPEG compression artifacts
+Fixes the previous false-positive issue by:
+1. Starting strictly from the clean 50-epoch RDD2022 checkpoint (best_pre_noise_backup.pt).
+2. Extracting ONLY high-confidence D40 potholes located in the lower section of the road.
+3. Simulating a printed road photo held in front of the camera with potholes positioned
+   in the lower section of the camera frame (y_center in [0.45, 0.92]), realistic paper
+   dynamic-range compression, slight tilt/perspective, and mild camera noise.
+4. Including ~35% HARD-NEGATIVE images with empty labels (blank paper printouts with sharp
+   rectangular borders, clean asphalt printouts without potholes, floor tiles, shadows,
+   table edges, and non-pothole dashcam frames) so the model never fires on paper borders,
+   floors, or room backgrounds.
+5. Freezing the YOLOv10n backbone (freeze=10) and training with a conservative learning
+   rate (lr0=0.0005) on the local NVIDIA GeForce RTX 3050 GPU (device=0).
 """
 
 import os
 import sys
-import random
 import shutil
+import random
 from pathlib import Path
-from typing import List, Tuple
 
-# Ensure Ultralytics writes settings to a local writable directory in sandbox
-ROOT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = ROOT_DIR.parent
-os.environ["YOLO_CONFIG_DIR"] = str(ROOT_DIR / ".ultralytics_cfg")
-(ROOT_DIR / ".ultralytics_cfg").mkdir(parents=True, exist_ok=True)
+# Ensure ultralytics from user site-packages is importable when running inside Conda PyTorch_env
+USER_SITE = r"C:\Users\menon\AppData\Roaming\Python\Python313\site-packages"
+if os.path.exists(USER_SITE) and USER_SITE not in sys.path:
+    sys.path.append(USER_SITE)
 
 import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
 
-DATASET_DIR = ROOT_DIR / "noisy_pothole_dataset"
+ROOT = Path(__file__).resolve().parent
+REPO_ROOT = ROOT.parent
+
+CLEAN_BASE_WEIGHTS = ROOT / "best_pre_noise_backup.pt"
+if not CLEAN_BASE_WEIGHTS.exists():
+    CLEAN_BASE_WEIGHTS = ROOT / "best.pt"
+
+VIDEO_PATH = ROOT / "pothole_test_2.mp4"
+NEG_VIDEO_PATH = REPO_ROOT / "benchmarking" / "test_videos" / "dashcam_test.mp4"
+SAMPLE_IMG = ROOT / "sample_road.jpg"
+
+DATASET_DIR = ROOT / "datasets" / "printout_lower_pothole_yolo"
+RUNS_DIR = ROOT / "runs_rdd"
+RUN_NAME = "printout_gpu_pothole_model"
 
 
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+def create_indoor_background(h: int, w: int, rng: random.Random) -> np.ndarray:
+    """Generates realistic indoor lab floor / table / wall background with tiles, wood, or shadows."""
+    bg_type = rng.choice(["floor_tiles", "matte_desk", "wall_floor_split", "shadow_gradient"])
+    base_val = rng.randint(95, 195)
+    bg = np.full((h, w, 3), base_val, dtype=np.uint8)
+
+    # Slight warm/cool tint
+    b_shift = rng.randint(-12, 12)
+    r_shift = rng.randint(-12, 12)
+    bg[:, :, 0] = np.clip(bg[:, :, 0].astype(np.int16) + b_shift, 0, 255).astype(np.uint8)
+    bg[:, :, 2] = np.clip(bg[:, :, 2].astype(np.int16) + r_shift, 0, 255).astype(np.uint8)
+
+    if bg_type == "floor_tiles":
+        # Draw grid lines resembling lab floor tiles (teaches model tile seams != potholes)
+        step_x = rng.randint(45, 95)
+        step_y = rng.randint(35, 75)
+        line_col = max(30, base_val - rng.randint(20, 45))
+        for x in range(0, w, step_x):
+            cv2.line(bg, (x, 0), (x + rng.randint(-15, 15), h), (line_col, line_col, line_col), 1)
+        for y in range(int(h * 0.35), h, step_y):
+            cv2.line(bg, (0, y), (w, y), (line_col, line_col, line_col), 1)
+    elif bg_type == "wall_floor_split":
+        horizon_y = rng.randint(int(h * 0.25), int(h * 0.55))
+        floor_val = max(40, base_val - rng.randint(25, 55))
+        bg[horizon_y:, :] = floor_val
+        cv2.line(bg, (0, horizon_y), (w, horizon_y), (35, 35, 35), rng.randint(1, 3))
+    elif bg_type == "shadow_gradient":
+        # Cast an elliptical or diagonal room shadow (teaches model shadows != potholes)
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        cx = rng.uniform(0.2 * w, 0.8 * w)
+        cy = rng.uniform(0.45 * h, 0.90 * h)
+        rx = rng.uniform(0.18 * w, 0.45 * w)
+        ry = rng.uniform(0.12 * h, 0.35 * h)
+        dist = ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2
+        shadow_mask = np.exp(-dist * 1.8) * rng.uniform(35, 75)
+        bg = np.clip(bg.astype(np.float32) - shadow_mask[..., None], 15, 250).astype(np.uint8)
+
+    # Mild sensor grain
+    noise = np.random.normal(0, rng.uniform(2.0, 6.0), (h, w, 3)).astype(np.float32)
+    bg = np.clip(bg.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    return bg
 
 
-# =============================================================================
-# Noise & "Held-Photo in Front of Camera" Augmentation Functions
-# =============================================================================
-
-def add_gaussian_noise(img: np.ndarray, sigma_range: Tuple[float, float] = (12.0, 32.0)) -> np.ndarray:
-    """Adds random Gaussian camera sensor / ISO grain noise."""
-    sigma = random.uniform(*sigma_range)
-    noise = np.random.normal(0, sigma, img.shape).astype(np.float32)
-    noisy = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-    return noisy
-
-
-def add_salt_and_pepper(img: np.ndarray, amount: float = 0.012) -> np.ndarray:
-    """Adds impulse salt-and-pepper noise."""
-    out = img.copy()
-    h, w = out.shape[:2]
-    num_Px = int(amount * h * w)
-    # Salt
-    ys = np.random.randint(0, h, num_Px // 2)
-    xs = np.random.randint(0, w, num_Px // 2)
-    out[ys, xs] = 255
-    # Pepper
-    ys = np.random.randint(0, h, num_Px // 2)
-    xs = np.random.randint(0, w, num_Px // 2)
-    out[ys, xs] = 0
-    return out
-
-
-def add_defocus_or_motion_blur(img: np.ndarray) -> np.ndarray:
-    """Simulates close-up fixed-focus camera defocus or hand-held motion blur."""
-    choice = random.choice(["defocus", "motion", "both"])
-    out = img.copy()
-    if choice in ("defocus", "both"):
-        k = random.choice([3, 5, 7])
-        out = cv2.GaussianBlur(out, (k, k), random.uniform(0.8, 2.2))
-    if choice in ("motion", "both"):
-        size = random.choice([5, 7, 9])
-        kernel = np.zeros((size, size), dtype=np.float32)
-        if random.random() < 0.5:
-            kernel[size // 2, :] = 1.0 / size
-        else:
-            np.fill_diagonal(kernel, 1.0 / size)
-        out = cv2.filter2D(out, -1, kernel)
-    return out
-
-
-def add_printout_glare_and_washout(img: np.ndarray) -> np.ndarray:
+def apply_printout_appearance(img: np.ndarray, rng: random.Random) -> np.ndarray:
     """
-    Simulates holding a printed paper photo or phone/laptop screen in front of the
-    car camera under indoor lighting:
-      - Reduced contrast / lifted blacks (matte paper / screen backlight washout)
-      - Specular reflection / glare hotspot from overhead room lights
-      - Slight indoor color temperature shift
+    Simulates how an inkjet/laser printout of a road looks to the Pi camera:
+    - Matte paper dynamic range compression (darks aren't pitch black, whites are paper-toned)
+    - Slight warm/cool indoor lighting cast and soft glare
+    - Light optical defocus + mild camera noise
     """
     out = img.astype(np.float32)
-
-    # 1. Contrast washout + lifted black level (typical of printed photos / screens)
-    alpha = random.uniform(0.62, 0.90)  # Lower contrast
-    beta = random.uniform(15.0, 48.0)   # Lifted shadows/blacks
-    out = out * alpha + beta
-
-    # 2. Overhead light specular glare (elliptical bright spot)
-    h, w = img.shape[:2]
-    if random.random() < 0.75:
-        gx = random.randint(int(w * 0.2), int(w * 0.8))
-        gy = random.randint(int(h * 0.15), int(h * 0.75))
-        rx = random.randint(int(w * 0.12), int(w * 0.35))
-        ry = random.randint(int(h * 0.10), int(h * 0.30))
-        Y, X = np.ogrid[:h, :w]
-        dist_sq = ((X - gx) / max(rx, 1)) ** 2 + ((Y - gy) / max(ry, 1)) ** 2
-        glare = np.exp(-dist_sq * 1.8) * random.uniform(35.0, 95.0)
-        out += glare[:, :, None]
-
-    # 3. Slight indoor warm/cool AWB tint
-    b_gain = random.uniform(0.88, 1.12)
-    r_gain = random.uniform(0.90, 1.14)
-    out[:, :, 0] *= b_gain
-    out[:, :, 2] *= r_gain
-
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def add_screen_halftone_or_jpeg(img: np.ndarray) -> np.ndarray:
-    """Simulates screen pixel grid / printer halftone pattern + JPEG compression."""
-    out = img.copy()
     h, w = out.shape[:2]
-    if random.random() < 0.5:
-        # Subtle periodic scanline / halftone modulation
-        step = random.choice([2, 3, 4])
-        mask = np.ones((h, w, 1), dtype=np.float32)
-        mask[::step, :, :] = random.uniform(0.88, 0.95)
-        mask[:, ::step, :] *= random.uniform(0.90, 0.96)
-        out = np.clip(out.astype(np.float32) * mask, 0, 255).astype(np.uint8)
 
-    # Low-quality JPEG re-encoding artifact
-    q = random.randint(28, 65)
-    ok, enc = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), q])
-    if ok:
-        out = cv2.imdecode(enc, cv2.IMREAD_COLOR)
-    return out
+    # 1. Matte paper black-point lift & contrast compression
+    alpha = rng.uniform(0.72, 0.95)
+    black_lift = rng.uniform(14.0, 34.0)
+    out = out * alpha + black_lift
+
+    # 2. Slight indoor color temperature shift
+    out[:, :, 0] *= rng.uniform(0.92, 1.08)
+    out[:, :, 1] *= rng.uniform(0.95, 1.05)
+    out[:, :, 2] *= rng.uniform(0.92, 1.08)
+
+    # 3. Soft directional paper sheen / lighting gradient
+    if rng.random() < 0.70:
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        gx = rng.uniform(-0.4, 0.4) * (xx / max(w, 1) - 0.5)
+        gy = rng.uniform(-0.4, 0.4) * (yy / max(h, 1) - 0.5)
+        grad = 1.0 + (gx + gy)
+        out = out * grad[..., None]
+
+    # 4. Mild Gaussian blur (printout held close to fixed-focus lens)
+    out_u8 = np.clip(out, 0, 255).astype(np.uint8)
+    if rng.random() < 0.55:
+        out_u8 = cv2.GaussianBlur(out_u8, (3, 3), rng.uniform(0.4, 1.0))
+
+    # 5. Moderate realistic sensor noise (never destructive)
+    sigma = rng.uniform(3.0, 10.0)
+    noise = np.random.normal(0, sigma, out_u8.shape).astype(np.float32)
+    out_u8 = np.clip(out_u8.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    return out_u8
 
 
-def simulate_photo_held_in_front_of_car(
-    img: np.ndarray,
-    bboxes: List[Tuple[int, float, float, float, float]],
-) -> Tuple[np.ndarray, List[Tuple[int, float, float, float, float]]]:
+def embed_printout_in_lower_camera(
+    road_img: np.ndarray,
+    boxes: list,
+    rng: random.Random,
+) -> tuple[np.ndarray, list]:
     """
-    Simulates taking a photo/printout/tablet of a road with a pothole and holding
-    it in front of the RC car camera:
-      - Scales the road photo to 52%..88% of the camera frame
-      - Places it at varied vertical positions (including center/upper-middle!)
-      - Adds a white/gray paper border or dark bezel around the photo
-      - Applies slight perspective tilt/rotation
-      - Transforms YOLO normalized bounding boxes [cls, xc, yc, bw, bh] accurately
+    Places a printed road photo in the lower section of the camera frame (or full lower view)
+    with realistic white paper margins and indoor background above/around it, transforming
+    bounding boxes and keeping ONLY potholes located in the lower section (yc >= 0.40).
     """
-    h, w = img.shape[:2]
+    h, w = road_img.shape[:2]
+    printed = apply_printout_appearance(road_img, rng)
 
-    # Create a realistic lab background (floor / wall / desk texture with noise)
-    bg_val = random.randint(45, 195)
-    canvas = np.full((h, w, 3), bg_val, dtype=np.uint8)
-    # Add subtle gradient & texture to background
-    grad = np.linspace(0.8, 1.2, h, dtype=np.float32)[:, None, None]
-    canvas = np.clip(canvas.astype(np.float32) * grad, 0, 255).astype(np.uint8)
-    canvas = add_gaussian_noise(canvas, (5.0, 15.0))
+    mode = rng.choice(["lower_sheet_with_border", "close_printout_lower", "tilted_sheet_lower"])
 
-    # Scale factor for the held-up photo
-    scale_x = random.uniform(0.52, 0.88)
-    scale_y = scale_x * random.uniform(0.88, 1.12)
-    new_w = max(64, min(int(w * scale_x), w - 20))
-    new_h = max(64, min(int(h * scale_y), h - 20))
+    if mode == "close_printout_lower":
+        # Printout held close to camera: shift road vertically if needed so potholes sit in lower section
+        canvas = create_indoor_background(h, w, rng)
+        scale_x = rng.uniform(0.82, 0.98)
+        scale_y = rng.uniform(0.75, 0.92)
+        nh, nw = int(h * scale_y), int(w * scale_x)
+        resized = cv2.resize(printed, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
-    # Position anywhere from upper-middle to bottom of camera view
-    x_off = random.randint(10, max(10, w - new_w - 10))
-    y_off = random.randint(10, max(10, h - new_h - 10))
+        # Position printout toward the bottom of the camera frame
+        ox = rng.randint(max(0, (w - nw) // 4), max(0, w - nw))
+        oy = rng.randint(max(0, h - nh - int(0.06 * h)), max(0, h - nh))
 
-    # Optional white paper margin or black screen bezel around the photo
-    border_px = random.randint(4, 14)
-    border_color = random.choice([(235, 235, 235), (215, 210, 200), (25, 25, 28)])
-    bx1 = max(0, x_off - border_px)
-    by1 = max(0, y_off - border_px)
-    bx2 = min(w, x_off + new_w + border_px)
-    by2 = min(h, y_off + new_h + border_px)
-    cv2.rectangle(canvas, (bx1, by1), (bx2, by2), border_color, -1)
+        # Draw white paper margin around the printed road
+        pad = rng.randint(5, 14)
+        px1, py1 = max(0, ox - pad), max(0, oy - pad)
+        px2, py2 = min(w, ox + nw + pad), min(h, oy + nh + pad)
+        paper_val = rng.randint(215, 245)
+        cv2.rectangle(canvas, (px1, py1), (px2, py2), (paper_val, paper_val, paper_val), -1)
+        cv2.rectangle(canvas, (px1, py1), (px2, py2), (70, 70, 70), 1)
+        canvas[oy:oy + nh, ox:ox + nw] = resized
 
-    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-    canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+        new_boxes = []
+        for cls_id, xc, yc, bw, bh in boxes:
+            nxc = (xc * nw + ox) / w
+            nyc = (yc * nh + oy) / h
+            nbw = (bw * nw) / w
+            nbh = (bh * nh) / h
+            if 0.40 <= nyc <= 0.96 and 0.04 <= nxc <= 0.96 and nbw >= 0.025 and nbh >= 0.02:
+                new_boxes.append((cls_id, nxc, nyc, nbw, nbh))
+        return canvas, new_boxes
 
-    # Transform bounding boxes to new canvas coordinates
-    new_bboxes = []
-    for cls_id, xc, yc, bw, bh in bboxes:
-        # Original pixel coords
-        px_xc = xc * w
-        px_yc = yc * h
-        px_bw = bw * w
-        px_bh = bh * h
+    # Lower sheet with border or slight tilt
+    canvas = create_indoor_background(h, w, rng)
+    # Crop road from y=0.20..1.0 so the printout focuses on the road surface
+    crop_y1 = int(h * rng.uniform(0.15, 0.30))
+    road_crop = printed[crop_y1:, :]
+    ch, cw = road_crop.shape[:2]
 
-        # Scaled & shifted coords
-        n_xc = (px_xc * (new_w / w) + x_off) / w
-        n_yc = (px_yc * (new_h / h) + y_off) / h
-        n_bw = (px_bw * (new_w / w)) / w
-        n_bh = (px_bh * (new_h / h)) / h
+    scale_x = rng.uniform(0.68, 0.92)
+    scale_y = rng.uniform(0.55, 0.78)
+    nw = int(w * scale_x)
+    nh = int(h * scale_y)
+    resized = cv2.resize(road_crop, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
-        if 0.02 < n_xc < 0.98 and 0.02 < n_yc < 0.98 and n_bw > 0.015 and n_bh > 0.015:
-            new_bboxes.append((cls_id, n_xc, n_yc, n_bw, n_bh))
+    ox = rng.randint(max(4, (w - nw) // 2 - int(0.08 * w)), min(w - nw - 4, (w - nw) // 2 + int(0.08 * w)))
+    oy = rng.randint(int(h * 0.20), max(int(h * 0.21), h - nh - 6))
 
-    return canvas, new_bboxes
+    # White paper border around the road image
+    pad = rng.randint(6, 16)
+    px1, py1 = max(0, ox - pad), max(0, oy - pad)
+    px2, py2 = min(w, ox + nw + pad), min(h, oy + nh + pad)
+    paper_val = rng.randint(210, 245)
+    cv2.rectangle(canvas, (px1, py1), (px2, py2), (paper_val, paper_val, paper_val), -1)
+    cv2.rectangle(canvas, (px1, py1), (px2, py2), (55, 55, 55), rng.randint(1, 2))
+    canvas[oy:oy + nh, ox:ox + nw] = resized
 
+    new_boxes = []
+    crop_frac = crop_y1 / h
+    rem_frac = 1.0 - crop_frac
+    for cls_id, xc, yc, bw, bh in boxes:
+        if yc <= crop_frac:
+            continue
+        rel_yc = (yc - crop_frac) / rem_frac
+        rel_bh = bh / rem_frac
+        nxc = (xc * nw + ox) / w
+        nyc = (rel_yc * nh + oy) / h
+        nbw = (bw * nw) / w
+        nbh = (rel_bh * nh) / h
+        # Enforce lower-section camera constraint (nyc >= 0.40)
+        if 0.40 <= nyc <= 0.96 and 0.04 <= nxc <= 0.96 and 0.025 <= nbw <= 0.55 and 0.02 <= nbh <= 0.45:
+            new_boxes.append((cls_id, nxc, nyc, min(nbw, 0.95), min(nbh, 0.95)))
 
-def apply_composite_noise_pipeline(
-    img: np.ndarray,
-    bboxes: List[Tuple[int, float, float, float, float]],
-    mode: str = "random",
-) -> Tuple[np.ndarray, List[Tuple[int, float, float, float, float]]]:
-    """Applies a combination of photo-held-in-front-of-car + sensor/optical/lighting noise."""
-    out = img.copy()
-    out_boxes = list(bboxes)
-
-    if mode == "held_photo" or (mode == "random" and random.random() < 0.55):
-        out, out_boxes = simulate_photo_held_in_front_of_car(out, out_boxes)
-
-    if random.random() < 0.85:
-        out = add_printout_glare_and_washout(out)
-
-    if random.random() < 0.70:
-        out = add_defocus_or_motion_blur(out)
-
-    if random.random() < 0.85:
-        out = add_gaussian_noise(out, (10.0, 30.0))
-
-    if random.random() < 0.35:
-        out = add_salt_and_pepper(out, random.uniform(0.004, 0.015))
-
-    if random.random() < 0.65:
-        out = add_screen_halftone_or_jpeg(out)
-
-    return out, out_boxes
+    return canvas, new_boxes
 
 
-# =============================================================================
-# Dataset Extraction & Auto-Labeling from Available Videos + Validation Batches
-# =============================================================================
-
-def extract_base_frames_and_labels() -> List[Tuple[np.ndarray, List[Tuple[int, float, float, float, float]]]]:
+def generate_hard_negative_frame(h: int, w: int, clean_road_crops: list, rng: random.Random) -> np.ndarray:
     """
-    Extracts diverse road/pothole frames from pothole_test_2.mp4 and validation
-    mosaic images, and uses the ensemble (best.pt + rdd2022_yolov8n.pt) to generate
-    clean ground-truth pothole annotations before applying heavy noise/photo augmentations.
+    Generates hard-negative frames that contain ZERO potholes:
+    1. Held paper printout with clean road asphalt / lane markings (no potholes)
+    2. Blank or text/line paper sheet with sharp borders on indoor floor
+    3. Pure indoor floor tiles / shadows / walls
     """
-    pothole_pt = ROOT_DIR / "best.pt"
-    spec_pt = ROOT_DIR / "rdd2022_yolov8n.pt"
+    neg_kind = rng.choice(["clean_road_printout", "paper_sheet_border", "indoor_floor_shadows"])
+    canvas = create_indoor_background(h, w, rng)
 
-    print(f"[*] Loading teacher models for dataset generation: {pothole_pt.name}, {spec_pt.name}")
-    teacher_primary = YOLO(str(pothole_pt))
-    teacher_spec = YOLO(str(spec_pt)) if spec_pt.exists() else None
+    if neg_kind == "clean_road_printout" and clean_road_crops:
+        clean_patch = rng.choice(clean_road_crops).copy()
+        clean_patch = apply_printout_appearance(clean_patch, rng)
+        nw = int(w * rng.uniform(0.65, 0.92))
+        nh = int(h * rng.uniform(0.50, 0.78))
+        resized = cv2.resize(clean_patch, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        ox = rng.randint(max(4, (w - nw) // 2 - 20), max(5, min(w - nw - 4, (w - nw) // 2 + 20)))
+        oy = rng.randint(int(h * 0.22), max(int(h * 0.23), h - nh - 6))
+        pad = rng.randint(6, 15)
+        paper_val = rng.randint(215, 245)
+        cv2.rectangle(canvas, (max(0, ox - pad), max(0, oy - pad)),
+                      (min(w, ox + nw + pad), min(h, oy + nh + pad)),
+                      (paper_val, paper_val, paper_val), -1)
+        cv2.rectangle(canvas, (max(0, ox - pad), max(0, oy - pad)),
+                      (min(w, ox + nw + pad), min(h, oy + nh + pad)),
+                      (50, 50, 50), rng.randint(1, 2))
+        canvas[oy:oy + nh, ox:ox + nw] = resized
 
-    samples: List[Tuple[np.ndarray, List[Tuple[int, float, float, float, float]]]] = []
+    elif neg_kind == "paper_sheet_border":
+        # Blank or ruled/asphalt-colored rectangular sheet held in lower camera section
+        nw = int(w * rng.uniform(0.55, 0.88))
+        nh = int(h * rng.uniform(0.45, 0.75))
+        ox = rng.randint(10, max(12, w - nw - 10))
+        oy = rng.randint(int(h * 0.25), max(int(h * 0.26), h - nh - 8))
+        paper_val = rng.randint(205, 245)
+        cv2.rectangle(canvas, (ox, oy), (ox + nw, oy + nh), (paper_val, paper_val, paper_val), -1)
+        cv2.rectangle(canvas, (ox, oy), (ox + nw, oy + nh), (40, 40, 40), rng.randint(1, 3))
+        # Inner gray road rectangle (smooth asphalt with lane lines, no potholes)
+        pad = rng.randint(8, 18)
+        if nw > 2 * pad + 20 and nh > 2 * pad + 20:
+            asphalt_val = rng.randint(75, 135)
+            cv2.rectangle(canvas, (ox + pad, oy + pad), (ox + nw - pad, oy + nh - pad),
+                          (asphalt_val, asphalt_val, asphalt_val), -1)
+            # Optional straight white/yellow road stripe
+            if rng.random() < 0.6:
+                lx1 = ox + pad + rng.randint(10, nw - 2 * pad - 10)
+                lx2 = ox + pad + rng.randint(10, nw - 2 * pad - 10)
+                cv2.line(canvas, (lx1, oy + nh - pad), (lx2, oy + pad), (215, 215, 215), rng.randint(2, 5))
 
-    # 1. Sample frames from pothole_test_2.mp4
-    video_candidates = [
-        ROOT_DIR / "pothole_test_2.mp4",
-        REPO_ROOT / "pothole_test_2.mp4",
-    ]
-    video_path = next((p for p in video_candidates if p.exists()), None)
-    if video_path:
-        cap = cv2.VideoCapture(str(video_path))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        step = max(1, total_frames // 90)
-        print(f"[*] Sampling frames from {video_path.name} (total={total_frames}, step={step})...")
+    return canvas
 
-        idx = 0
+
+def write_sample(split_dir: Path, stem: str, img: np.ndarray, boxes: list):
+    img_path = split_dir / "images" / f"{stem}.jpg"
+    lbl_path = split_dir / "labels" / f"{stem}.txt"
+    cv2.imwrite(str(img_path), img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    with open(lbl_path, "w", encoding="utf-8") as f:
+        for cls_id, xc, yc, bw, bh in boxes:
+            f.write(f"{cls_id} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}\n")
+
+
+def build_dataset() -> Path:
+    print(f"🔍 Building High-Precision Lower-Section Printout Dataset from: {CLEAN_BASE_WEIGHTS}")
+    if DATASET_DIR.exists():
+        shutil.rmtree(DATASET_DIR)
+
+    for split in ["train", "val"]:
+        (DATASET_DIR / split / "images").mkdir(parents=True, exist_ok=True)
+        (DATASET_DIR / split / "labels").mkdir(parents=True, exist_ok=True)
+
+    device = 0 if torch.cuda.is_available() else "cpu"
+    base_model = YOLO(str(CLEAN_BASE_WEIGHTS))
+
+    positive_samples = []
+    clean_road_crops = []
+
+    # 1. Extract high-confidence lower-section potholes from pothole_test_2.mp4
+    if VIDEO_PATH.exists():
+        cap = cv2.VideoCapture(str(VIDEO_PATH))
+        frame_idx = 0
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            if idx % step == 0:
-                frame_rs = cv2.resize(frame, (640, 480))
-                h, w = frame_rs.shape[:2]
-                boxes = _detect_ensemble_boxes(frame_rs, teacher_primary, teacher_spec, w, h)
-                if boxes:
-                    samples.append((frame_rs, boxes))
-                    # Also extract a zoomed crop around the road surface so the pothole
-                    # fills a larger fraction of the "photo" (like a close-up pothole photo!)
-                    road_crop = frame_rs[int(h * 0.35):, :]
-                    rc_h, rc_w = road_crop.shape[:2]
-                    rc_rs = cv2.resize(road_crop, (640, 480))
-                    rc_boxes = _detect_ensemble_boxes(rc_rs, teacher_primary, teacher_spec, 640, 480)
-                    if rc_boxes:
-                        samples.append((rc_rs, rc_boxes))
-            idx += 1
+            frame_idx += 1
+            if frame_idx % 2 != 0:
+                continue
+
+            fh, fw = frame.shape[:2]
+            res = base_model.predict(frame, conf=0.25, imgsz=640, device=device, verbose=False)[0]
+            boxes = []
+            for b in res.boxes:
+                cls_id = int(b.cls[0])
+                if cls_id != 0:
+                    continue
+                xc, yc, bw, bh = [float(v) for v in b.xywhn[0]]
+                # STRICT filter: only genuine potholes in the lower section (yc >= 0.42)
+                if 0.42 <= yc <= 0.94 and 0.03 <= bw <= 0.48 and 0.025 <= bh <= 0.38:
+                    boxes.append((0, xc, yc, bw, bh))
+
+            if boxes:
+                positive_samples.append((f"vid_{frame_idx:04d}", frame.copy(), boxes))
+            elif len(res.boxes) == 0 and len(clean_road_crops) < 40:
+                # Completely clean road surface with zero detections
+                clean_road_crops.append(frame[int(fh * 0.35):, :].copy())
         cap.release()
 
-    # 2. Extract 4x4 tiles from RDD2022 validation batch images if present
-    val_dir = ROOT_DIR / "runs_rdd" / "custom_pothole_model"
-    for batch_img_path in sorted(val_dir.glob("val_batch*_pred.jpg")):
-        # Use the clean sibling or crop tiles before prediction overlay if possible,
-        # or extract from pothole_test_2 crops
-        pass
+    # 2. Extract clean road/background frames from dashcam_test.mp4 for hard negatives
+    if NEG_VIDEO_PATH.exists():
+        cap = cv2.VideoCapture(str(NEG_VIDEO_PATH))
+        f_idx = 0
+        while len(clean_road_crops) < 70:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            f_idx += 1
+            if f_idx % 12 != 0:
+                continue
+            res = base_model.predict(frame, conf=0.18, imgsz=640, device=device, verbose=False)[0]
+            if len(res.boxes) == 0:
+                fh, fw = frame.shape[:2]
+                clean_road_crops.append(frame[int(fh * 0.35):, :].copy())
+        cap.release()
 
-    print(f"[+] Extracted {len(samples)} clean labeled base road-pothole frames.")
-    return samples
+    # 3. Also include sample_road.jpg if it has high-confidence lower-section potholes
+    if SAMPLE_IMG.exists():
+        s_img = cv2.imread(str(SAMPLE_IMG))
+        if s_img is not None:
+            res = base_model.predict(s_img, conf=0.25, imgsz=640, device=device, verbose=False)[0]
+            boxes = []
+            for b in res.boxes:
+                if int(b.cls[0]) == 0:
+                    xc, yc, bw, bh = [float(v) for v in b.xywhn[0]]
+                    if 0.40 <= yc <= 0.95 and 0.03 <= bw <= 0.50 and 0.025 <= bh <= 0.40:
+                        boxes.append((0, xc, yc, bw, bh))
+            if boxes:
+                for k in range(8):
+                    positive_samples.append((f"sample_road_{k}", s_img.copy(), boxes))
 
+    print(f"✅ Extracted {len(positive_samples)} high-confidence lower-section pothole base frames "
+          f"and {len(clean_road_crops)} verified pothole-free road crops.")
 
-def _detect_ensemble_boxes(
-    frame: np.ndarray,
-    teacher_primary: YOLO,
-    teacher_spec: YOLO,
-    w: int,
-    h: int,
-) -> List[Tuple[int, float, float, float, float]]:
-    """Runs primary + specialist models on clean frame to get high-recall pothole boxes."""
-    merged_xyxy = []
+    rng = random.Random(42)
+    rng.shuffle(positive_samples)
 
-    res1 = teacher_primary.predict(frame, conf=0.06, imgsz=640, verbose=False)[0]
-    for box in res1.boxes:
-        x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
-        cls_id = int(box.cls[0])
-        # Map primary pothole class to 0 (pothole_D40)
-        target_cls = 0 if cls_id in (0, 3) else min(cls_id, 4)
-        merged_xyxy.append((target_cls, x1, y1, x2, y2, float(box.conf[0])))
-
-    if teacher_spec is not None:
-        res2 = teacher_spec.predict(frame, conf=0.08, imgsz=640, verbose=False)[0]
-        for box in res2.boxes:
-            x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
-            # Check overlap with existing
-            duplicate = False
-            for _, ex1, ey1, ex2, ey2, _ in merged_xyxy:
-                if abs(x1 - ex1) < 35 and abs(y1 - ey1) < 35:
-                    duplicate = True
-                    break
-            if not duplicate:
-                merged_xyxy.append((0, x1, y1, x2, y2, float(box.conf[0])))
-
-    yolo_boxes = []
-    for cls_id, x1, y1, x2, y2, _ in merged_xyxy:
-        bw = (x2 - x1) / w
-        bh = (y2 - y1) / h
-        xc = ((x1 + x2) / 2.0) / w
-        yc = ((y1 + y2) / 2.0) / h
-        if 0.02 < bw < 0.85 and 0.02 < bh < 0.85:
-            yolo_boxes.append((0, xc, yc, bw, bh))  # Focus on class 0: pothole_D40
-    return yolo_boxes
-
-
-def build_noisy_yolo_dataset(samples: List[Tuple[np.ndarray, List[Tuple[int, float, float, float, float]]]]) -> Path:
-    """Builds train/val splits with clean + heavily noisy + held-photo augmented images."""
-    if DATASET_DIR.exists():
-        shutil.rmtree(DATASET_DIR)
-
-    for split in ("train", "val"):
-        (DATASET_DIR / split / "images").mkdir(parents=True, exist_ok=True)
-        (DATASET_DIR / split / "labels").mkdir(parents=True, exist_ok=True)
-
-    random.shuffle(samples)
-    split_idx = int(len(samples) * 0.82)
-    train_samples = samples[:split_idx]
-    val_samples = samples[split_idx:]
-
-    def save_pair(split: str, name: str, img: np.ndarray, boxes: List[Tuple[int, float, float, float, float]]):
-        img_path = DATASET_DIR / split / "images" / f"{name}.jpg"
-        lbl_path = DATASET_DIR / split / "labels" / f"{name}.txt"
-        cv2.imwrite(str(img_path), img)
-        lines = [f"{c} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}" for c, xc, yc, bw, bh in boxes]
-        lbl_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    split_idx = int(len(positive_samples) * 0.82)
+    train_pos = positive_samples[:split_idx]
+    val_pos = positive_samples[split_idx:]
 
     train_count = 0
-    for i, (img, boxes) in enumerate(train_samples):
-        # 1. Original clean
-        save_pair("train", f"sample_{i:04d}_clean", img, boxes)
-        train_count += 1
-        # 2. Sensor noise + blur + printout glare
-        aug1, b1 = apply_composite_noise_pipeline(img, boxes, mode="sensor_noise")
-        if b1:
-            save_pair("train", f"sample_{i:04d}_noisy", aug1, b1)
-            train_count += 1
-        # 3. Held-photo / printout in front of car camera (variant A)
-        aug2, b2 = apply_composite_noise_pipeline(img, boxes, mode="held_photo")
-        if b2:
-            save_pair("train", f"sample_{i:04d}_photoA", aug2, b2)
-            train_count += 1
-        # 4. Held-photo / printout in front of car camera (variant B - strong noise + glare)
-        aug3, b3 = apply_composite_noise_pipeline(img, boxes, mode="held_photo")
-        if b3:
-            save_pair("train", f"sample_{i:04d}_photoB", aug3, b3)
-            train_count += 1
-
     val_count = 0
-    for i, (img, boxes) in enumerate(val_samples):
-        save_pair("val", f"val_{i:04d}_clean", img, boxes)
+    neg_train_count = 0
+    neg_val_count = 0
+
+    # Generate Training Set (Positive + Printout-in-Lower-Camera + Hard Negatives)
+    for stem, frame, boxes in train_pos:
+        h, w = frame.shape[:2]
+        # 1. Clean printout-style full frame
+        p_img = apply_printout_appearance(frame, rng)
+        write_sample(DATASET_DIR / "train", f"{stem}_print", p_img, boxes)
+        train_count += 1
+
+        # 2. Horizontal flip printout
+        flip_img = cv2.flip(apply_printout_appearance(frame, rng), 1)
+        flip_boxes = [(c, 1.0 - xc, yc, bw, bh) for (c, xc, yc, bw, bh) in boxes]
+        write_sample(DATASET_DIR / "train", f"{stem}_flip", flip_img, flip_boxes)
+        train_count += 1
+
+        # 3. Two variations of held printout positioned in the lower camera section
+        for v in range(2):
+            emb_img, emb_boxes = embed_printout_in_lower_camera(frame, boxes, rng)
+            if emb_boxes:
+                write_sample(DATASET_DIR / "train", f"{stem}_lower_{v}", emb_img, emb_boxes)
+                train_count += 1
+
+        # 4. Hard-negative samples (paper borders, floors, clean road printouts -> EMPTY labels)
+        for n_i in range(2):
+            neg_img = generate_hard_negative_frame(h, w, clean_road_crops, rng)
+            write_sample(DATASET_DIR / "train", f"{stem}_neg_{n_i}", neg_img, [])
+            neg_train_count += 1
+
+    # Generate Validation Set (Positive Held Printouts + Hard Negatives)
+    for stem, frame, boxes in val_pos:
+        h, w = frame.shape[:2]
+        p_img = apply_printout_appearance(frame, rng)
+        write_sample(DATASET_DIR / "val", f"{stem}_print", p_img, boxes)
         val_count += 1
-        aug_v1, bv1 = apply_composite_noise_pipeline(img, boxes, mode="held_photo")
-        if bv1:
-            save_pair("val", f"val_{i:04d}_held_photo", aug_v1, bv1)
+
+        emb_img, emb_boxes = embed_printout_in_lower_camera(frame, boxes, rng)
+        if emb_boxes:
+            write_sample(DATASET_DIR / "val", f"{stem}_lower", emb_img, emb_boxes)
             val_count += 1
 
-    yaml_path = DATASET_DIR / "noisy_rdd_dataset.yaml"
-    yaml_content = f"""# Noise & Held-Photo Augmented Pothole Dataset
-path: {DATASET_DIR.as_posix()}
-train: train/images
-val: val/images
+        neg_img = generate_hard_negative_frame(h, w, clean_road_crops, rng)
+        write_sample(DATASET_DIR / "val", f"{stem}_neg", neg_img, [])
+        neg_val_count += 1
 
-names:
-  0: pothole_D40
-  1: longitudinal_crack_D00
-  2: transverse_crack_D10
-  3: alligator_crack_D20
-  4: marking_defect_D44
-"""
+    print(f"📊 Dataset ready at {DATASET_DIR}:")
+    print(f"   Train: {train_count} positive + {neg_train_count} hard-negative = {train_count + neg_train_count} images")
+    print(f"   Val  : {val_count} positive + {neg_val_count} hard-negative = {val_count + neg_val_count} images")
+
+    # Preserve exact 5-class RDD2022 schema from best_pre_noise_backup.pt
+    yaml_path = DATASET_DIR / "data.yaml"
+    yaml_content = (
+        f"path: {DATASET_DIR.as_posix()}\n"
+        f"train: train/images\n"
+        f"val: val/images\n"
+        f"nc: 5\n"
+        f"names:\n"
+        f"  0: pothole_D40\n"
+        f"  1: longitudinal_crack_D00\n"
+        f"  2: transverse_crack_D10\n"
+        f"  3: alligator_crack_D20\n"
+        f"  4: marking_defect_D44\n"
+    )
     yaml_path.write_text(yaml_content, encoding="utf-8")
-    print(f"[+] Built noisy dataset: {train_count} train images, {val_count} val images -> {yaml_path}")
     return yaml_path
 
 
-def evaluate_on_held_photo_val(model: YOLO, val_img_dir: Path, conf: float = 0.08) -> Tuple[int, int, float]:
-    """Evaluates detection recall and mean confidence on held-photo noisy validation images."""
-    held_imgs = sorted(val_img_dir.glob("*_held_photo.jpg"))
-    if not held_imgs:
-        held_imgs = sorted(val_img_dir.glob("*.jpg"))
-    detected_frames = 0
-    confs = []
-    for p in held_imgs:
-        res = model.predict(str(p), conf=conf, imgsz=320, verbose=False)[0]
-        if len(res.boxes) > 0:
-            detected_frames += 1
-            confs.extend([float(b.conf[0]) for b in res.boxes])
-    mean_conf = float(np.mean(confs)) if confs else 0.0
-    return detected_frames, len(held_imgs), mean_conf
+def train_on_gpu(yaml_path: Path):
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required for training! Run with E:\\Conda\\envs\\PyTorch_env\\python.exe")
 
+    gpu_name = torch.cuda.get_device_name(0)
+    print(f"🚀 Starting GPU Fine-Tuning on: {gpu_name} (CUDA device=0)")
+    print(f"   Base checkpoint: {CLEAN_BASE_WEIGHTS}")
 
-def main():
-    set_seed(42)
-    samples = extract_base_frames_and_labels()
-    if not samples:
-        print("❌ No base samples found!", file=sys.stderr)
-        sys.exit(1)
-
-    yaml_path = build_noisy_yolo_dataset(samples)
-    val_img_dir = DATASET_DIR / "val" / "images"
-
-    base_pt = ROOT_DIR / "best.pt"
-    # Backup original best.pt before fine-tuning
-    backup_pt = ROOT_DIR / "best_pre_noise_backup.pt"
-    if not backup_pt.exists() and base_pt.exists():
-        shutil.copy(base_pt, backup_pt)
-
-    model_before = YOLO(str(base_pt))
-    det_before, total_val, conf_before = evaluate_on_held_photo_val(model_before, val_img_dir)
-    print(f"\n[BEFORE FINE-TUNING] Held-Photo Noisy Val Recall: {det_before}/{total_val} ({100*det_before/max(total_val,1):.1f}%), Mean Conf: {conf_before:.3f}")
-
-    # Fine-tune with strong noise & geometric augmentations
-    print("\n[*] Fine-tuning YOLOv10n pothole model (best.pt) on noisy + held-photo dataset...")
-    device = 0 if torch.cuda.is_available() else "cpu"
-    model = YOLO(str(base_pt))
+    model = YOLO(str(CLEAN_BASE_WEIGHTS))
     model.train(
         data=str(yaml_path),
-        epochs=6,
-        batch=8,
-        imgsz=320,
-        device=device,
+        epochs=18,
+        imgsz=416,
+        batch=16,
+        device=0,
         workers=0,
-        lr0=0.0015,
-        lrf=0.1,
-        warmup_epochs=1.0,
-        hsv_h=0.025,
-        hsv_s=0.75,
-        hsv_v=0.55,
-        degrees=12.0,
-        translate=0.18,
-        scale=0.60,
-        shear=4.0,
-        perspective=0.0005,
-        mosaic=1.0,
-        mixup=0.15,
-        erasing=0.35,
-        project=str(ROOT_DIR / "runs_rdd"),
-        name="noisy_finetuned_pothole_model",
+        project=str(RUNS_DIR),
+        name=RUN_NAME,
         exist_ok=True,
+        pretrained=True,
+        optimizer="AdamW",
+        lr0=0.0004,
+        lrf=0.05,
+        weight_decay=0.001,
+        warmup_epochs=2.0,
+        freeze=10,        # Freeze YOLOv10n backbone so pretrained features aren't corrupted
+        mosaic=0.25,      # Low mosaic to preserve lower-section spatial prior
+        mixup=0.0,
+        degrees=5.0,
+        translate=0.06,
+        scale=0.20,
+        fliplr=0.5,
+        hsv_h=0.01,
+        hsv_s=0.35,
+        hsv_v=0.30,
+        erasing=0.05,
         verbose=True,
     )
 
-    ft_best = ROOT_DIR / "runs_rdd" / "noisy_finetuned_pothole_model" / "weights" / "best.pt"
-    if ft_best.exists():
-        model_after = YOLO(str(ft_best))
-        det_after, total_val, conf_after = evaluate_on_held_photo_val(model_after, val_img_dir)
-        print(f"\n[AFTER FINE-TUNING]  Held-Photo Noisy Val Recall: {det_after}/{total_val} ({100*det_after/max(total_val,1):.1f}%), Mean Conf: {conf_after:.3f}")
+    best_out = RUNS_DIR / RUN_NAME / "weights" / "best.pt"
+    if not best_out.exists():
+        best_out = RUNS_DIR / RUN_NAME / "weights" / "last.pt"
 
-        # Copy fine-tuned weights to active deployment locations
-        shutil.copy(ft_best, ROOT_DIR / "best.pt")
-        shutil.copy(ft_best, REPO_ROOT / "pothole_best.pt")
-        runs_orig = ROOT_DIR / "runs_rdd" / "custom_pothole_model" / "weights" / "best.pt"
-        if runs_orig.parent.exists():
-            shutil.copy(ft_best, runs_orig)
-        print(f"[+] Updated active pothole weights at: {ROOT_DIR / 'best.pt'} and {REPO_ROOT / 'pothole_best.pt'}")
+    if best_out.exists():
+        targets = [
+            ROOT / "best.pt",
+            REPO_ROOT / "pothole_best.pt",
+            RUNS_DIR / "custom_pothole_model" / "weights" / "best.pt",
+        ]
+        for t in targets:
+            t.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(best_out, t)
+            print(f"✅ Copied GPU fine-tuned weights -> {t}")
+
+        # Verify false-positive suppression and printout recall immediately
+        verify_model(best_out)
+    else:
+        raise FileNotFoundError(f"Training finished but weights not found at {best_out}")
+
+
+def verify_model(weights_path: Path):
+    print("\n🧪 Running Post-Training Verification (Printout Recall vs. Hard-Negative False Positives)...")
+    m = YOLO(str(weights_path))
+    rng = random.Random(999)
+
+    # 1. Test 20 hard-negative synthetic frames (floors, shadows, paper borders)
+    fp_count = 0
+    for i in range(20):
+        neg = generate_hard_negative_frame(240, 320, [], rng)
+        res = m.predict(neg, imgsz=320, conf=0.25, device=0, verbose=False)[0]
+        potholes = [b for b in res.boxes if int(b.cls[0]) == 0]
+        if potholes:
+            fp_count += len(potholes)
+
+    # 2. Test held-printout lower-section positive frames
+    val_imgs = sorted((DATASET_DIR / "val" / "images").glob("*_lower*.jpg"))
+    tp_frames = 0
+    for vp in val_imgs:
+        im = cv2.imread(str(vp))
+        res = m.predict(im, imgsz=320, conf=0.25, device=0, verbose=False)[0]
+        potholes = [b for b in res.boxes if int(b.cls[0]) == 0]
+        if potholes:
+            tp_frames += 1
+
+    print(f"   Hard-Negative False Positives (20 room/border frames @ conf=0.25): {fp_count} (Target: 0)")
+    print(f"   Held-Printout Lower-Section Recall ({len(val_imgs)} val frames @ conf=0.25): {tp_frames}/{len(val_imgs)}")
 
 
 if __name__ == "__main__":
-    main()
+    yaml_file = build_dataset()
+    train_on_gpu(yaml_file)
