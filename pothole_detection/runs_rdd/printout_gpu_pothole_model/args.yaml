@@ -1,8 +1,8 @@
 task: detect
 mode: train
 model: E:\OneDrive - Shri Vile Parle Kelavani Mandal\Capstone\model\pothole_detection\best_pre_noise_backup.pt
-data: E:\OneDrive - Shri Vile Parle Kelavani Mandal\Capstone\model\pothole_detection\datasets\printout_lower_pothole_yolo\data.yaml
-epochs: 18
+data: C:\Users\menon\AppData\Local\Temp\printout_lower_pothole_yolo_v3\data.yaml
+epochs: 25
 time: null
 patience: 100
 batch: 16
@@ -29,7 +29,7 @@ resume: false
 amp: true
 fraction: 1.0
 profile: false
-freeze: 10
+freeze: 3
 multi_scale: 0.0
 compile: false
 channels_last: null
@@ -71,10 +71,10 @@ dynamic: false
 simplify: true
 opset: null
 workspace: null
-lr0: 0.0004
+lr0: 0.0008
 lrf: 0.05
 momentum: 0.937
-weight_decay: 0.001
+weight_decay: 0.0008
 warmup_epochs: 2.0
 warmup_momentum: 0.8
 warmup_bias_lr: 0.1
@@ -92,24 +92,24 @@ dlog: 1.0
 dgrad: 0.5
 dlam: 1.0
 nbs: 64
-hsv_h: 0.01
-hsv_s: 0.35
-hsv_v: 0.3
-degrees: 5.0
-translate: 0.06
-scale: 0.2
+hsv_h: 0.015
+hsv_s: 0.4
+hsv_v: 0.35
+degrees: 6.0
+translate: 0.08
+scale: 0.25
 shear: 0.0
 perspective: 0.0
 flipud: 0.0
 fliplr: 0.5
 bgr: 0.0
-mosaic: 0.25
+mosaic: 0.3
 mixup: 0.0
 cutmix: 0.0
 copy_paste: 0.0
 copy_paste_mode: flip
 auto_augment: randaugment
-erasing: 0.05
+erasing: 0.0
 cfg: null
 tracker: tracktrack.yaml
 save_dir: E:\OneDrive - Shri Vile Parle Kelavani Mandal\Capstone\model\pothole_detection\runs_rdd\printout_gpu_pothole_model

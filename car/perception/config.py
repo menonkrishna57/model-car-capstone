@@ -13,8 +13,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 MODEL_PATH = str(REPO_ROOT / "benchmarking" / "models" / "yolov10n_ncnn_model")
 POTHOLE_MODEL_PATH = str(REPO_ROOT / "pothole_detection" / "best.pt")
 IMGSZ = 320                            # Optimal resolution identified in benchmarks
+POTHOLE_IMGSZ = 416                    # Resolution for D40 pothole model (matches 4:3 GPU fine-tuning)
 CONFIDENCE_THRESHOLD = 0.25            # Detection threshold for positive obstacles
-POTHOLE_CONFIDENCE_THRESHOLD = 0.24    # High-precision threshold for GPU fine-tuned D40 printout potholes
+POTHOLE_CONFIDENCE_THRESHOLD = 0.20    # High-recall/precision threshold for GPU fine-tuned D40 printout potholes
 POTHOLE_LOWER_Y_MIN_FRAC = 0.40        # Potholes must lie in the lower section of the camera (yc >= 40% height)
 
 # ── Serial Link (Pi 5 ↔ Arduino Uno) ─────────────────────────────────────────

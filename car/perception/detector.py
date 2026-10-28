@@ -19,6 +19,7 @@ from car.perception.config import (
     MODEL_PATH,
     POTHOLE_MODEL_PATH,
     IMGSZ,
+    POTHOLE_IMGSZ,
     CONFIDENCE_THRESHOLD,
     POTHOLE_CONFIDENCE_THRESHOLD,
     POTHOLE_LOWER_Y_MIN_FRAC,
@@ -161,7 +162,7 @@ class Detector:
                     continue
 
     def _detect_yolo_potholes(self, frame: np.ndarray) -> List[Dict[str, Any]]:
-        """Runs the GPU fine-tuned D40 pothole YOLO model and filters strictly to the lower camera section."""
+        """Runs the GPU fine-tuned D40 pothole YOLO model on the full 4:3 frame and filters strictly to the lower camera section."""
         if self.pothole_model is None or frame is None:
             return []
 
@@ -169,19 +170,12 @@ class Detector:
         if h < 40 or w < 40:
             return []
 
-        # Crop top 22% ceiling/wall while keeping full lower-section road/printout context
-        roi_y1, roi_y2 = int(h * 0.22), h
-        roi_x1, roi_x2 = int(w * 0.03), int(w * 0.97)
-        sub_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
-        if sub_frame.size == 0:
-            return []
-
         potholes: List[Dict[str, Any]] = []
         frame_area = float(h * w)
         try:
             res = self.pothole_model.predict(
-                sub_frame,
-                imgsz=max(self.imgsz, 320),
+                frame,
+                imgsz=max(self.imgsz, POTHOLE_IMGSZ),
                 conf=self.pothole_conf,
                 verbose=False,
             )[0]
@@ -191,8 +185,7 @@ class Detector:
                 name = str(res.names.get(cls_id, "pothole")).lower()
                 # Strict D40 pothole filter (Class 0: pothole_D40) — ignore cracks, lines, and borders
                 if cls_id == 0 or "pothole" in name or "d40" in name:
-                    x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
-                    gx1, gy1, gx2, gy2 = x1 + roi_x1, y1 + roi_y1, x2 + roi_x1, y2 + roi_y1
+                    gx1, gy1, gx2, gy2 = [float(v) for v in box.xyxy[0]]
                     bw = gx2 - gx1
                     bh = gy2 - gy1
                     gyc = (gy1 + gy2) / 2.0

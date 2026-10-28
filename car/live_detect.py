@@ -103,9 +103,10 @@ def find_daylight_ref() -> Optional[Path]:
 CAM_WIDTH = 320
 CAM_HEIGHT = 240
 IMGSZ = 320
+POTHOLE_IMGSZ = 416                     # Matches 4:3 GPU fine-tuning resolution for held printouts
 OBSTACLE_CLASSES = [0, 1, 2, 3, 5, 7]  # person, bicycle, car, motorcycle, bus, truck
 CONF_OBSTACLE = 0.35
-CONF_POTHOLE = 0.24                     # High-precision threshold for D40 potholes on held printouts
+CONF_POTHOLE = 0.20                     # Balanced recall/precision threshold for D40 potholes on held printouts
 POTHOLE_LOWER_Y_MIN_FRAC = 0.40         # Pothole vertical center must lie in lower 60% of camera (yc >= 0.40*h)
 POTHOLE_PERSIST_FRAMES = 2              # Consecutive pothole detections required before autonomous swerve
 POTHOLE_ONLY = True                     # STRICT FILTER: Only detect D40 potholes
@@ -1016,21 +1017,15 @@ def detect_loop(cam, output):
             raw_pot_dets = []
             if pot_model is not None:
                 try:
-                    # Crop top 22% ceiling/wall while keeping full lower-section road/printout context
-                    roi_y1, roi_y2 = int(h * 0.22), h
-                    roi_x1, roi_x2 = int(w * 0.03), int(w * 0.97)
-                    sub_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                    # Run on full 4:3 frame (matching training aspect ratio) and filter boxes to lower section
                     frame_area = float(h * w)
-
-                    res_p = pot_model.predict(sub_frame, imgsz=IMGSZ, conf=CONF_POTHOLE, verbose=False)[0]
+                    res_p = pot_model.predict(frame, imgsz=POTHOLE_IMGSZ, conf=CONF_POTHOLE, verbose=False)[0]
 
                     for box in res_p.boxes:
                         cls_id = int(box.cls[0])
                         name = res_p.names.get(cls_id, "pothole").lower()
                         c_val = float(box.conf[0])
-                        bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
-                        x1, y1 = bx1 + roi_x1, by1 + roi_y1
-                        x2, y2 = bx2 + roi_x1, by2 + roi_y1
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
 
                         is_pothole = (cls_id == 0 or "pothole" in name or "d40" in name)
                         if POTHOLE_ONLY and not is_pothole:
