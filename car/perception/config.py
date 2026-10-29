@@ -42,3 +42,14 @@ EMERGENCY_STOP_DISTANCE_CM = 25.0      # Stop immediately if obstacle closer tha
 # ── IMU (ICM20948 over I2C) ──────────────────────────────────────────────────
 IMU_I2C_BUS = 1
 IMU_I2C_ADDRESS = 0x68
+
+# ── Follow-Me & Person Re-Identification ─────────────────────────────────────
+FOLLOW_CALIBRATION_FRAMES = 8          # Multi-frame samples to build target signature
+FOLLOW_SIMILARITY_THRESHOLD = 0.58     # Min combined score (clothing + figure) to match target
+FOLLOW_TRACK_VERIFY_THRESHOLD = 0.50   # Min score during active tracking before dropping to RE_ACQUIRE
+FOLLOW_ANTI_CONFUSION_MARGIN = 0.08    # Required margin over overlapping distractor person
+FOLLOW_SEARCH_STEP_DEG = 28            # Degrees per stepped turn toward last_seen_side
+FOLLOW_SEARCH_TURN_SPEED = 165         # PWM speed for search turns during RE_ACQUIRE
+FOLLOW_SEARCH_MAX_STEPS = 4            # Max directional search turns before holding stationary
+FOLLOW_SEARCH_INTERVAL_S = 0.85        # Delay (s) between search turns to stabilize camera & scan
+

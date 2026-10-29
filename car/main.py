@@ -51,6 +51,14 @@ from car.perception.config import (
     EMERGENCY_STOP_DISTANCE_CM,
     SERIAL_PORT,
     SERIAL_BAUD,
+    FOLLOW_CALIBRATION_FRAMES,
+    FOLLOW_SIMILARITY_THRESHOLD,
+    FOLLOW_TRACK_VERIFY_THRESHOLD,
+    FOLLOW_ANTI_CONFUSION_MARGIN,
+    FOLLOW_SEARCH_STEP_DEG,
+    FOLLOW_SEARCH_TURN_SPEED,
+    FOLLOW_SEARCH_MAX_STEPS,
+    FOLLOW_SEARCH_INTERVAL_S,
 )
 from car.perception.detector import Detector
 from car.perception.sensors import SensorManager
@@ -293,6 +301,17 @@ class SystemState:
         self.motor: Optional[MotorController] = None
         self.streaming_output: Optional['StreamingOutput'] = None
 
+        # Follow-Me & Re-ID State
+        self.follow_state: str = "WAIT_CALIBRATION"
+        self.pending_select_point: Optional[Tuple[float, float]] = None
+        self.pending_calibrate_center: bool = False
+        self.pending_reset_target: bool = False
+        self.target_bbox: Optional[Tuple[int, int, int, int]] = None
+        self.target_similarity: float = 0.0
+        self.calibration_progress: float = 0.0
+        self.last_seen_side: str = "CENTER"
+        self.non_target_persons: list = []
+
 
 # =============================================================================
 # Headless HTTP Live Stream with Diagnostic HUD
@@ -414,6 +433,7 @@ PAGE = """<!DOCTYPE html>
   <header id="topbar">
     <div style="font-weight:700; font-size:0.85rem">🏎️ MPSTME Capstone — Pi 5 ↔ Uno</div>
     <div class="badge badge-mode" id="mode-badge" onclick="toggleControlMode()" style="cursor:pointer" title="Click to toggle Mode (C)">MODE: AUTONOMOUS 🤖</div>
+    <div class="badge badge-invert-off" id="target-badge" onclick="calibrateTarget()" style="cursor:pointer" title="Click to Calibrate (L)">TARGET: UNCALIBRATED 🎯</div>
     <div class="badge badge-invert-off" id="override-badge" onclick="toggleOverride()" style="cursor:pointer" title="Toggle Manual Obstacle Override (O)">OVERRIDE: OFF 🛡️</div>
     <div class="badge badge-daylight" id="awb-badge">AWB: DAYLIGHT ☀️</div>
     <div class="badge badge-motors-on" id="motors-badge">MOTORS: ACTIVE ⚡</div>
@@ -423,7 +443,10 @@ PAGE = """<!DOCTYPE html>
 
   <div class="controls-dock" id="dock">
     <button id="btn-motors" class="btn-success" onclick="toggleMotors()">🛑 Disable Motors (M)</button>
-    <button id="btn-mode" onclick="toggleControlMode()">🎮 Manual (C)</button>
+    <button id="btn-mode" onclick="toggleControlMode()">🎮 Mode: Toggle (C)</button>
+    <button id="btn-follow" onclick="setMode('follow')">🎯 Follow Mode</button>
+    <button id="btn-cal-target" class="btn-active" onclick="calibrateTarget()">🎯 Calibrate Target (L)</button>
+    <button id="btn-reset-target" onclick="resetTarget()">🔄 Reset Target</button>
     <button id="btn-override" onclick="toggleOverride()">🔓 Override Obstacles (O)</button>
     <button id="btn-remote" onclick="toggleRemoteWidget()">🕹️ D-Pad</button>
     <button id="btn-invert" onclick="toggleInvertMotors()">🔄 Polarity: Normal (I)</button>
@@ -434,7 +457,7 @@ PAGE = """<!DOCTYPE html>
     <button onclick="emergencyStop()" class="btn-danger">🛑 E-STOP (Space)</button>
     <button onclick="testPulse()">🏎️ Test Pulse</button>
     <button onclick="testTurn(45)">🔄 Test Turn</button>
-    <button onclick="toggleFullscreen()">⛶ Fullscreen (F)</button>
+    <button onclick="toggleFullscreen()">⛶ Fullscreen</button>
     <button onclick="openRef()">📷 Ref daylight.jpg</button>
     <button onclick="toggleDock()" style="padding:7px 10px">👁️</button>
   </div>
@@ -508,6 +531,21 @@ PAGE = """<!DOCTYPE html>
       });
     }
 
+    function setMode(mode) {
+      fetch('/set_mode?mode=' + mode).then(r => r.json()).then(d => {
+        currentControlMode = d.control_mode || d.mode;
+        updateModeBadge(currentControlMode);
+      });
+    }
+
+    function calibrateTarget() {
+      fetch('/calibrate_target').then(r => r.json());
+    }
+
+    function resetTarget() {
+      fetch('/reset_target').then(r => r.json());
+    }
+
     function updateModeBadge(mode) {
       const badge = document.getElementById('mode-badge');
       const btn = document.getElementById('btn-mode');
@@ -517,12 +555,47 @@ PAGE = """<!DOCTYPE html>
         badge.className = 'badge badge-motors-on';
         if (btn) { btn.innerText = '🤖 Mode: Auto (C)'; btn.className = 'btn-active'; }
         if (panel) panel.classList.remove('hidden');
+      } else if (mode === 'follow') {
+        badge.innerText = 'MODE: FOLLOW 🎯';
+        badge.className = 'badge badge-invert-on';
+        if (btn) { btn.innerText = '🎮 Mode: Manual (C)'; btn.className = ''; }
+        if (panel) panel.classList.add('hidden');
       } else {
         badge.innerText = 'MODE: AUTONOMOUS 🤖';
         badge.className = 'badge badge-mode';
         if (btn) { btn.innerText = '🎮 Mode: Manual (C)'; btn.className = ''; }
+        if (panel) panel.classList.add('hidden');
       }
     }
+
+    window.addEventListener('load', () => {
+      const streamImg = document.getElementById('stream');
+      if (streamImg) {
+        streamImg.addEventListener('click', (e) => {
+          const rect = streamImg.getBoundingClientRect();
+          const imgAspect = 640.0 / 480.0;
+          const elemAspect = rect.width / rect.height;
+          let renderedW = rect.width;
+          let renderedH = rect.height;
+          let offsetX = 0;
+          let offsetY = 0;
+          if (elemAspect > imgAspect) {
+            renderedW = rect.height * imgAspect;
+            offsetX = (rect.width - renderedW) / 2.0;
+          } else {
+            renderedH = rect.width / imgAspect;
+            offsetY = (rect.height - renderedH) / 2.0;
+          }
+          const clickX = e.clientX - rect.left - offsetX;
+          const clickY = e.clientY - rect.top - offsetY;
+          if (clickX >= 0 && clickX <= renderedW && clickY >= 0 && clickY <= renderedH) {
+            const normX = Math.max(0.0, Math.min(1.0, clickX / renderedW));
+            const normY = Math.max(0.0, Math.min(1.0, clickY / renderedH));
+            fetch('/select_target?x=' + normX.toFixed(4) + '&y=' + normY.toFixed(4)).then(r => r.json());
+          }
+        });
+      }
+    });
 
     function toggleRemoteWidget() {
       const panel = document.getElementById('remote-panel');
@@ -675,6 +748,24 @@ PAGE = """<!DOCTYPE html>
             sb.style.color = 'var(--success)';
           }
         }
+        if (d.follow_state) {
+          const tb = document.getElementById('target-badge');
+          if (tb) {
+            if (d.follow_state === 'TRACKING') {
+              tb.innerText = `🎯 LOCKED (${(d.target_similarity || 0).toFixed(2)}) [${d.last_seen_side || 'CTR'}]`;
+              tb.className = 'badge badge-motors-on';
+            } else if (d.follow_state === 'CALIBRATING') {
+              tb.innerText = `⏳ CALIBRATING (${Math.round((d.calibration_progress || 0) * 100)}%)`;
+              tb.className = 'badge badge-daylight';
+            } else if (d.follow_state === 'RE_ACQUIRE') {
+              tb.innerText = `🔍 SEARCHING [${d.last_seen_side || 'CTR'}]`;
+              tb.className = 'badge badge-us';
+            } else {
+              tb.innerText = 'TARGET: CLICK TO SELECT 🎯';
+              tb.className = 'badge badge-invert-off';
+            }
+          }
+        }
         if (d.control_mode) {
           currentControlMode = d.control_mode;
           updateModeBadge(d.control_mode);
@@ -694,6 +785,7 @@ PAGE = """<!DOCTYPE html>
       if (k === 'm') toggleMotors();
       if (k === 'i') toggleInvertMotors();
       if (k === 'c') toggleControlMode();
+      if (k === 'l') calibrateTarget();
       if (k === 'o') toggleOverride();
       if (k === 'r') toggleRemoteWidget();
       if (k === 't') testPulse();
@@ -787,6 +879,11 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                 manual_action = sys_state.manual_action
                 awb = sys_state.current_awb
                 fps = round(sys_state.fps, 1)
+                follow_state = sys_state.follow_state
+                target_bbox = sys_state.target_bbox
+                target_similarity = round(sys_state.target_similarity, 2)
+                calibration_progress = round(sys_state.calibration_progress, 2)
+                last_seen_side = sys_state.last_seen_side
             data = {
                 "sonar": sonar,
                 "state": state_str,
@@ -803,6 +900,11 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                 "manual_action": manual_action,
                 "awb": awb,
                 "fps": fps,
+                "follow_state": follow_state,
+                "target_bbox": target_bbox,
+                "target_similarity": target_similarity,
+                "calibration_progress": calibration_progress,
+                "last_seen_side": last_seen_side,
             }
             resp = json.dumps(data).encode('utf-8')
             self.send_response(200)
@@ -817,11 +919,6 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                 enabled = sys_state.manual_override_obstacles
             print(f"🔓 Manual obstacle override: {'ENABLED (Driver Full Authority)' if enabled else 'DISABLED (Safety Auto-Brake)'}")
             resp = json.dumps({"status": "ok", "override": enabled}).encode('utf-8')
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(resp)))
-            self.end_headers()
-            self.wfile.write(resp)
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(resp)))
@@ -918,12 +1015,92 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == '/toggle_control_mode':
             with sys_state.lock:
-                sys_state.control_mode = "manual" if sys_state.control_mode == "autonomous" else "autonomous"
+                # Cycle: autonomous -> follow -> manual -> autonomous
+                if sys_state.control_mode == "autonomous":
+                    sys_state.control_mode = "follow"
+                    sys_state.current_mode = "follow"
+                    if sys_state.follow_state not in ("TRACKING", "CALIBRATING"):
+                        sys_state.follow_state = "WAIT_CALIBRATION"
+                elif sys_state.control_mode == "follow":
+                    sys_state.control_mode = "manual"
+                else:
+                    sys_state.control_mode = "autonomous"
+                    sys_state.current_mode = "autonomous"
                 mode_now = sys_state.control_mode
             if mode_now == "manual" and sys_state.motor:
                 sys_state.motor.stop()
             print(f"🎮 Control mode toggled: {mode_now.upper()}")
-            resp = json.dumps({"status": "ok", "control_mode": mode_now}).encode('utf-8')
+            resp = json.dumps({"status": "ok", "control_mode": mode_now, "mode": mode_now}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif path == '/set_mode':
+            new_mode = query.get('mode', ['autonomous'])[0].lower().strip()
+            with sys_state.lock:
+                if new_mode == "manual":
+                    sys_state.control_mode = "manual"
+                elif new_mode in ("autonomous", "follow"):
+                    sys_state.control_mode = new_mode
+                    sys_state.current_mode = new_mode
+                    if new_mode == "follow" and sys_state.follow_state not in ("TRACKING", "CALIBRATING"):
+                        sys_state.follow_state = "WAIT_CALIBRATION"
+                mode_now = sys_state.control_mode
+            if mode_now == "manual" and sys_state.motor:
+                sys_state.motor.stop()
+            print(f"🔄 Mode switched to: {mode_now.upper()}")
+            resp = json.dumps({"status": "ok", "mode": mode_now, "control_mode": mode_now}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif path == '/select_target':
+            try:
+                nx = float(query.get('x', [0.5])[0])
+                ny = float(query.get('y', [0.5])[0])
+            except (ValueError, TypeError):
+                nx, ny = 0.5, 0.5
+            with sys_state.lock:
+                sys_state.current_mode = "follow"
+                sys_state.control_mode = "follow"
+                sys_state.pending_select_point = (nx, ny)
+            print(f"🎯 Target select queued at ({nx:.2f}, {ny:.2f})")
+            resp = json.dumps({"status": "ok", "point": [nx, ny]}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif path == '/calibrate_target':
+            with sys_state.lock:
+                sys_state.current_mode = "follow"
+                sys_state.control_mode = "follow"
+                sys_state.pending_calibrate_center = True
+            print("🎯 Calibrate target queued")
+            resp = json.dumps({"status": "ok"}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif path == '/reset_target':
+            with sys_state.lock:
+                sys_state.pending_reset_target = True
+                sys_state.follow_state = "WAIT_CALIBRATION"
+                sys_state.target_bbox = None
+                sys_state.target_similarity = 0.0
+                sys_state.calibration_progress = 0.0
+                sys_state.last_seen_side = "CENTER"
+            if sys_state.motor:
+                sys_state.motor.stop()
+            print("🔄 Target profile reset queued")
+            resp = json.dumps({"status": "ok"}).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(resp)))
@@ -1065,6 +1242,12 @@ def draw_hud(
     motors_enabled: bool,
     invert_motors: bool,
     pi_latched: bool,
+    target_bbox: Optional[Tuple[int, int, int, int]] = None,
+    target_similarity: float = 0.0,
+    calibration_progress: float = 0.0,
+    last_seen_side: str = "CENTER",
+    follow_state: str = "WAIT_CALIBRATION",
+    non_target_persons: Optional[list] = None,
 ) -> np.ndarray:
     """Renders active bounding boxes, zone markers, and live diagnostic telemetry overlay."""
     if frame is None or getattr(frame, "size", 0) == 0:
@@ -1101,7 +1284,13 @@ def draw_hud(
     cv2.putText(annotated, "C", (int(w * 0.48), h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
     cv2.putText(annotated, "R", (max(10, w - 20), h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
 
-    # ── 2. Render Detections (YOLO Obstacles & Potholes) ──────────────────────
+    # ── 2. Render Detections (YOLO Obstacles, Potholes & Bystanders) ─────────
+    non_target_set = set()
+    if non_target_persons:
+        for ntp in non_target_persons:
+            if isinstance(ntp, dict) and ntp.get("bbox"):
+                non_target_set.add(tuple(ntp["bbox"]))
+
     for det in (detections or []):
         if not isinstance(det, dict):
             continue
@@ -1113,17 +1302,56 @@ def draw_hud(
         except (ValueError, TypeError):
             continue
         is_pothole = det.get("type") == "negative" or "pothole" in det.get("class_name", "").lower()
+        is_bystander = tuple(bbox) in non_target_set or (det.get("class_name") == "person" and non_target_persons and det in non_target_persons)
 
-        color = (0, 69, 255) if is_pothole else (0, 255, 0)
+        if is_bystander:
+            color = (0, 140, 255)  # Orange for Bystander Obstacles
+            lbl = "BYSTANDER [OBSTACLE]"
+        elif is_pothole:
+            color = (0, 69, 255)   # Red/Orange for Potholes
+            lbl = det.get("class_name", "pothole")
+        else:
+            color = (0, 255, 0)    # Green for General Obstacles
+            lbl = det.get("class_name", "obstacle")
+
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thick)
-
-        lbl = det.get("class_name", "obstacle")
         conf = det.get("confidence", 0.0)
         text = f"{lbl.upper()} {conf:.2f}"
         cv2.putText(annotated, text, (max(0, x1), max(12, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, box_scale, color, thick)
 
-    # ── 3. Diagnostic HUD Text Overlays ──────────────────────────────────────
-    # Header: FPS, Mode, AWB
+    # ── 3. Render Target Lock Box with Corner Reticles ────────────────────────
+    if target_bbox is not None and follow_state in ("TRACKING", "CALIBRATING"):
+        tx, ty, tw, th = [int(v) for v in target_bbox]
+        tx2, ty2 = tx + tw, ty + th
+        tgt_color = (0, 215, 255)  # Gold
+        cv2.rectangle(annotated, (tx, ty), (tx2, ty2), tgt_color, thick)
+
+        # Reticles on 4 corners
+        rlen = max(6, min(22, int(min(tw, th) * 0.22)))
+        cv2.line(annotated, (tx, ty), (tx + rlen, ty), (255, 255, 0), thick + 1)
+        cv2.line(annotated, (tx, ty), (tx, ty + rlen), (255, 255, 0), thick + 1)
+        cv2.line(annotated, (tx2, ty), (tx2 - rlen, ty), (255, 255, 0), thick + 1)
+        cv2.line(annotated, (tx2, ty), (tx2, ty + rlen), (255, 255, 0), thick + 1)
+        cv2.line(annotated, (tx, ty2), (tx + rlen, ty2), (255, 255, 0), thick + 1)
+        cv2.line(annotated, (tx, ty2), (tx, ty2 - rlen), (255, 255, 0), thick + 1)
+        cv2.line(annotated, (tx2, ty2), (tx2 - rlen, ty2), (255, 255, 0), thick + 1)
+        cv2.line(annotated, (tx2, ty2), (tx2, ty2 - rlen), (255, 255, 0), thick + 1)
+
+        if follow_state == "CALIBRATING":
+            bar_w = max(50, tw)
+            bar_h = 6
+            bx = tx
+            by = max(14, ty - 14)
+            cv2.rectangle(annotated, (bx, by), (bx + bar_w, by + bar_h), (40, 40, 40), -1)
+            fill_w = int(bar_w * max(0.0, min(1.0, calibration_progress)))
+            cv2.rectangle(annotated, (bx, by), (bx + fill_w, by + bar_h), (0, 255, 0), -1)
+            cal_lbl = f"CALIBRATING ({int(calibration_progress * FOLLOW_CALIBRATION_FRAMES)}/{FOLLOW_CALIBRATION_FRAMES})"
+            cv2.putText(annotated, cal_lbl, (bx, max(12, by - 4)), cv2.FONT_HERSHEY_SIMPLEX, box_scale, (0, 255, 255), thick)
+        else:
+            tgt_lbl = f"TARGET (SIM: {target_similarity:.2f}) [{last_seen_side}]"
+            cv2.putText(annotated, tgt_lbl, (max(0, tx), max(12, ty - 6)), cv2.FONT_HERSHEY_SIMPLEX, box_scale, (0, 255, 255), thick)
+
+    # ── 4. Diagnostic HUD Text Overlays ──────────────────────────────────────
     head_str = f"{fps:.1f} FPS | {mode.upper()} | {awb_mode.upper()} AWB"
     cv2.putText(annotated, head_str, (10, 20 if is_hd else 15),
                 cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 255, 255), thick)
@@ -1134,6 +1362,12 @@ def draw_hud(
         act_color = (0, 0, 255)
     cv2.putText(annotated, f"Action: {action_label}", (10, 42 if is_hd else 30),
                 cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, act_color, thick)
+
+    # Directional Search Banner when in RE_ACQUIRE
+    if follow_state == "RE_ACQUIRE":
+        search_str = f"RE_ACQUIRE: SEARCHING {last_seen_side}"
+        cv2.putText(annotated, search_str, (10, 64 if is_hd else 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 165, 255), thick)
 
     # Ultrasonic telemetry display
     us_l = latest_sonar.get("left", 999.0)
@@ -1377,10 +1611,11 @@ def _run_follow(
     motors_enabled: bool,
     throttler: CommandThrottler,
     fresh_inference: bool = True,
+    sys_state: Optional[SystemState] = None,
 ) -> Tuple[str, bool, str]:
     """
     One loop iteration of follow-me mode.
-    Priority: Tier 1 non-target obstacle stop > PID person steering.
+    Priority: Tier 1 non-target obstacle stop > PID person steering + active obstacle bypass.
 
     Returns:
       (updated_follow_state, updated_pi_latched, action_label)
@@ -1389,84 +1624,156 @@ def _run_follow(
     us = sensors.read_ultrasonic()
     arduino_state = (motor.latest_state or "UNKNOWN").upper()
 
-    persons = [d for d in detections if isinstance(d, dict) and d.get("class_name") == "person"]
+    # ── Handle Web UI / Pending Triggers ─────────────────────────────────────
+    if sys_state and getattr(sys_state, "pending_reset_target", False):
+        tracker.reset()
+        follow_state = "WAIT_CALIBRATION"
+        sys_state.pending_reset_target = False
+        sys_state.target_bbox = None
+        sys_state.target_similarity = 0.0
+        sys_state.calibration_progress = 0.0
+        sys_state.last_seen_side = "CENTER"
+        sys_state.follow_state = follow_state
+        if motors_enabled:
+            motor.stop()
+        return follow_state, pi_latched, "🔄 TARGET RESET: Waiting for Selection"
+
+    persons = [d for d in (detections or []) if isinstance(d, dict) and d.get("class_name") == "person"]
     non_person_obstacles = [
-        d for d in detections
+        d for d in (detections or [])
         if isinstance(d, dict) and d.get("class_name") != "person" and d.get("type") != "negative"
     ]
-    pothole_obstacles = [d for d in detections if isinstance(d, dict) and d.get("type") == "negative"]
-    all_obstacles = non_person_obstacles + pothole_obstacles
+    pothole_obstacles = [d for d in (detections or []) if isinstance(d, dict) and d.get("type") == "negative"]
 
-    # Evaluate obstacle path ahead
-    obs_action, obs_slow = _check_obstacle_ahead(all_obstacles, frame_w, frame_h) if all_obstacles else ("CLEAR", None)
-
-    # ── 1. Non-target obstacle check (Tier 1 Pi Camera Latch) ─────────────────
-    if obs_action == "STOP":
-        if not pi_latched:
-            print("🛑 PI_STOP: Non-target obstacle ahead (camera)")
-            motor.pi_stop()
-            pi_latched = True
-            throttler.record_other("PI_STOP")
-            return follow_state, pi_latched, "🛑 PI_STOP: Non-Target Obstacle"
+    if sys_state and getattr(sys_state, "pending_select_point", None) is not None:
+        nx, ny = sys_state.pending_select_point
+        sys_state.pending_select_point = None
+        px, py = nx * frame_w, ny * frame_h
+        best_p = None
+        best_dist = float('inf')
+        for p in persons:
+            x1, y1, x2, y2 = [int(v) for v in p["bbox"]]
+            if x1 <= px <= x2 and y1 <= py <= y2:
+                best_p = p
+                break
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            dist = math.hypot(cx - px, cy - py)
+            if dist < best_dist and dist < (0.25 * frame_w):
+                best_dist = dist
+                best_p = p
+        if best_p:
+            x1, y1, x2, y2 = [int(v) for v in best_p["bbox"]]
+            bbox = (x1, y1, x2 - x1, y2 - y1)
+            tracker.start_calibration(frame, bbox)
+            follow_state = "CALIBRATING"
+            sys_state.follow_state = follow_state
+            sys_state.target_bbox = bbox
+            sys_state.calibration_progress = tracker.calibration_progress
+            if motors_enabled:
+                motor.stop()
+            return follow_state, pi_latched, "🎯 CALIBRATING: Target Selected by Click"
         else:
-            throttler.record_other("PI_STOPPED")
-            return follow_state, pi_latched, "🛑 PI_STOPPED (Non-Target Obstacle)"
-    elif all_obstacles and not pi_latched:
-        scores = compute_zone_scores(all_obstacles, frame_w, frame_h)
-        decision = decide_avoidance(scores)
-        if decision in ("LEFT", "RIGHT"):
-            if throttler.should_send_avoid_hint(decision):
-                motor.pi_avoid(decision)
-                throttler.record_avoid_hint(decision)
+            return follow_state, pi_latched, "⚠️ SELECT FAILED: No Person at Click Position"
 
-    # ── 2. Handle Existing Latch Release / Holding ────────────────────────────
-    if pi_latched:
-        if obs_action == "CLEAR" and not us_blocked:
-            if follow_state == "RE_ACQUIRE":
-                # Path is clear; allow RE_ACQUIRE state machine below to search candidates,
-                # re-lock onto the person, and unlatch when target is found!
-                pass
-            else:
-                print("✅ PI_GO: Path clear, releasing follow latch.")
-                motor.pi_go()
-                pi_latched = False
+    if sys_state and getattr(sys_state, "pending_calibrate_center", False):
+        sys_state.pending_calibrate_center = False
+        if persons:
+            best_p = min(
+                persons,
+                key=lambda p: abs((p["bbox"][0] + p["bbox"][2]) / 2.0 - frame_w / 2.0)
+            )
+            x1, y1, x2, y2 = [int(v) for v in best_p["bbox"]]
+            bbox = (x1, y1, x2 - x1, y2 - y1)
+            tracker.start_calibration(frame, bbox)
+            follow_state = "CALIBRATING"
+            sys_state.follow_state = follow_state
+            sys_state.target_bbox = bbox
+            sys_state.calibration_progress = tracker.calibration_progress
+            if motors_enabled:
+                motor.stop()
+            return follow_state, pi_latched, "🎯 CALIBRATING: Center Target Selected"
         else:
-            throttler.record_other("PI_STOPPED")
-            return follow_state, pi_latched, "🛑 PI_STOPPED (Follow Latch Active)"
+            return follow_state, pi_latched, "⚠️ CALIBRATE FAILED: No Person in View"
 
-    # ── 3. Respect Arduino Autonomous Reflex States ───────────────────────────
+    # ── Respect Arduino Autonomous States ────────────────────────────────────
     if arduino_state in ("AVOIDING", "STATE_AVOIDING", "CLIFF_REVERSING", "STATE_CLIFF_REVERSING"):
         throttler.record_other(arduino_state)
         return follow_state, pi_latched, f"🔀 ARDUINO {arduino_state} (Yielding)"
 
-    if arduino_state in ("CLIFF_STOPPED", "STATE_CLIFF_STOPPED"):
-        throttler.record_other(arduino_state)
-        if obs_action != "STOP" and not us_blocked and is_valid_us(us.get("left")) and is_valid_us(us.get("right")):
-            print("✅ PI_GO: Cliff drop-off cleared, releasing latch.")
-            motor.pi_go()
-            return follow_state, False, "✅ PI_GO: Cliff Cleared"
-        return follow_state, pi_latched, "⚠️ CLIFF_STOPPED (Latched Drop-Off)"
-
-    if arduino_state in ("PI_STOPPED", "STATE_PI_STOPPED"):
-        throttler.record_other(arduino_state)
-        if obs_action == "CLEAR" and not us_blocked:
-            if follow_state == "RE_ACQUIRE":
-                pass
+    # ── Non-Target Obstacle Check for Pre-Tracking States ─────────────────────
+    if follow_state in ("WAIT_CALIBRATION", "CALIBRATING", "LOCK_ON"):
+        pre_obstacles = non_person_obstacles + pothole_obstacles
+        obs_action, _ = _check_obstacle_ahead(pre_obstacles, frame_w, frame_h) if pre_obstacles else ("CLEAR", None)
+        if obs_action == "STOP":
+            if not pi_latched:
+                print("🛑 PI_STOP: Non-target obstacle ahead (camera)")
+                motor.pi_stop()
+                pi_latched = True
+                throttler.record_other("PI_STOP")
+                return follow_state, pi_latched, "🛑 PI_STOP: Non-Target Obstacle"
             else:
+                throttler.record_other("PI_STOPPED")
+                return follow_state, pi_latched, "🛑 PI_STOPPED (Non-Target Obstacle)"
+
+        if pi_latched:
+            if obs_action == "CLEAR" and not us_blocked:
+                print("✅ PI_GO: Path clear, releasing follow latch.")
                 motor.pi_go()
+                pi_latched = False
+            else:
+                throttler.record_other("PI_STOPPED")
+                return follow_state, pi_latched, "🛑 PI_STOPPED (Follow Latch Active)"
+
+    # ── State Machine ────────────────────────────────────────────────────────
+
+    # 1. WAIT_CALIBRATION
+    if follow_state == "WAIT_CALIBRATION":
+        is_cal = getattr(tracker, "is_calibrated", True)
+        is_trk = getattr(tracker, "is_tracking", False)
+        if is_cal and is_trk:
+            follow_state = "TRACKING"
+            if sys_state:
+                sys_state.follow_state = "TRACKING"
         else:
-            pi_latched = True
-            return follow_state, pi_latched, "🛑 PI_STOPPED (Arduino Latched)"
+            if motors_enabled:
+                motor.stop()
+            throttler.record_other("STOP")
+            return follow_state, pi_latched, "🎯 FOLLOW: Click Person or Calibrate"
 
-    # ── 4. Critical Ultrasonic auto-brake ────────────────────────────────────
-    if us_blocked:
+    # 2. CALIBRATING
+    if follow_state == "CALIBRATING":
+        if motors_enabled:
+            motor.stop()
         throttler.record_other("STOP")
-        motor.stop()
-        return follow_state, pi_latched, "🛑 US AUTO-BRAKE (< 25cm)"
+        done = tracker.step_calibration(frame, persons) if hasattr(tracker, "step_calibration") else True
+        cal_prog = getattr(tracker, "calibration_progress", 1.0)
+        is_cal = getattr(tracker, "is_calibrating", False)
+        is_locked = getattr(tracker, "is_calibrated", False)
 
-    action_label = f"FOLLOW [{follow_state}]"
+        if not is_cal and not is_locked:
+            # Person lost during calibration -> abort and wait for new selection
+            follow_state = "WAIT_CALIBRATION"
+            if sys_state:
+                sys_state.follow_state = "WAIT_CALIBRATION"
+                sys_state.target_bbox = None
+                sys_state.calibration_progress = 0.0
+            return follow_state, pi_latched, "⚠️ CALIBRATION ABORTED: Person Lost"
 
-    # ── 5. Follow-me State Machine: LOCK_ON -> TRACKING -> RE_ACQUIRE ────────
+        if sys_state:
+            sys_state.calibration_progress = cal_prog
+            sys_state.target_bbox = getattr(tracker, "bbox", None)
+            sys_state.last_seen_side = getattr(tracker, "last_seen_side", "CENTER")
+        if done:
+            follow_state = "TRACKING"
+            if sys_state:
+                sys_state.follow_state = "TRACKING"
+            action_label = "🎯 TARGET LOCKED (Calibration Complete)"
+        else:
+            frames_count = getattr(tracker, "_total_calibration_frames", FOLLOW_CALIBRATION_FRAMES)
+            action_label = f"🎯 CALIBRATING CLOTHES & FIGURE ({int(cal_prog * frames_count)}/{frames_count})"
+        return follow_state, pi_latched, action_label
+
+    # 3. LOCK_ON (Legacy auto-lock onto largest person)
     if follow_state == "LOCK_ON":
         if persons:
             best = max(
@@ -1475,94 +1782,243 @@ def _run_follow(
             )
             x1, y1, x2, y2 = [int(v) for v in best["bbox"]]
             bbox = (x1, y1, x2 - x1, y2 - y1)
-            if tracker.lock_on(frame, bbox):
-                print("🎯 Target locked. Entering TRACKING.")
-                follow_state = "TRACKING"
-                action_label = "🎯 TARGET LOCKED"
+            tracker.lock_on(frame, bbox)
+            follow_state = "TRACKING"
+            if sys_state:
+                sys_state.follow_state = "TRACKING"
+                sys_state.target_bbox = bbox
+            action_label = "🎯 TARGET LOCKED"
         else:
             if motors_enabled:
                 motor.stop()
             throttler.record_other("STOP")
             action_label = "🔍 SCANNING FOR TARGET (Owner)"
+        return follow_state, pi_latched, action_label
 
-    elif follow_state == "TRACKING":
-        success, bbox = tracker.update(frame)
-        if success and bbox is not None:
-            x, y, w, h = bbox
-            center_x = x + w / 2.0
-            bbox_h_frac = h / max(frame_h, 1)
-
-            pid.update(center_x)
-            angle = -int(pid.output)
-            angle = max(-45, min(45, angle))
-
-            if bbox_h_frac > FOLLOW_TOO_CLOSE:
-                if motors_enabled:
-                    motor.stop()
-                throttler.record_other("STOP")
-                action_label = "🎯 TARGET TOO CLOSE (Holding)"
-            elif bbox_h_frac > FOLLOW_IDEAL_MIN:
-                spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_CRUISE_SPEED
-                action_label = f"🎯 FOLLOWING (Cruise PWM {spd}, Steer {angle}°)"
-                if motors_enabled:
-                    if abs(angle) < 5:
-                        if throttler.should_send_drive(spd):
-                            motor.drive(spd, throttler.drive_duration_ms)
-                            throttler.record_drive(spd)
-                    else:
-                        if throttler.should_send_turn(angle, spd):
-                            motor.turn(angle, speed=spd)
-                            throttler.record_turn(angle, spd)
-                else:
-                    action_label = "⏸️ BENCH SAFE: FOLLOW CRUISE (Suppressed)"
-            elif bbox_h_frac > FOLLOW_GETTING_FAR:
-                spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
-                action_label = f"🎯 FOLLOWING (Fast PWM {spd}, Steer {angle}°)"
-                if motors_enabled:
-                    if abs(angle) < 5:
-                        if throttler.should_send_drive(spd):
-                            motor.drive(spd, throttler.drive_duration_ms)
-                            throttler.record_drive(spd)
-                    else:
-                        if throttler.should_send_turn(angle, spd):
-                            motor.turn(angle, speed=spd)
-                            throttler.record_turn(angle, spd)
-                else:
-                    action_label = "⏸️ BENCH SAFE: FOLLOW FAST (Suppressed)"
-            else:
-                spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
-                action_label = f"🎯 TARGET FAR (PWM {spd}, Steer {angle}°)"
-                if motors_enabled:
-                    if abs(angle) < 5:
-                        if throttler.should_send_drive(spd):
-                            motor.drive(spd, throttler.drive_duration_ms)
-                            throttler.record_drive(spd)
-                    else:
-                        if throttler.should_send_turn(angle, spd):
-                            motor.turn(angle, speed=spd)
-                            throttler.record_turn(angle, spd)
-                else:
-                    action_label = "⏸️ BENCH SAFE: TARGET FAR (Suppressed)"
+    # 4. TRACKING
+    if follow_state == "TRACKING":
+        if hasattr(tracker, "update_with_detections"):
+            try:
+                is_tracking, tgt_box, target_det, non_target_persons, sim_score = tracker.update_with_detections(
+                    frame, persons, fresh_inference=fresh_inference
+                )
+            except TypeError:
+                is_tracking, tgt_box, target_det, non_target_persons, sim_score = tracker.update_with_detections(
+                    frame, persons
+                )
         else:
+            is_tracking, tgt_box = tracker.update(frame)
+            target_det = None
+            non_target_persons = persons
+            sim_score = 1.0 if is_tracking else 0.0
+
+        if sys_state:
+            sys_state.target_bbox = tgt_box
+            sys_state.target_similarity = sim_score
+            sys_state.last_seen_side = getattr(tracker, "last_seen_side", "CENTER")
+            sys_state.non_target_persons = non_target_persons
+
+        if not is_tracking or tgt_box is None:
             print("🤷 Tracker lost target → RE_ACQUIRE.")
             motor.pi_stop()
             pi_latched = True
             throttler.record_other("PI_STOP")
             follow_state = "RE_ACQUIRE"
-            action_label = "⚠️ TARGET LOST: Re-acquiring"
+            if sys_state:
+                sys_state.follow_state = "RE_ACQUIRE"
+            last_side = getattr(tracker, "last_seen_side", "CENTER")
+            return follow_state, pi_latched, f"⚠️ TARGET LOST: Re-acquiring (Last: {last_side})"
 
-    elif follow_state == "RE_ACQUIRE":
-        if persons:
-            if tracker.reacquire(frame, persons):
-                print("🎯 Target re-identified! Resuming TRACKING.")
+        # Non-target persons are treated as obstacles!
+        all_obstacles = non_person_obstacles + pothole_obstacles + non_target_persons
+
+        # Evaluate obstacle path ahead (Tier 1 Pi Camera Latch)
+        obs_action, obs_slow = _check_obstacle_ahead(all_obstacles, frame_w, frame_h) if all_obstacles else ("CLEAR", None)
+        if obs_action == "STOP":
+            if not pi_latched:
+                print("🛑 PI_STOP: Non-target obstacle ahead (camera)")
+                motor.pi_stop()
+                pi_latched = True
+                throttler.record_other("PI_STOP")
+                return follow_state, pi_latched, "🛑 PI_STOP: Non-Target Obstacle"
+            else:
+                throttler.record_other("PI_STOPPED")
+                return follow_state, pi_latched, "🛑 PI_STOPPED (Non-Target Obstacle)"
+
+        # Handle Existing Latch Release
+        if pi_latched:
+            if obs_action == "CLEAR" and not us_blocked:
+                print("✅ PI_GO: Path clear, releasing follow latch.")
                 motor.pi_go()
                 pi_latched = False
-                follow_state = "TRACKING"
-                action_label = "🎯 TARGET RE-IDENTIFIED"
             else:
-                action_label = "🔍 RE-ACQUIRING: Comparing Candidates"
+                throttler.record_other("PI_STOPPED")
+                return follow_state, pi_latched, "🛑 PI_STOPPED (Follow Latch Active)"
+
+        # Respect Arduino autonomous states
+        if arduino_state in ("AVOIDING", "STATE_AVOIDING", "CLIFF_REVERSING", "STATE_CLIFF_REVERSING"):
+            throttler.record_other(arduino_state)
+            return follow_state, pi_latched, f"🔀 ARDUINO {arduino_state} (Yielding)"
+
+        if arduino_state in ("CLIFF_STOPPED", "STATE_CLIFF_STOPPED"):
+            throttler.record_other(arduino_state)
+            if obs_action != "STOP" and not us_blocked and is_valid_us(us.get("left")) and is_valid_us(us.get("right")):
+                print("✅ PI_GO: Cliff drop-off cleared, releasing latch.")
+                motor.pi_go()
+                return follow_state, False, "✅ PI_GO: Cliff Cleared"
+            return follow_state, pi_latched, "⚠️ CLIFF_STOPPED (Latched Drop-Off)"
+
+        if arduino_state in ("PI_STOPPED", "STATE_PI_STOPPED"):
+            throttler.record_other(arduino_state)
+            if obs_action == "CLEAR" and not us_blocked:
+                motor.pi_go()
+            else:
+                pi_latched = True
+                return follow_state, pi_latched, "🛑 PI_STOPPED (Arduino Latched)"
+
+        # Critical Ultrasonic auto-brake
+        if us_blocked:
+            throttler.record_other("STOP")
+            motor.stop()
+            return follow_state, pi_latched, "🛑 US AUTO-BRAKE (< 25cm)"
+
+        # Steering & Follow Speed Modulation
+        x, y, w, h = tgt_box
+        center_x = x + w / 2.0
+        bbox_h_frac = h / max(frame_h, 1)
+
+        pid.update(center_x)
+        angle = -int(pid.output)
+        angle = max(-45, min(45, angle))
+
+        # Active Obstacle Bypass While Following
+        scores = compute_zone_scores(all_obstacles, frame_w, frame_h, sonar=us) if all_obstacles else {}
+        decision = decide_avoidance(scores) if scores else "CLEAR"
+
+        avoid_override = False
+        us_l = us.get("left", 999.0)
+        us_r = us.get("right", 999.0)
+
+        if decision in ("LEFT", "RIGHT"):
+            avoid_override = True
+            angle = -35 if decision == "LEFT" else 35
+            if throttler.should_send_avoid_hint(decision):
+                motor.pi_avoid(decision)
+                throttler.record_avoid_hint(decision)
+        elif is_valid_us(us_l) and us_l < 42.0 and (not is_valid_us(us_r) or us_r > us_l + 10.0):
+            avoid_override = True
+            angle = max(25, angle)
+        elif is_valid_us(us_r) and us_r < 42.0 and (not is_valid_us(us_l) or us_l > us_r + 10.0):
+            avoid_override = True
+            angle = min(-25, angle)
+
+        prefix = "🔀 BYPASS+FOLLOW" if avoid_override else "🎯 FOLLOWING"
+
+        if bbox_h_frac > FOLLOW_TOO_CLOSE:
+            if motors_enabled:
+                motor.stop()
+            throttler.record_other("STOP")
+            action_label = "🎯 TARGET TOO CLOSE (Holding)"
+        elif bbox_h_frac > FOLLOW_IDEAL_MIN:
+            spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_CRUISE_SPEED
+            action_label = f"{prefix} (Cruise PWM {spd}, Steer {angle}°)"
+            if motors_enabled:
+                if abs(angle) < 5:
+                    if throttler.should_send_drive(spd):
+                        motor.drive(spd, throttler.drive_duration_ms)
+                        throttler.record_drive(spd)
+                else:
+                    if throttler.should_send_turn(angle, spd):
+                        motor.turn(angle, speed=spd)
+                        throttler.record_turn(angle, spd)
+            else:
+                action_label = f"⏸️ BENCH SAFE: {prefix} CRUISE (Suppressed)"
+        elif bbox_h_frac > FOLLOW_GETTING_FAR:
+            spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
+            action_label = f"{prefix} (Fast PWM {spd}, Steer {angle}°)"
+            if motors_enabled:
+                if abs(angle) < 5:
+                    if throttler.should_send_drive(spd):
+                        motor.drive(spd, throttler.drive_duration_ms)
+                        throttler.record_drive(spd)
+                else:
+                    if throttler.should_send_turn(angle, spd):
+                        motor.turn(angle, speed=spd)
+                        throttler.record_turn(angle, spd)
+            else:
+                action_label = f"⏸️ BENCH SAFE: {prefix} FAST (Suppressed)"
         else:
-            action_label = "🔍 RE-ACQUIRING: Searching..."
+            spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
+            action_label = f"{prefix} (PWM {spd}, Steer {angle}°)"
+            if motors_enabled:
+                if abs(angle) < 5:
+                    if throttler.should_send_drive(spd):
+                        motor.drive(spd, throttler.drive_duration_ms)
+                        throttler.record_drive(spd)
+                else:
+                    if throttler.should_send_turn(angle, spd):
+                        motor.turn(angle, speed=spd)
+                        throttler.record_turn(angle, spd)
+            else:
+                action_label = f"⏸️ BENCH SAFE: {prefix} FAR (Suppressed)"
+
+        return follow_state, pi_latched, action_label
+
+    # 5. RE_ACQUIRE
+    elif follow_state == "RE_ACQUIRE":
+        if persons and tracker.reacquire(frame, persons):
+            print("🎯 Target re-identified! Resuming TRACKING.")
+            motor.pi_go()
+            pi_latched = False
+            if hasattr(tracker, "reset_search"):
+                tracker.reset_search()
+            follow_state = "TRACKING"
+            if sys_state:
+                sys_state.follow_state = "TRACKING"
+                sys_state.target_bbox = getattr(tracker, "bbox", None)
+            action_label = "🎯 TARGET RE-IDENTIFIED"
+            return follow_state, pi_latched, action_label
+
+        all_obstacles = non_person_obstacles + pothole_obstacles + persons
+        obs_action, _ = _check_obstacle_ahead(all_obstacles, frame_w, frame_h) if all_obstacles else ("CLEAR", None)
+
+        # Stepped directional search turns toward last_seen_side
+        now_mono = time.monotonic()
+        side = getattr(tracker, "last_seen_side", "CENTER")
+        should_step = tracker.should_step_search(now_mono) if hasattr(tracker, "should_step_search") else False
+        search_steps = getattr(tracker, "search_steps_taken", 0)
+
+        if side in ("LEFT", "RIGHT") and should_step:
+            side_dist = us.get("left") if side == "LEFT" else us.get("right")
+            side_clear = (not is_valid_us(side_dist)) or (float(side_dist) > 35.0)
+
+            if side_clear and obs_action != "STOP" and not us_blocked:
+                if pi_latched:
+                    motor.pi_go()
+                    pi_latched = False
+                step_angle = -FOLLOW_SEARCH_STEP_DEG if side == "LEFT" else FOLLOW_SEARCH_STEP_DEG
+                if motors_enabled:
+                    motor.turn(step_angle, speed=FOLLOW_SEARCH_TURN_SPEED)
+                    throttler.record_turn(step_angle, FOLLOW_SEARCH_TURN_SPEED)
+                if hasattr(tracker, "record_search_step"):
+                    tracker.record_search_step(now_mono)
+                search_steps = getattr(tracker, "search_steps_taken", 0)
+                action_label = f"🔍 SEARCHING {side} (Step {search_steps}/{FOLLOW_SEARCH_MAX_STEPS})"
+            else:
+                if motors_enabled:
+                    motor.stop()
+                action_label = f"🔍 SEARCH {side} BLOCKED (Holding)"
+        else:
+            if motors_enabled:
+                motor.stop()
+            if search_steps >= FOLLOW_SEARCH_MAX_STEPS:
+                action_label = f"🔍 SEARCH HOLD (Scanned {side}, awaiting target)"
+            elif persons:
+                action_label = "🔍 RE-ACQUIRING: Comparing Candidates"
+            else:
+                action_label = f"🔍 RE-ACQUIRING: Scanning ({side})"
+
+        return follow_state, pi_latched, action_label
 
     return follow_state, pi_latched, action_label
 
@@ -1771,19 +2227,7 @@ def run_pipeline(
                         man_act = system_state.manual_action
                         man_spd = system_state.manual_speed
                     action_label = f"🎮 MANUAL REMOTE: {man_act} (PWM {man_spd})"
-            elif mode == "autonomous":
-                pi_latched, action_label = _run_autonomous(
-                    motor=motor,
-                    sensors=sensors,
-                    detections=cached_detections,
-                    us_blocked=us_blocked,
-                    frame=frame,
-                    pi_latched=pi_latched,
-                    motors_enabled=system_state.motors_enabled,
-                    throttler=throttler,
-                    fresh_inference=fresh_inference,
-                )
-            else:
+            elif current_ctrl_mode == "follow" or mode == "follow":
                 follow_state, pi_latched, action_label = _run_follow(
                     motor=motor,
                     sensors=sensors,
@@ -1792,7 +2236,21 @@ def run_pipeline(
                     detections=cached_detections,
                     us_blocked=us_blocked,
                     frame=frame,
-                    follow_state=follow_state,
+                    follow_state=system_state.follow_state,
+                    pi_latched=pi_latched,
+                    motors_enabled=system_state.motors_enabled,
+                    throttler=throttler,
+                    fresh_inference=fresh_inference,
+                    sys_state=system_state,
+                )
+                system_state.follow_state = follow_state
+            else:
+                pi_latched, action_label = _run_autonomous(
+                    motor=motor,
+                    sensors=sensors,
+                    detections=cached_detections,
+                    us_blocked=us_blocked,
+                    frame=frame,
                     pi_latched=pi_latched,
                     motors_enabled=system_state.motors_enabled,
                     throttler=throttler,
@@ -1820,10 +2278,16 @@ def run_pipeline(
                     port_name=motor.port,
                     fps=fps,
                     awb_mode=system_state.current_awb,
-                    mode=system_state.control_mode if system_state.control_mode == "manual" else mode,
+                    mode=system_state.control_mode if system_state.control_mode in ("manual", "follow") else mode,
                     motors_enabled=system_state.motors_enabled,
                     invert_motors=system_state.invert_motors,
                     pi_latched=pi_latched,
+                    target_bbox=system_state.target_bbox,
+                    target_similarity=system_state.target_similarity,
+                    calibration_progress=system_state.calibration_progress,
+                    last_seen_side=system_state.last_seen_side,
+                    follow_state=system_state.follow_state,
+                    non_target_persons=system_state.non_target_persons,
                 )
                 ok, jpg = cv2.imencode(".jpg", hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if ok:
