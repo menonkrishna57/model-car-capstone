@@ -41,7 +41,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
-import cv2
+import cv2  
 import numpy as np
 
 from car.perception.config import (
@@ -59,11 +59,23 @@ from car.perception.config import (
     FOLLOW_SEARCH_TURN_SPEED,
     FOLLOW_SEARCH_MAX_STEPS,
     FOLLOW_SEARCH_INTERVAL_S,
+    LANE_ROI_Y_MIN_FRAC,
+    LANE_LOOKAHEAD_Y_FRAC,
+    LANE_DEFAULT_WIDTH_FRAC,
+    LANE_EMA_ALPHA,
+    LANE_MAX_JUMP_FRAC,
+    LANE_LOST_MAX_FRAMES,
+    LANE_CRUISE_SPEED,
+    LANE_CURVE_SPEED,
+    LANE_STEER_DEADBAND_DEG,
+    LANE_MAX_STEER_DEG,
+    LANE_COLOR_MODE,
 )
 from car.perception.detector import Detector
 from car.perception.sensors import SensorManager
 from car.perception.avoidance import compute_zone_scores, decide_avoidance
 from car.perception.tracker import ObjectTracker
+from car.perception.lane_detector import ChartLaneDetector, LaneCurve, LaneDetectionResult
 from car.control.motor_controller import MotorController
 from car.control.navigation import NavigationSystem
 from car.control.pid import PID
@@ -312,6 +324,10 @@ class SystemState:
         self.last_seen_side: str = "CENTER"
         self.non_target_persons: list = []
 
+        # Lane Detection & Following State
+        self.lane_color_mode: str = LANE_COLOR_MODE
+        self.lane_result: Optional[LaneDetectionResult] = None
+
 
 # =============================================================================
 # Headless HTTP Live Stream with Diagnostic HUD
@@ -444,6 +460,8 @@ PAGE = """<!DOCTYPE html>
   <div class="controls-dock" id="dock">
     <button id="btn-motors" class="btn-success" onclick="toggleMotors()">🛑 Disable Motors (M)</button>
     <button id="btn-mode" onclick="toggleControlMode()">🎮 Mode: Toggle (C)</button>
+    <button id="btn-lane" onclick="setMode('lane')">🛣️ Lane Mode</button>
+    <button id="btn-lane-color" onclick="cycleLaneColor()">🎨 Lane: Dark</button>
     <button id="btn-follow" onclick="setMode('follow')">🎯 Follow Mode</button>
     <button id="btn-cal-target" class="btn-active" onclick="calibrateTarget()">🎯 Calibrate Target (L)</button>
     <button id="btn-reset-target" onclick="resetTarget()">🔄 Reset Target</button>
@@ -546,6 +564,20 @@ PAGE = """<!DOCTYPE html>
       fetch('/reset_target').then(r => r.json());
     }
 
+    function cycleLaneColor() {
+      const colors = ['dark', 'yellow', 'blue', 'white'];
+      const btn = document.getElementById('btn-lane-color');
+      let curr = (btn ? btn.getAttribute('data-color') : '') || 'dark';
+      let nextIdx = (colors.indexOf(curr) + 1) % colors.length;
+      let nextCol = colors[nextIdx];
+      fetch('/set_lane_color?color=' + nextCol).then(r => r.json()).then(d => {
+        if (btn) {
+          btn.setAttribute('data-color', d.color);
+          btn.innerText = '🎨 Lane: ' + d.color.toUpperCase();
+        }
+      });
+    }
+
     function updateModeBadge(mode) {
       const badge = document.getElementById('mode-badge');
       const btn = document.getElementById('btn-mode');
@@ -555,6 +587,11 @@ PAGE = """<!DOCTYPE html>
         badge.className = 'badge badge-motors-on';
         if (btn) { btn.innerText = '🤖 Mode: Auto (C)'; btn.className = 'btn-active'; }
         if (panel) panel.classList.remove('hidden');
+      } else if (mode === 'lane') {
+        badge.innerText = 'MODE: LANE 🛣️';
+        badge.className = 'badge badge-motors-on';
+        if (btn) { btn.innerText = '🎯 Mode: Follow (C)'; btn.className = 'btn-active'; }
+        if (panel) panel.classList.add('hidden');
       } else if (mode === 'follow') {
         badge.innerText = 'MODE: FOLLOW 🎯';
         badge.className = 'badge badge-invert-on';
@@ -563,7 +600,7 @@ PAGE = """<!DOCTYPE html>
       } else {
         badge.innerText = 'MODE: AUTONOMOUS 🤖';
         badge.className = 'badge badge-mode';
-        if (btn) { btn.innerText = '🎮 Mode: Manual (C)'; btn.className = ''; }
+        if (btn) { btn.innerText = '🛣️ Mode: Lane (C)'; btn.className = ''; }
         if (panel) panel.classList.add('hidden');
       }
     }
@@ -884,6 +921,11 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                 target_similarity = round(sys_state.target_similarity, 2)
                 calibration_progress = round(sys_state.calibration_progress, 2)
                 last_seen_side = sys_state.last_seen_side
+                lane_res_snap = sys_state.lane_result
+                lane_status = lane_res_snap.status if lane_res_snap else "OFF"
+                lane_offset = round(lane_res_snap.lateral_offset_pct, 1) if lane_res_snap else 0.0
+                lane_steer = round(lane_res_snap.steer_angle_deg, 1) if lane_res_snap else 0.0
+                lane_color = sys_state.lane_color_mode
             data = {
                 "sonar": sonar,
                 "state": state_str,
@@ -905,6 +947,10 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                 "target_similarity": target_similarity,
                 "calibration_progress": calibration_progress,
                 "last_seen_side": last_seen_side,
+                "lane_status": lane_status,
+                "lane_offset": lane_offset,
+                "lane_steer": lane_steer,
+                "lane_color": lane_color,
             }
             resp = json.dumps(data).encode('utf-8')
             self.send_response(200)
@@ -1015,8 +1061,11 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == '/toggle_control_mode':
             with sys_state.lock:
-                # Cycle: autonomous -> follow -> manual -> autonomous
+                # Cycle: autonomous -> lane -> follow -> manual -> autonomous
                 if sys_state.control_mode == "autonomous":
+                    sys_state.control_mode = "lane"
+                    sys_state.current_mode = "lane"
+                elif sys_state.control_mode == "lane":
                     sys_state.control_mode = "follow"
                     sys_state.current_mode = "follow"
                     if sys_state.follow_state not in ("TRACKING", "CALIBRATING"):
@@ -1042,7 +1091,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
             with sys_state.lock:
                 if new_mode == "manual":
                     sys_state.control_mode = "manual"
-                elif new_mode in ("autonomous", "follow"):
+                elif new_mode in ("autonomous", "lane", "follow"):
                     sys_state.control_mode = new_mode
                     sys_state.current_mode = new_mode
                     if new_mode == "follow" and sys_state.follow_state not in ("TRACKING", "CALIBRATING"):
@@ -1052,6 +1101,21 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                 sys_state.motor.stop()
             print(f"🔄 Mode switched to: {mode_now.upper()}")
             resp = json.dumps({"status": "ok", "mode": mode_now, "control_mode": mode_now}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif path == '/set_lane_color':
+            color = query.get('color', ['dark'])[0].lower().strip()
+            if color in ("dark", "yellow", "blue", "white"):
+                with sys_state.lock:
+                    sys_state.lane_color_mode = color
+                    if hasattr(self.server, "lane_detector") and self.server.lane_detector:
+                        self.server.lane_detector.set_color_mode(color)
+            print(f"🎨 Lane color mode set to: {color.upper()}")
+            resp = json.dumps({"status": "ok", "color": color}).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(resp)))
@@ -1248,6 +1312,7 @@ def draw_hud(
     last_seen_side: str = "CENTER",
     follow_state: str = "WAIT_CALIBRATION",
     non_target_persons: Optional[list] = None,
+    lane_result: Optional[LaneDetectionResult] = None,
 ) -> np.ndarray:
     """Renders active bounding boxes, zone markers, and live diagnostic telemetry overlay."""
     if frame is None or getattr(frame, "size", 0) == 0:
@@ -1283,6 +1348,27 @@ def draw_hud(
     cv2.putText(annotated, "L", (10, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
     cv2.putText(annotated, "C", (int(w * 0.48), h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
     cv2.putText(annotated, "R", (max(10, w - 20), h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
+
+    # ── 1b. Render Lane Corridor, Polylines & Target Reticle (Lane Mode) ─────
+    if lane_result is not None:
+        if lane_result.corridor_pts is not None and len(lane_result.corridor_pts) >= 4:
+            overlay = annotated.copy()
+            cv2.fillPoly(overlay, [lane_result.corridor_pts], (40, 180, 50))
+            cv2.addWeighted(overlay, 0.35, annotated, 0.65, 0, annotated)
+
+        if lane_result.left_pts is not None and len(lane_result.left_pts) >= 2:
+            cv2.polylines(annotated, [lane_result.left_pts], False, (255, 255, 0), thick + 1)
+
+        if lane_result.right_pts is not None and len(lane_result.right_pts) >= 2:
+            cv2.polylines(annotated, [lane_result.right_pts], False, (0, 215, 255), thick + 1)
+
+        if lane_result.center_pts is not None and len(lane_result.center_pts) >= 2:
+            cv2.polylines(annotated, [lane_result.center_pts], False, (255, 0, 255), thick)
+
+        if lane_result.lookahead_point is not None and (lane_result.status != "LANE_LOST" or lane_result.center_coeffs is not None):
+            lx, ly = lane_result.lookahead_point
+            cv2.drawMarker(annotated, (lx, ly), (0, 0, 255), cv2.MARKER_CROSS, 14, thick + 1)
+            cv2.circle(annotated, (lx, ly), 6, (0, 255, 255), thick)
 
     # ── 2. Render Detections (YOLO Obstacles, Potholes & Bystanders) ─────────
     non_target_set = set()
@@ -1368,6 +1454,15 @@ def draw_hud(
         search_str = f"RE_ACQUIRE: SEARCHING {last_seen_side}"
         cv2.putText(annotated, search_str, (10, 64 if is_hd else 48),
                     cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 165, 255), thick)
+    elif lane_result is not None:
+        if lane_result.status != "LANE_LOST":
+            lane_str = f"LANE: {lane_result.status} | Off: {lane_result.lateral_offset_pct:+.1f}% | δ: {lane_result.steer_angle_deg:+.0f}°"
+            cv2.putText(annotated, lane_str, (10, 64 if is_hd else 48),
+                        cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 255, 200), thick)
+        elif lane_result.center_coeffs is not None:
+            lane_str = f"LANE: COASTING ({lane_result.lost_frames}) | Off: {lane_result.lateral_offset_pct:+.1f}% | δ: {lane_result.steer_angle_deg:+.0f}°"
+            cv2.putText(annotated, lane_str, (10, 64 if is_hd else 48),
+                        cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 165, 255), thick)
 
     # Ultrasonic telemetry display
     us_l = latest_sonar.get("left", 999.0)
@@ -1407,6 +1502,177 @@ def draw_hud(
                     cv2.FONT_HERSHEY_SIMPLEX, hud_scale2, (0, 0, 255), thick)
 
     return annotated
+
+
+# =============================================================================
+# Chart-Paper Lane Following Mode (Option A)
+# =============================================================================
+
+def _run_lane(
+    motor: MotorController,
+    sensors: SensorManager,
+    lane_detector: ChartLaneDetector,
+    detections: list,
+    us_blocked: bool,
+    frame: np.ndarray,
+    pi_latched: bool,
+    motors_enabled: bool,
+    throttler: CommandThrottler,
+    sys_state: Optional[SystemState] = None,
+) -> Tuple[bool, str, LaneDetectionResult]:
+    """
+    Executes one loop iteration of Chart-Paper Lane Following mode (Option A).
+    Priority Stack:
+      Tier 1: Imminent obstacle / pothole camera stop (PI_STOP latch)
+      Tier 1.5 & Tier 2: Cliff reflex & Ultrasonic auto-brake / local Arduino FSM
+      Tier 2.5: In-lane active obstacle/pothole bypass (steer to clear side)
+      Tier 3: Nominal chart-paper lane centering via pure pursuit
+    """
+    frame_h, frame_w = frame.shape[:2]
+    us = sensors.read_ultrasonic()
+    arduino_state = (motor.latest_state or "UNKNOWN").upper()
+
+    # Filter valid detections
+    valid_detections = [
+        d for d in (detections or [])
+        if isinstance(d, dict) and d.get("bbox") and len(d.get("bbox")) == 4
+    ]
+
+    # Run Lane Detection (excluding bounding boxes of active obstacles & potholes)
+    lane_res = lane_detector.detect(frame, exclude_boxes=valid_detections)
+    if sys_state:
+        sys_state.lane_result = lane_res
+
+    # ── 1. Tier 1: Camera Obstacle Latch (Rule 1 & Rule 2) ───────────────────
+    action, slow_speed = _check_obstacle_ahead(valid_detections, frame_w, frame_h)
+
+    if action == "STOP":
+        if not pi_latched:
+            print("🛑 PI_STOP: Obstacle/Pothole ahead in lane (camera latch engaged)")
+            motor.pi_stop()
+            pi_latched = True
+            throttler.record_other("PI_STOP")
+            return pi_latched, "🛑 PI_STOP: Obstacle/Pothole Ahead in Lane", lane_res
+        else:
+            throttler.record_other("PI_STOPPED")
+            return pi_latched, "🛑 PI_STOPPED (Lane Obstacle Latch Active)", lane_res
+
+    # ── 2. Camera Latch Release ──────────────────────────────────────────────
+    if pi_latched:
+        if action == "CLEAR" and not us_blocked:
+            print("✅ PI_GO: Lane corridor clear, releasing camera latch.")
+            motor.pi_go()
+            pi_latched = False
+            arduino_state = "IDLE"
+        else:
+            throttler.record_other("PI_STOPPED")
+            return pi_latched, "🛑 PI_STOPPED (Lane Latch Active)", lane_res
+
+    # ── 3. Respect Arduino Autonomous Reflex States (Tier 2 & 1.5) ────────────
+    if arduino_state in ("AVOIDING", "STATE_AVOIDING", "CLIFF_REVERSING", "STATE_CLIFF_REVERSING"):
+        throttler.record_other(arduino_state)
+        return pi_latched, f"🔀 ARDUINO {arduino_state} (Yielding)", lane_res
+
+    if arduino_state in ("CLIFF_STOPPED", "STATE_CLIFF_STOPPED"):
+        throttler.record_other(arduino_state)
+        if action == "CLEAR" and not us_blocked and is_valid_us(us.get("left")) and is_valid_us(us.get("right")):
+            print("✅ PI_GO: Cliff cleared, releasing latch.")
+            motor.pi_go()
+            return False, "✅ PI_GO: Cliff Cleared", lane_res
+        return pi_latched, "⚠️ CLIFF_STOPPED (Latched Drop-Off)", lane_res
+
+    if arduino_state in ("PI_STOPPED", "STATE_PI_STOPPED"):
+        throttler.record_other(arduino_state)
+        if action == "CLEAR" and not us_blocked:
+            print("✅ PI_GO: Releasing stale Arduino PI_STOPPED state.")
+            motor.pi_go()
+            arduino_state = "IDLE"
+        else:
+            pi_latched = True
+            return pi_latched, "🛑 PI_STOPPED (Arduino Latched)", lane_res
+
+    # ── 4. Ultrasonic Critical Stop (< EMERGENCY_STOP_DISTANCE_CM) ───────────
+    if us_blocked:
+        throttler.record_other("STOP")
+        if motors_enabled:
+            motor.stop()
+        return pi_latched, f"🛑 US AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)", lane_res
+
+    # ── 5. Tier 2.5: In-Lane Active Obstacle / Pothole Bypass ────────────────
+    # Check if there are active obstacles or potholes inside the driving corridor
+    scores = compute_zone_scores(valid_detections, frame_w, frame_h, sonar=us)
+    avoid_decision = decide_avoidance(scores)
+    us_l, us_r = us.get("left", 999.0), us.get("right", 999.0)
+
+    if avoid_decision in ("LEFT", "RIGHT"):
+        hint = avoid_decision
+        if throttler.should_send_avoid_hint(hint):
+            motor.pi_avoid(hint)
+            throttler.record_avoid_hint(hint)
+        turn_angle = 32 if hint == "RIGHT" else -32
+        turn_speed = LANE_CURVE_SPEED
+        if motors_enabled and throttler.should_send_turn(turn_angle, turn_speed):
+            motor.turn(turn_angle, speed=turn_speed)
+            throttler.record_turn(turn_angle, turn_speed)
+        return pi_latched, f"🔀 LANE BYPASS: Avoiding Hazard -> Steering {hint}", lane_res
+
+    # Close ultrasonic asymmetric avoidance
+    if is_valid_us(us_l) and us_l < 42.0 and (not is_valid_us(us_r) or us_l < us_r - 5.0):
+        if throttler.should_send_avoid_hint("RIGHT"):
+            motor.pi_avoid("RIGHT")
+            throttler.record_avoid_hint("RIGHT")
+        if motors_enabled and throttler.should_send_turn(32, LANE_CURVE_SPEED):
+            motor.turn(32, speed=LANE_CURVE_SPEED)
+            throttler.record_turn(32, LANE_CURVE_SPEED)
+        return pi_latched, f"🔀 LANE BYPASS: Left Obstacle ({us_l:.0f}cm) -> Steering RIGHT", lane_res
+
+    if is_valid_us(us_r) and us_r < 42.0 and (not is_valid_us(us_l) or us_r < us_l - 5.0):
+        if throttler.should_send_avoid_hint("LEFT"):
+            motor.pi_avoid("LEFT")
+            throttler.record_avoid_hint("LEFT")
+        if motors_enabled and throttler.should_send_turn(-32, LANE_CURVE_SPEED):
+            motor.turn(-32, speed=LANE_CURVE_SPEED)
+            throttler.record_turn(-32, LANE_CURVE_SPEED)
+        return pi_latched, f"🔀 LANE BYPASS: Right Obstacle ({us_r:.0f}cm) -> Steering LEFT", lane_res
+
+    # ── 6. Tier 3: Nominal Chart-Paper Lane Following ────────────────────────
+    # If lane is lost and either exceeding coasting limit OR no prior lane lock:
+    if lane_res.status == "LANE_LOST" and (lane_res.lost_frames > lane_detector.lost_max_frames or lane_res.center_coeffs is None):
+        if motors_enabled:
+            motor.stop()
+        throttler.record_other("STOP")
+        return pi_latched, f"⚠️ LANE LOST ({lane_res.lost_frames}f): Holding Safe Stop", lane_res
+
+    # Either locked onto lane (DUAL_LOCKED, SINGLE_LEFT, SINGLE_RIGHT) or active coasting with valid trajectory
+    delta = lane_res.steer_angle_deg
+    is_coasting = (lane_res.status == "LANE_LOST")
+
+    if abs(delta) <= lane_detector.steer_deadband_deg:
+        target_speed = LANE_CRUISE_SPEED
+        if motors_enabled:
+            if throttler.should_send_drive(target_speed):
+                motor.drive(target_speed, throttler.drive_duration_ms)
+                throttler.record_drive(target_speed)
+        else:
+            target_speed = 0
+        if is_coasting:
+            action_label = f"⚠️ LANE COASTING ({lane_res.lost_frames}/{lane_detector.lost_max_frames}): Straight"
+        else:
+            action_label = f"🛣️ LANE LOCKED ({lane_res.status}): Straight (PWM {LANE_CRUISE_SPEED})"
+    else:
+        steer_cmd = int(round(delta))
+        target_speed = LANE_CURVE_SPEED
+        if motors_enabled:
+            if throttler.should_send_turn(steer_cmd, target_speed):
+                motor.turn(steer_cmd, speed=target_speed)
+                throttler.record_turn(steer_cmd, target_speed)
+        steer_dir = "RIGHT" if steer_cmd > 0 else "LEFT"
+        if is_coasting:
+            action_label = f"⚠️ LANE COASTING ({lane_res.lost_frames}/{lane_detector.lost_max_frames}): Steer {steer_dir} ({abs(steer_cmd)}°)"
+        else:
+            action_label = f"🛣️ LANE STEER {steer_dir} ({abs(steer_cmd)}° | PWM {LANE_CURVE_SPEED})"
+
+    return pi_latched, action_label, lane_res
 
 
 # =============================================================================
@@ -2039,12 +2305,13 @@ def run_pipeline(
     confidence_thresh: float = 0.4,
 ):
     print(f"🚀 Autonomous RC Car — mode: {mode.upper()}")
-    if mode not in ("autonomous", "follow"):
-        print(f"❌ Unknown mode '{mode}'. Use --mode autonomous or --mode follow")
+    if mode not in ("autonomous", "lane", "follow"):
+        print(f"❌ Unknown mode '{mode}'. Use --mode autonomous, --mode lane, or --mode follow")
         sys.exit(1)
 
     system_state = SystemState()
     system_state.current_mode = mode
+    system_state.control_mode = mode
     system_state.motors_enabled = not bench_safe
     system_state.invert_motors = invert_motors
     system_state.current_awb = awb_mode
@@ -2089,6 +2356,9 @@ def run_pipeline(
     steering_pid.setSampleTime(0.05)
     steering_pid.setWindup(50)
     follow_state = "LOCK_ON"
+
+    # ── 3b. Chart-Paper Lane Following Components ────────────────────────────
+    lane_detector = ChartLaneDetector(color_mode=system_state.lane_color_mode)
 
     # ── 4. Camera Setup ──────────────────────────────────────────────────────
     use_picam2 = False
@@ -2137,6 +2407,7 @@ def run_pipeline(
         system_state.streaming_output = streaming_output
         try:
             httpd = StreamingServer(('', web_port), DiagnosticHandler, system_state)
+            httpd.lane_detector = lane_detector
             server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
             server_thread.start()
             print(f"  🌐 Diagnostic HUD live stream active on: http://0.0.0.0:{web_port}")
@@ -2227,6 +2498,19 @@ def run_pipeline(
                         man_act = system_state.manual_action
                         man_spd = system_state.manual_speed
                     action_label = f"🎮 MANUAL REMOTE: {man_act} (PWM {man_spd})"
+            elif current_ctrl_mode == "lane" or (current_ctrl_mode == "autonomous" and mode == "lane"):
+                pi_latched, action_label, lane_res = _run_lane(
+                    motor=motor,
+                    sensors=sensors,
+                    lane_detector=lane_detector,
+                    detections=cached_detections,
+                    us_blocked=us_blocked,
+                    frame=frame,
+                    pi_latched=pi_latched,
+                    motors_enabled=system_state.motors_enabled,
+                    throttler=throttler,
+                    sys_state=system_state,
+                )
             elif current_ctrl_mode == "follow" or mode == "follow":
                 follow_state, pi_latched, action_label = _run_follow(
                     motor=motor,
@@ -2278,7 +2562,7 @@ def run_pipeline(
                     port_name=motor.port,
                     fps=fps,
                     awb_mode=system_state.current_awb,
-                    mode=system_state.control_mode if system_state.control_mode in ("manual", "follow") else mode,
+                    mode=system_state.control_mode if system_state.control_mode in ("manual", "follow", "lane") else mode,
                     motors_enabled=system_state.motors_enabled,
                     invert_motors=system_state.invert_motors,
                     pi_latched=pi_latched,
@@ -2288,6 +2572,7 @@ def run_pipeline(
                     last_seen_side=system_state.last_seen_side,
                     follow_state=system_state.follow_state,
                     non_target_persons=system_state.non_target_persons,
+                    lane_result=system_state.lane_result,
                 )
                 ok, jpg = cv2.imencode(".jpg", hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if ok:
@@ -2337,9 +2622,9 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["autonomous", "follow"],
+        choices=["autonomous", "lane", "follow"],
         default="autonomous",
-        help="Operating mode: 'autonomous' (avoid obstacles) or 'follow' (follow closest person).",
+        help="Operating mode: 'autonomous' (avoid obstacles), 'lane' (chart-paper lane following), or 'follow' (follow closest person).",
     )
     parser.add_argument(
         "--port",

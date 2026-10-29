@@ -47,6 +47,7 @@ Two-layer autonomous 4WD RC vehicle powered by an **Arduino Uno** for real-time 
 │
 ├── docs/                          # Project documentation — owned by docs-tracker-agent
 │   ├── architecture.md            # Canonical system architecture, wiring, modes, priority stack
+│   ├── LANE_DETECTION_SYSTEM_CONTEXT.md # Comprehensive guide for teammates & LLMs on lane detection backend
 │   └── decisions/                 # Architectural Decision Records (ADRs)
 │
 ├── AGENTS.md                      # Multi-agent role boundaries and constraints
@@ -68,7 +69,9 @@ python benchmark.py --video test_videos/dashcam_test.mp4 --imgsz 320
 ```bash
 cd car
 pip install -r requirements.txt
-# Run in autonomous obstacle navigation mode
+# Run in chart-paper lane tracking mode (30 Hz lane + 10 Hz obstacle/pothole preemption)
+python main.py --mode lane
+# Or run in autonomous obstacle free-roam navigation mode
 python main.py --mode autonomous
 # Or run in follow-me mode (locks onto closest person and tracks them)
 python main.py --mode follow

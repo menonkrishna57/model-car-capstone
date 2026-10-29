@@ -25,6 +25,7 @@ try:
 except Exception:
     Picamera2 = None
 from ultralytics import YOLO
+from car.perception.lane_detector import ChartLaneDetector, LaneDetectionResult
 
 # ── 1. Model & Path Resolution ───────────────────────────────────────────────
 def find_model_path(rel_path: str) -> Optional[Path]:
@@ -120,10 +121,13 @@ CRUISE_SPEED = 200                      # Normal cruising forward PWM
 SLOW_SPEED = 135                        # Cautionary PWM when approaching obstacle
 
 # ── Remote Control & Operating Modes ─────────────────────────────────────────
-control_mode = "autonomous"             # "autonomous" or "manual"
+control_mode = "autonomous"             # "autonomous", "lane", or "manual"
 manual_override_obstacles = False       # True = Ignore all obstacles & ultrasonic brake in manual mode
 manual_speed = 185                      # Default manual drive PWM (100 - 255)
 manual_action = "IDLE"                  # Current manual direction / status
+lane_color_mode = "dark"
+lane_detector = ChartLaneDetector(color_mode=lane_color_mode)
+last_lane_res = None
 
 # ── 2. Camera Controls & Daylight White Balance ──────────────────────────────
 try:
@@ -331,8 +335,8 @@ def is_valid_us(dist: float) -> bool:
     """Returns True if reading is a valid obstacle reflection (filters out 0.0 noise & 999 timeout)."""
     return 1.0 < dist < 850.0
 
-def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_dets: list):
-    global active_action_label, control_mode, manual_action, manual_override_obstacles
+def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_dets: list, frame: Optional[np.ndarray] = None):
+    global active_action_label, control_mode, manual_action, manual_override_obstacles, last_lane_res, lane_detector
 
     # 1. Camera Obstacle Check
     obstacle_ahead = False
@@ -368,6 +372,81 @@ def evaluate_autonomous_action(frame_w: int, frame_h: int, obs_boxes: list, pot_
                 active_action_label = f"⚠️ MANUAL WARN: Obstacle Ahead | {manual_action}"
             else:
                 active_action_label = f"🎮 MANUAL REMOTE: {manual_action} (PWM {manual_speed})"
+        return
+
+    # ── CHART-PAPER LANE FOLLOWING MODE ──────────────────────────────────────
+    if control_mode == "lane":
+        exclude_boxes = []
+        for b in obs_boxes:
+            exclude_boxes.append({"bbox": list(map(int, b.xyxy[0].tolist()))})
+        for p in pot_dets:
+            if "bbox" in p:
+                exclude_boxes.append({"bbox": p["bbox"]})
+
+        lane_res = lane_detector.detect(frame, exclude_boxes=exclude_boxes) if frame is not None else LaneDetectionResult(status="LANE_LOST")
+        last_lane_res = lane_res
+
+        # Tier 1 Camera Obstacle Check
+        if obstacle_ahead:
+            active_action_label = "🛑 PI_STOP: Obstacle Ahead in Lane"
+            arduino.pi_stop()
+            return
+
+        if arduino.pi_latched and not obstacle_ahead:
+            active_action_label = "✅ PI_GO: Lane Cleared"
+            arduino.pi_go()
+
+        # Tier 2 Ultrasonic Auto-Brake
+        us_l = arduino.latest_sonar["left"]
+        us_r = arduino.latest_sonar["right"]
+        v_l = is_valid_us(us_l)
+        v_r = is_valid_us(us_r)
+        if (v_l and us_l < EMERGENCY_STOP_DIST_CM) or (v_r and us_r < EMERGENCY_STOP_DIST_CM):
+            active_action_label = f"🛑 US AUTO-BRAKE! (L:{us_l:.0f}cm R:{us_r:.0f}cm)"
+            arduino.stop()
+            return
+
+        # Tier 2.5 In-Lane Obstacle/Pothole Bypass
+        danger_left = sum(1.0 for p in pot_dets if p.get("is_pothole") and (p["bbox"][0] + p["bbox"][2]) / 2 < frame_w * 0.5)
+        danger_right = sum(1.0 for p in pot_dets if p.get("is_pothole") and (p["bbox"][0] + p["bbox"][2]) / 2 >= frame_w * 0.5)
+        if danger_left > 0 or danger_right > 0:
+            if danger_left > danger_right:
+                active_action_label = "🔀 LANE BYPASS: Steering RIGHT around Pothole"
+                arduino.pi_avoid("RIGHT")
+                if arduino.motors_enabled:
+                    arduino.turn(32, 145)
+            else:
+                active_action_label = "🔀 LANE BYPASS: Steering LEFT around Pothole"
+                arduino.pi_avoid("LEFT")
+                if arduino.motors_enabled:
+                    arduino.turn(-32, 145)
+            return
+
+        # Tier 3 Nominal Lane Centering via Pure Pursuit
+        if lane_res.status == "LANE_LOST" and (lane_res.lost_frames > lane_detector.lost_max_frames or lane_res.center_coeffs is None):
+            active_action_label = f"⚠️ LANE LOST ({lane_res.lost_frames}f): Holding Safe Stop"
+            arduino.stop()
+            return
+
+        delta = lane_res.steer_angle_deg
+        is_coasting = (lane_res.status == "LANE_LOST")
+
+        if abs(delta) <= lane_detector.steer_deadband_deg:
+            if is_coasting:
+                active_action_label = f"⚠️ LANE COASTING ({lane_res.lost_frames}/{lane_detector.lost_max_frames}): Straight"
+            else:
+                active_action_label = f"🛣️ LANE LOCKED ({lane_res.status}): Straight"
+            if arduino.motors_enabled:
+                arduino.drive(165, 250)
+        else:
+            steer_cmd = int(round(delta))
+            steer_dir = "RIGHT" if steer_cmd > 0 else "LEFT"
+            if is_coasting:
+                active_action_label = f"⚠️ LANE COASTING ({lane_res.lost_frames}/{lane_detector.lost_max_frames}): Steer {steer_dir} ({abs(steer_cmd)}°)"
+            else:
+                active_action_label = f"🛣️ LANE STEER {steer_dir} ({abs(steer_cmd)}°)"
+            if arduino.motors_enabled:
+                arduino.turn(steer_cmd, 145)
         return
 
     # ── AUTONOMOUS NAVIGATION MODE ───────────────────────────────────────────
@@ -600,6 +679,8 @@ PAGE = """<!DOCTYPE html>
   <div class="controls-dock" id="dock">
     <button id="btn-motors" class="btn-danger" onclick="toggleMotors()">🚗 Enable Motors (M)</button>
     <button id="btn-mode" onclick="toggleControlMode()">🎮 Mode: Manual (C)</button>
+    <button id="btn-lane" onclick="setMode('lane')">🛣️ Lane Mode</button>
+    <button id="btn-lane-color" onclick="cycleLaneColor()">🎨 Lane: Dark</button>
     <button id="btn-override" onclick="toggleOverride()">🔓 Override Obstacles (O)</button>
     <button id="btn-remote" class="btn-active" onclick="toggleRemoteWidget()">🕹️ Remote</button>
     <button id="btn-invert" class="btn-active" onclick="toggleInvertMotors()">🔄 Polarity: Inverted (I)</button>
@@ -737,6 +818,26 @@ PAGE = """<!DOCTYPE html>
       });
     }
 
+    function setMode(mode) {
+      fetch('/set_mode?mode=' + mode).then(r => r.json()).then(d => {
+        updateModeUI(d.mode);
+      });
+    }
+
+    function cycleLaneColor() {
+      const colors = ['dark', 'yellow', 'blue', 'white'];
+      const btn = document.getElementById('btn-lane-color');
+      let curr = (btn ? btn.getAttribute('data-color') : '') || 'dark';
+      let nextIdx = (colors.indexOf(curr) + 1) % colors.length;
+      let nextCol = colors[nextIdx];
+      fetch('/set_lane_color?color=' + nextCol).then(r => r.json()).then(d => {
+        if (btn) {
+          btn.setAttribute('data-color', d.color);
+          btn.innerText = '🎨 Lane: ' + d.color.toUpperCase();
+        }
+      });
+    }
+
     function updateModeUI(mode) {
       currentMode = mode;
       const mb = document.getElementById('mode-badge');
@@ -746,10 +847,15 @@ PAGE = """<!DOCTYPE html>
         mb.className = 'badge badge-mode-manual';
         btnMode.innerText = '🤖 Mode: Auto (C)';
         btnMode.className = 'btn-active';
+      } else if (mode === 'lane') {
+        mb.innerText = 'MODE: LANE 🛣️';
+        mb.className = 'badge badge-mode-auto';
+        btnMode.innerText = '🎮 Mode: Manual (C)';
+        btnMode.className = 'btn-active';
       } else {
         mb.innerText = 'MODE: AUTO 🤖';
         mb.className = 'badge badge-mode-auto';
-        btnMode.innerText = '🎮 Mode: Manual (C)';
+        btnMode.innerText = '🛣️ Mode: Lane (C)';
         btnMode.className = '';
       }
     }
@@ -1074,13 +1180,30 @@ def detect_loop(cam, output):
 
         # 3. Decision Engine (uses temporally confirmed potholes to prevent 1-frame false swerves)
         obs_boxes = r.boxes if r is not None else []
-        evaluate_autonomous_action(w, h, obs_boxes, confirmed_pot_dets)
+        evaluate_autonomous_action(w, h, obs_boxes, confirmed_pot_dets, frame=frame)
 
-        # 4. Render Obstacle Boxes (Green)
+        # 4. Render Lane Corridor & Curves if in Lane Mode
+        if control_mode == "lane" and last_lane_res is not None:
+            if last_lane_res.corridor_pts is not None and len(last_lane_res.corridor_pts) >= 4:
+                overlay = frame.copy()
+                cv2.fillPoly(overlay, [last_lane_res.corridor_pts], (40, 180, 50))
+                cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
+            if last_lane_res.left_pts is not None and len(last_lane_res.left_pts) >= 2:
+                cv2.polylines(frame, [last_lane_res.left_pts], False, (255, 255, 0), thick + 1)
+            if last_lane_res.right_pts is not None and len(last_lane_res.right_pts) >= 2:
+                cv2.polylines(frame, [last_lane_res.right_pts], False, (0, 215, 255), thick + 1)
+            if last_lane_res.center_pts is not None and len(last_lane_res.center_pts) >= 2:
+                cv2.polylines(frame, [last_lane_res.center_pts], False, (255, 0, 255), thick)
+            if last_lane_res.lookahead_point is not None and (last_lane_res.status != "LANE_LOST" or last_lane_res.center_coeffs is not None):
+                lx, ly = last_lane_res.lookahead_point
+                cv2.drawMarker(frame, (lx, ly), (0, 0, 255), cv2.MARKER_CROSS, 14, thick + 1)
+                cv2.circle(frame, (lx, ly), 6, (0, 255, 255), thick)
+
+        # 5. Render Obstacle Boxes (Green)
         if r is not None:
             draw_boxes(frame, r, (0, 255, 0))
 
-        # 5. Render Lower-Section Pothole Scan Horizon & Pothole Boxes
+        # 6. Render Lower-Section Pothole Scan Horizon & Pothole Boxes
         f_scale = 0.50 if w >= 480 else 0.38
         hud_scale1 = 0.65 if w >= 480 else 0.45
         hud_scale2 = 0.55 if w >= 480 else 0.40
@@ -1105,11 +1228,21 @@ def detect_loop(cam, output):
         mode_tag = f"[{control_mode.upper()}{ov_text}]"
         cv2.putText(frame, f"{fps:.1f} FPS | {mode_tag} | {current_awb.upper()} AWB", (10, 20 if w < 480 else 26),
                     cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 255, 255), thick)
-        action_col = (0, 255, 0) if ("CRUISING" in active_action_label or "MANUAL" in active_action_label) else (0, 165, 255)
+        action_col = (0, 255, 0) if ("CRUISING" in active_action_label or "MANUAL" in active_action_label or "LANE" in active_action_label) else (0, 165, 255)
         if "BRAKE" in active_action_label or "STOP" in active_action_label:
             action_col = (0, 0, 255)
         cv2.putText(frame, f"Action: {active_action_label}", (10, 38 if w < 480 else 52),
                     cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, action_col, thick)
+
+        if control_mode == "lane" and last_lane_res is not None:
+            if last_lane_res.status != "LANE_LOST":
+                lane_str = f"LANE: {last_lane_res.status} | Off: {last_lane_res.lateral_offset_pct:+.1f}% | δ: {last_lane_res.steer_angle_deg:+.0f}°"
+                cv2.putText(frame, lane_str, (10, 56 if w < 480 else 76),
+                            cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 255, 200), thick)
+            elif last_lane_res.center_coeffs is not None:
+                lane_str = f"LANE: COASTING ({last_lane_res.lost_frames}) | Off: {last_lane_res.lateral_offset_pct:+.1f}% | δ: {last_lane_res.steer_angle_deg:+.0f}°"
+                cv2.putText(frame, lane_str, (10, 56 if w < 480 else 76),
+                            cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 165, 255), thick)
 
         # Ultrasonic live display
         us_l = arduino.latest_sonar["left"]
@@ -1144,7 +1277,7 @@ def detect_loop(cam, output):
 # ── 7. Web Server Handler ────────────────────────────────────────────────────
 class Handler(server.BaseHTTPRequestHandler):
     def do_GET(self):
-        global POTHOLE_ONLY, control_mode, manual_speed, manual_action, manual_override_obstacles
+        global POTHOLE_ONLY, control_mode, manual_speed, manual_action, manual_override_obstacles, lane_color_mode, lane_detector
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -1212,6 +1345,10 @@ class Handler(server.BaseHTTPRequestHandler):
                 "manual_speed": manual_speed,
                 "manual_action": manual_action,
                 "action": active_action_label,
+                "lane_status": last_lane_res.status if last_lane_res else "OFF",
+                "lane_offset": round(last_lane_res.lateral_offset_pct, 1) if last_lane_res else 0.0,
+                "lane_steer": round(last_lane_res.steer_angle_deg, 1) if last_lane_res else 0.0,
+                "lane_color": lane_color_mode,
             }
             resp = json.dumps(data).encode('utf-8')
             self.send_response(200)
@@ -1221,7 +1358,12 @@ class Handler(server.BaseHTTPRequestHandler):
             self.wfile.write(resp)
 
         elif path == '/toggle_control_mode':
-            control_mode = "manual" if control_mode == "autonomous" else "autonomous"
+            if control_mode == "autonomous":
+                control_mode = "lane"
+            elif control_mode == "lane":
+                control_mode = "manual"
+            else:
+                control_mode = "autonomous"
             if control_mode == "manual":
                 arduino.stop()
                 manual_action = "IDLE"
@@ -1238,7 +1380,7 @@ class Handler(server.BaseHTTPRequestHandler):
 
         elif path == '/set_mode':
             req_mode = query.get('mode', ['autonomous'])[0].lower()
-            if req_mode in ('autonomous', 'manual'):
+            if req_mode in ('autonomous', 'lane', 'manual'):
                 control_mode = req_mode
                 if control_mode == "manual":
                     arduino.stop()
@@ -1248,6 +1390,19 @@ class Handler(server.BaseHTTPRequestHandler):
                     manual_action = "IDLE"
             print(f"🎮 Control mode set: {control_mode.upper()}")
             resp = json.dumps({"status": "ok", "mode": control_mode}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif path == '/set_lane_color':
+            col = query.get('color', ['dark'])[0].lower()
+            if col in ('dark', 'yellow', 'blue', 'white'):
+                lane_color_mode = col
+                lane_detector.set_color_mode(col)
+            print(f"🎨 Lane color mode set: {lane_color_mode.upper()}")
+            resp = json.dumps({"status": "ok", "color": lane_color_mode}).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(resp)))

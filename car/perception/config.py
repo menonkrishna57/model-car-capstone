@@ -53,3 +53,16 @@ FOLLOW_SEARCH_TURN_SPEED = 165         # PWM speed for search turns during RE_AC
 FOLLOW_SEARCH_MAX_STEPS = 4            # Max directional search turns before holding stationary
 FOLLOW_SEARCH_INTERVAL_S = 0.85        # Delay (s) between search turns to stabilize camera & scan
 
+# ── Chart-Paper Lane Detection & Following (Option A) ────────────────────────
+LANE_ROI_Y_MIN_FRAC = 0.45             # Scan lower 55% of frame for chart paper lines
+LANE_LOOKAHEAD_Y_FRAC = 0.68           # Vertical lookahead row for steering error (0=top, 1=bottom)
+LANE_DEFAULT_WIDTH_FRAC = 0.52         # Expected normalized spacing between left & right lines at reference row
+LANE_EMA_ALPHA = 0.45                  # Temporal smoothing factor for polynomial coefficients
+LANE_MAX_JUMP_FRAC = 0.15              # Max frame-to-frame lateral jump before rejecting outlier
+LANE_LOST_MAX_FRAMES = 8               # Coast frames allowed before stopping when both lines disappear
+LANE_CRUISE_SPEED = 165                # Forward PWM speed when centered in lane
+LANE_CURVE_SPEED = 145                 # PWM speed when executing corrective lane turns
+LANE_STEER_DEADBAND_DEG = 6            # Deadband (deg) within which car drives straight
+LANE_MAX_STEER_DEG = 38                # Maximum skid-steer correction angle for sharp paper curves
+LANE_COLOR_MODE = "dark"               # "dark" (black lines on white chart paper), "yellow", "blue", "white"
+
