@@ -13,6 +13,7 @@ import urllib.request
 import urllib.error
 import pytest
 import numpy as np
+import cv2
 
 from car.main import (
     CommandThrottler,
@@ -517,3 +518,86 @@ def test_http_streaming_server_and_telemetry_endpoint():
     assert status == 200
     data = json.loads(body.decode("utf-8"))
     assert data["mode"] == "daylight"
+
+    # 7. Test GET /toggle_swap_rb
+    status, headers, body = simulate_http_get("/toggle_swap_rb", sys_state)
+    assert status == 200
+    data = json.loads(body.decode("utf-8"))
+    assert data["status"] == "ok"
+    assert data["swap_rb"] is False
+    assert sys_state.swap_rb is False
+
+    # 8. Test GET /set_swap_rb
+    status, headers, body = simulate_http_get("/set_swap_rb?enabled=true", sys_state)
+    assert status == 200
+    data = json.loads(body.decode("utf-8"))
+    assert data["status"] == "ok"
+    assert data["swap_rb"] is True
+    assert sys_state.swap_rb is True
+
+
+def test_camera_color_filter_swap_rb_and_skin_tone_perception():
+    """Verify camera color filter swap logic, default True, and skin tone Hue preservation."""
+    # 1. Verify default state
+    state = SystemState()
+    assert state.swap_rb is True
+
+    # 2. Verify toggle via DiagnosticHandler
+    status, _, body = simulate_http_get("/toggle_swap_rb", state)
+    assert status == 200
+    assert json.loads(body)["swap_rb"] is False
+    assert state.swap_rb is False
+
+    status, _, body = simulate_http_get("/toggle_swap_rb", state)
+    assert status == 200
+    assert json.loads(body)["swap_rb"] is True
+    assert state.swap_rb is True
+
+    # 3. Verify set endpoint with various query parameters
+    status, _, body = simulate_http_get("/set_swap_rb?enabled=false", state)
+    assert status == 200
+    assert json.loads(body)["swap_rb"] is False
+    assert state.swap_rb is False
+
+    status, _, body = simulate_http_get("/set_swap_rb?enabled=0", state)
+    assert status == 200
+    assert json.loads(body)["swap_rb"] is False
+
+    status, _, body = simulate_http_get("/set_swap_rb?enabled=true", state)
+    assert status == 200
+    assert json.loads(body)["swap_rb"] is True
+    assert state.swap_rb is True
+
+    status, _, body = simulate_http_get("/set_swap_rb?enable=1", state)
+    assert status == 200
+    assert json.loads(body)["swap_rb"] is True
+
+    # 4. Telemetry reflects swap_rb accurately
+    status, _, body = simulate_http_get("/telemetry", state)
+    assert status == 200
+    assert json.loads(body)["swap_rb"] is True
+
+    # 5. Verify mathematical skin tone Hue preservation:
+    # A human skin tone patch in RGB: high Red (220), moderate Green (155), lower Blue (110)
+    # R > G > B holds true for human skin across ethnicities.
+    raw_rgb_patch = np.array([[[220, 155, 110]]], dtype=np.uint8)
+
+    # When swap_rb is True:
+    bgr_patch = cv2.cvtColor(raw_rgb_patch, cv2.COLOR_RGB2BGR)
+    assert bgr_patch[0, 0, 0] == 110  # Blue
+    assert bgr_patch[0, 0, 1] == 155  # Green
+    assert bgr_patch[0, 0, 2] == 220  # Red
+
+    # In OpenCV BGR -> HSV:
+    hsv_correct = cv2.cvtColor(bgr_patch, cv2.COLOR_BGR2HSV)
+    hue_correct = hsv_correct[0, 0, 0]
+    # True skin tones map to OpenCV Hue 0-25 (Melanin / Hemoglobin band)
+    assert 0 <= hue_correct <= 25, f"Expected true skin Hue in [0, 25], got {hue_correct}"
+
+    # When swap_rb is False (erroneous unswapped RGB treated as BGR):
+    # OpenCV treats raw RGB array as BGR, so Blue channel is high (220) and Red is low (110)
+    hsv_inverted = cv2.cvtColor(raw_rgb_patch, cv2.COLOR_BGR2HSV)
+    hue_inverted = hsv_inverted[0, 0, 0]
+    # Cyan / Blue shift (Smurf effect)
+    assert 95 <= hue_inverted <= 130, f"Expected inverted Hue in cyan/blue band [95, 130], got {hue_inverted}"
+
