@@ -461,7 +461,7 @@ PAGE = """<!DOCTYPE html>
     <button id="btn-motors" class="btn-success" onclick="toggleMotors()">🛑 Disable Motors (M)</button>
     <button id="btn-mode" onclick="toggleControlMode()">🎮 Mode: Toggle (C)</button>
     <button id="btn-lane" onclick="setMode('lane')">🛣️ Lane Mode</button>
-    <button id="btn-lane-color" onclick="cycleLaneColor()">🎨 Lane: Dark</button>
+    <button id="btn-lane-color" onclick="cycleLaneColor()" data-color="dark">🎨 Lane: Dark</button>
     <button id="btn-follow" onclick="setMode('follow')">🎯 Follow Mode</button>
     <button id="btn-cal-target" class="btn-active" onclick="calibrateTarget()">🎯 Calibrate Target (L)</button>
     <button id="btn-reset-target" onclick="resetTarget()">🔄 Reset Target</button>
@@ -764,18 +764,20 @@ PAGE = """<!DOCTYPE html>
       fetch('/telemetry').then(r => r.json()).then(d => {
         const sb = document.getElementById('sonar-badge');
         if (sb && d.sonar) {
-          const l = (d.sonar.left <= 1.0 || d.sonar.left >= 850.0) ? 'CLR' : d.sonar.left.toFixed(0) + 'cm';
-          const r = (d.sonar.right <= 1.0 || d.sonar.right >= 850.0) ? 'CLR' : d.sonar.right.toFixed(0) + 'cm';
+          const vl = typeof d.sonar.left === 'number' && d.sonar.left > 1.0 && d.sonar.left < 850.0;
+          const vr = typeof d.sonar.right === 'number' && d.sonar.right > 1.0 && d.sonar.right < 850.0;
+          const l = vl ? d.sonar.left.toFixed(0) + 'cm' : 'CLR';
+          const r = vr ? d.sonar.right.toFixed(0) + 'cm' : 'CLR';
           let usText = `US: L=${l}  R=${r}`;
-          if (d.sonar.rear && d.sonar.rear > 1.0 && d.sonar.rear < 850.0) {
+          if (typeof d.sonar.rear === 'number' && d.sonar.rear > 1.0 && d.sonar.rear < 850.0) {
             usText += `  B=${d.sonar.rear.toFixed(0)}cm`;
           }
           sb.innerText = usText;
-          if ((d.sonar.left > 1.0 && d.sonar.left < 25.0) || (d.sonar.right > 1.0 && d.sonar.right < 25.0)) {
+          if ((vl && d.sonar.left < 25.0) || (vr && d.sonar.right < 25.0)) {
             sb.style.background = 'rgba(248, 81, 73, 0.35)';
             sb.style.borderColor = 'var(--danger)';
             sb.style.color = '#ff7b72';
-          } else if ((d.sonar.left > 1.0 && d.sonar.left < 45.0) || (d.sonar.right > 1.0 && d.sonar.right < 45.0)) {
+          } else if ((vl && d.sonar.left < 45.0) || (vr && d.sonar.right < 45.0)) {
             sb.style.background = 'rgba(227, 179, 65, 0.35)';
             sb.style.borderColor = 'var(--warning)';
             sb.style.color = '#e3b341';
@@ -783,6 +785,13 @@ PAGE = """<!DOCTYPE html>
             sb.style.background = 'rgba(63, 185, 80, 0.2)';
             sb.style.borderColor = 'var(--success)';
             sb.style.color = 'var(--success)';
+          }
+        }
+        if (d.lane_color) {
+          const btn = document.getElementById('btn-lane-color');
+          if (btn && btn.getAttribute('data-color') !== d.lane_color) {
+            btn.setAttribute('data-color', d.lane_color);
+            btn.innerText = '🎨 Lane: ' + d.lane_color.toUpperCase();
           }
         }
         if (d.follow_state) {
@@ -894,6 +903,10 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(frame_bytes)
                     self.wfile.write(b'\r\n')
+                    try:
+                        self.wfile.flush()
+                    except Exception:
+                        pass
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
@@ -1072,6 +1085,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                         sys_state.follow_state = "WAIT_CALIBRATION"
                 elif sys_state.control_mode == "follow":
                     sys_state.control_mode = "manual"
+                    sys_state.current_mode = "manual"
                 else:
                     sys_state.control_mode = "autonomous"
                     sys_state.current_mode = "autonomous"
@@ -1091,6 +1105,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
             with sys_state.lock:
                 if new_mode == "manual":
                     sys_state.control_mode = "manual"
+                    sys_state.current_mode = "manual"
                 elif new_mode in ("autonomous", "lane", "follow"):
                     sys_state.control_mode = new_mode
                     sys_state.current_mode = new_mode
@@ -1350,7 +1365,7 @@ def draw_hud(
     cv2.putText(annotated, "R", (max(10, w - 20), h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
 
     # ── 1b. Render Lane Corridor, Polylines & Target Reticle (Lane Mode) ─────
-    if lane_result is not None:
+    if mode == "lane" and lane_result is not None:
         if lane_result.corridor_pts is not None and len(lane_result.corridor_pts) >= 4:
             overlay = annotated.copy()
             cv2.fillPoly(overlay, [lane_result.corridor_pts], (40, 180, 50))
@@ -1406,7 +1421,7 @@ def draw_hud(
         cv2.putText(annotated, text, (max(0, x1), max(12, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, box_scale, color, thick)
 
     # ── 3. Render Target Lock Box with Corner Reticles ────────────────────────
-    if target_bbox is not None and follow_state in ("TRACKING", "CALIBRATING"):
+    if mode == "follow" and target_bbox is not None and follow_state in ("TRACKING", "CALIBRATING"):
         tx, ty, tw, th = [int(v) for v in target_bbox]
         tx2, ty2 = tx + tw, ty + th
         tgt_color = (0, 215, 255)  # Gold
@@ -1450,11 +1465,11 @@ def draw_hud(
                 cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, act_color, thick)
 
     # Directional Search Banner when in RE_ACQUIRE
-    if follow_state == "RE_ACQUIRE":
+    if mode == "follow" and follow_state == "RE_ACQUIRE":
         search_str = f"RE_ACQUIRE: SEARCHING {last_seen_side}"
         cv2.putText(annotated, search_str, (10, 64 if is_hd else 48),
                     cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 165, 255), thick)
-    elif lane_result is not None:
+    elif mode == "lane" and lane_result is not None:
         if lane_result.status != "LANE_LOST":
             lane_str = f"LANE: {lane_result.status} | Off: {lane_result.lateral_offset_pct:+.1f}% | δ: {lane_result.steer_angle_deg:+.0f}°"
             cv2.putText(annotated, lane_str, (10, 64 if is_hd else 48),
@@ -1552,6 +1567,7 @@ def _run_lane(
             motor.pi_stop()
             pi_latched = True
             throttler.record_other("PI_STOP")
+            throttler.latch_start_time = time.monotonic()
             return pi_latched, "🛑 PI_STOP: Obstacle/Pothole Ahead in Lane", lane_res
         else:
             throttler.record_other("PI_STOPPED")
@@ -1563,6 +1579,7 @@ def _run_lane(
             print("✅ PI_GO: Lane corridor clear, releasing camera latch.")
             motor.pi_go()
             pi_latched = False
+            throttler.latch_start_time = 0.0
             arduino_state = "IDLE"
         else:
             throttler.record_other("PI_STOPPED")
@@ -1726,7 +1743,9 @@ def _run_autonomous(
         else:
             # Check if stationary obstacle allows auto-unstick / pivot escape
             now_m = time.monotonic()
-            latch_age = now_m - getattr(throttler, "latch_start_time", 0.0)
+            if getattr(throttler, "latch_start_time", 0.0) == 0.0:
+                throttler.latch_start_time = now_m
+            latch_age = now_m - throttler.latch_start_time
             if latch_age > 1.2 and valid_detections:
                 scores = compute_zone_scores(valid_detections, frame_w, frame_h, sonar=us)
                 decision = decide_avoidance(scores)
@@ -1797,7 +1816,8 @@ def _run_autonomous(
     # ── 5. Ultrasonic Critical Stop (< EMERGENCY_STOP_DISTANCE_CM) ───────────
     if us_blocked:
         throttler.record_other("STOP")
-        motor.stop()
+        if motors_enabled:
+            motor.stop()
         return pi_latched, f"🛑 US AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)"
 
     # ── 6. Active Obstacle Avoidance & Steering ──────────────────────────────
@@ -2145,7 +2165,8 @@ def _run_follow(
         # Critical Ultrasonic auto-brake
         if us_blocked:
             throttler.record_other("STOP")
-            motor.stop()
+            if motors_enabled:
+                motor.stop()
             return follow_state, pi_latched, "🛑 US AUTO-BRAKE (< 25cm)"
 
         # Steering & Follow Speed Modulation
@@ -2372,18 +2393,21 @@ def run_pipeline(
 
         # Configure Picamera2 in BGR888 mode
         cfg = None
+        picam2_is_bgr = False
         if Transform is not None:
             try:
                 cfg = picam2.create_video_configuration(
                     main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "BGR888"},
                     transform=Transform(hflip=1, vflip=1)
                 )
+                picam2_is_bgr = True
             except Exception:
-                pass
+                cfg = None
         if cfg is None:
             cfg = picam2.create_preview_configuration(
                 main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"}
             )
+            picam2_is_bgr = False
         picam2.configure(cfg)
         picam2.start()
         set_awb_mode(picam2, awb_mode)
@@ -2457,7 +2481,7 @@ def run_pipeline(
             if use_picam2 and picam2:
                 frame_raw = picam2.capture_array()
                 if len(frame_raw.shape) == 3 and frame_raw.shape[2] == 3:
-                    frame = cv2.cvtColor(frame_raw, cv2.COLOR_RGB2BGR) if cfg.get("main", {}).get("format") != "BGR888" else frame_raw.copy()
+                    frame = frame_raw.copy() if picam2_is_bgr else cv2.cvtColor(frame_raw, cv2.COLOR_RGB2BGR)
                 else:
                     frame = frame_raw.copy()
             elif cap and cap.isOpened():
@@ -2486,19 +2510,22 @@ def run_pipeline(
             # ── E. Decision Execution ────────────────────────────────────────
             with system_state.lock:
                 current_ctrl_mode = system_state.control_mode
+                override_obs = system_state.manual_override_obstacles
+                motors_en = system_state.motors_enabled
 
             if current_ctrl_mode == "manual":
                 # Manual control mode: vehicle is controlled via Web UI / D-Pad
-                # Safety auto-brake: if front US is blocked, stop immediately!
-                if us_blocked:
-                    motor.stop()
+                # Safety auto-brake: if front US is blocked and not overridden, stop!
+                if us_blocked and not override_obs:
+                    if motors_en:
+                        motor.stop()
                     action_label = f"🛑 MANUAL AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)"
                 else:
                     with system_state.lock:
                         man_act = system_state.manual_action
                         man_spd = system_state.manual_speed
                     action_label = f"🎮 MANUAL REMOTE: {man_act} (PWM {man_spd})"
-            elif current_ctrl_mode == "lane" or (current_ctrl_mode == "autonomous" and mode == "lane"):
+            elif current_ctrl_mode == "lane":
                 pi_latched, action_label, lane_res = _run_lane(
                     motor=motor,
                     sensors=sensors,
@@ -2507,11 +2534,11 @@ def run_pipeline(
                     us_blocked=us_blocked,
                     frame=frame,
                     pi_latched=pi_latched,
-                    motors_enabled=system_state.motors_enabled,
+                    motors_enabled=motors_en,
                     throttler=throttler,
                     sys_state=system_state,
                 )
-            elif current_ctrl_mode == "follow" or mode == "follow":
+            elif current_ctrl_mode == "follow":
                 follow_state, pi_latched, action_label = _run_follow(
                     motor=motor,
                     sensors=sensors,
@@ -2522,7 +2549,7 @@ def run_pipeline(
                     frame=frame,
                     follow_state=system_state.follow_state,
                     pi_latched=pi_latched,
-                    motors_enabled=system_state.motors_enabled,
+                    motors_enabled=motors_en,
                     throttler=throttler,
                     fresh_inference=fresh_inference,
                     sys_state=system_state,
@@ -2536,7 +2563,7 @@ def run_pipeline(
                     us_blocked=us_blocked,
                     frame=frame,
                     pi_latched=pi_latched,
-                    motors_enabled=system_state.motors_enabled,
+                    motors_enabled=motors_en,
                     throttler=throttler,
                     fresh_inference=fresh_inference,
                 )
@@ -2562,7 +2589,7 @@ def run_pipeline(
                     port_name=motor.port,
                     fps=fps,
                     awb_mode=system_state.current_awb,
-                    mode=system_state.control_mode if system_state.control_mode in ("manual", "follow", "lane") else mode,
+                    mode=current_ctrl_mode,
                     motors_enabled=system_state.motors_enabled,
                     invert_motors=system_state.invert_motors,
                     pi_latched=pi_latched,
