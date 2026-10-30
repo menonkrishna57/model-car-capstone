@@ -3,7 +3,7 @@ corner_recovery.py — Dual Ultrasonic Corner Collision Backup and Turn Recovery
 =============================================================================
 Implements Requirement 2:
 When both ultrasonic sensors report an obstacle collision (such as when trapped in a corner),
-the car reverses until both sensors report that it is safe or 1.0s has elapsed, and then
+the car reverses until both sensors report that it is safe or 200ms has elapsed, and then
 performs a turn maneuver away from the corner before resuming forward navigation.
 Includes multi-ping confirmation to suppress spurious ultrasonic noise spikes.
 """
@@ -42,7 +42,7 @@ class CornerRecoveryController:
 
     States:
         - IDLE: Monitoring sensors. Forward navigation active.
-        - BACKUP: Reversing at PWM 200 for up to 1.0s or until both sensors clear >= 25cm.
+        - BACKUP: Reversing at PWM 200 for up to 200ms or until both sensors clear >= 25cm.
         - TURN: Turning +/-45 deg away from corner towards greater clearance at PWM 200.
     """
 
@@ -52,7 +52,7 @@ class CornerRecoveryController:
         safe_threshold: float = 25.0,
         backup_speed: int = 200,
         turn_speed: int = 200,
-        backup_timeout_s: float = 1.0,
+        backup_timeout_s: float = 0.2,
         turn_duration_s: float = 0.5,
         turn_angle_deg: int = 45,
         confirm_count: int = 1,

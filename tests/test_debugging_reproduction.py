@@ -68,7 +68,7 @@ def test_two_consecutive_pings_trigger_reverse():
 
     assert is_recovering is True
     assert controller.state == RecoveryState.BACKUP
-    assert any("REV 200 1000" in cmd for cmd in serial_dev.written_commands)
+    assert any("REV 200 200" in cmd for cmd in serial_dev.written_commands)
 
 
 def test_single_sided_obstacle_executes_evasion_instead_of_freezing():

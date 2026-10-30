@@ -42,7 +42,7 @@ def test_dual_collision_triggers_reverse():
     assert "CORNER BACKUP" in action
 
     # Must issue reverse command with PWM 200 and 1000ms duration
-    assert any("REV 200 1000" in cmd for cmd in serial_dev.written_commands)
+    assert any("REV 200 200" in cmd for cmd in serial_dev.written_commands)
 
 
 def test_single_sided_obstacle_left_does_not_trigger_corner_backup():
@@ -102,13 +102,13 @@ def test_reverse_terminates_early_when_both_sensors_clear():
     serial_dev.written_commands.clear()
 
     # Step 2: 300ms later, sensors still close
-    controller.update(us_left=18.0, us_right=19.0, current_time=t0 + 0.3)
+    controller.update(us_left=18.0, us_right=19.0, current_time=t0 + 0.1)
     assert controller.state == RecoveryState.BACKUP
     assert len(serial_dev.written_commands) == 0
 
     # Step 3: 450ms later (< 1.0s), both sensors clear to safe distance (35cm and 45cm)
     # Right has 45cm > Left 35cm -> Turn RIGHT (+45°)
-    is_recovering, action = controller.update(us_left=35.0, us_right=45.0, current_time=t0 + 0.45)
+    is_recovering, action = controller.update(us_left=35.0, us_right=45.0, current_time=t0 + 0.15)
 
     assert is_recovering is True
     assert controller.state == RecoveryState.TURN
@@ -131,12 +131,12 @@ def test_reverse_terminates_at_1s_timeout_when_still_blocked():
     serial_dev.written_commands.clear()
 
     # Step 2: 800ms later (< 1.0s), still blocked
-    controller.update(us_left=12.0, us_right=14.0, current_time=t0 + 0.8)
+    controller.update(us_left=12.0, us_right=14.0, current_time=t0 + 0.1)
     assert controller.state == RecoveryState.BACKUP
 
     # Step 3: 1.0s elapsed (timeout reached), still blocked (12cm and 18cm)
     # Right 18cm >= Left 12cm -> Turn RIGHT (+45°)
-    is_recovering, action = controller.update(us_left=12.0, us_right=18.0, current_time=t0 + 1.0)
+    is_recovering, action = controller.update(us_left=12.0, us_right=18.0, current_time=t0 + 0.2)
 
     assert is_recovering is True
     assert controller.state == RecoveryState.TURN
@@ -180,7 +180,7 @@ def test_turn_maneuver_timeout_steers_left_when_left_has_more_space():
     serial_dev.written_commands.clear()
 
     # Timeout at 1.05s: Left 22cm > Right 14cm
-    is_recovering, action = controller.update(us_left=22.0, us_right=14.0, current_time=t0 + 1.05)
+    is_recovering, action = controller.update(us_left=22.0, us_right=14.0, current_time=t0 + 0.25)
 
     assert controller.state == RecoveryState.TURN
     assert any("TURN -45 200" in cmd for cmd in serial_dev.written_commands)
@@ -232,7 +232,7 @@ def test_resumption_to_idle_after_turn_duration():
     assert action == "IDLE"
 
     # 5. Next cycle remains in IDLE and normal forward navigation resumes
-    is_recovering, action = controller.update(us_left=40.0, us_right=45.0, current_time=t0 + 1.0)
+    is_recovering, action = controller.update(us_left=40.0, us_right=45.0, current_time=t0 + 0.2)
     assert is_recovering is False
     assert controller.state == RecoveryState.IDLE
 
@@ -244,7 +244,7 @@ def test_notify_turn_complete_early_ack():
 
     t0 = 100.0
     controller.update(us_left=15.0, us_right=15.0, current_time=t0)
-    controller.update(us_left=30.0, us_right=30.0, current_time=t0 + 0.3)
+    controller.update(us_left=30.0, us_right=30.0, current_time=t0 + 0.1)
     assert controller.state == RecoveryState.TURN
 
     # Telemetry notifies done turn at 150ms

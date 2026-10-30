@@ -1868,7 +1868,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                         reason = "us_rear_blocked"
                         sys_state.motor.stop()
                     else:
-                        sys_state.motor.reverse(spd, 350)
+                        sys_state.motor.reverse(spd, 200)
                         executed = True
                 elif cmd in ("left", "turn_left"):
                     sys_state.motor.turn(-40, speed=spd)
@@ -3095,7 +3095,7 @@ def run_pipeline(
         safe_threshold=EMERGENCY_STOP_DISTANCE_CM,
         backup_speed=200,
         turn_speed=200,
-        backup_timeout_s=1.0,
+        backup_timeout_s=0.2,
         turn_duration_s=0.5,
         turn_angle_deg=45,
         confirm_count=2,
