@@ -1868,7 +1868,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                         reason = "us_rear_blocked"
                         sys_state.motor.stop()
                     else:
-                        sys_state.motor.reverse(spd, 200)
+                        sys_state.motor.reverse(spd, 120)
                         executed = True
                 elif cmd in ("left", "turn_left"):
                     sys_state.motor.turn(-40, speed=spd)
@@ -2246,31 +2246,10 @@ def _run_lane(
 
     # ── 4. Ultrasonic Critical Stop (< EMERGENCY_STOP_DISTANCE_CM) ───────────
     if us_blocked:
-        # Check if one side has clear escape corridor
-        valid_l = is_valid_us(us_l_val)
-        valid_r = is_valid_us(us_r_val)
-        left_clear = not valid_l or us_l_val >= EMERGENCY_STOP_DISTANCE_CM
-        right_clear = not valid_r or us_r_val >= EMERGENCY_STOP_DISTANCE_CM
-
-        if left_clear and not right_clear:
-            # Right side blocked (<25cm), Left side clear: steer LEFT away from obstacle!
-            throttler.record_avoid_hint("LEFT")
-            if motors_enabled and throttler.should_send_turn(-35, 200):
-                motor.turn(-35, speed=200)
-                throttler.record_turn(-35, 200)
-            return pi_latched, f"🔀 US CRITICAL ESCAPE: Right Obs ({us_r_val:.0f}cm) -> Steering LEFT"
-        elif right_clear and not left_clear:
-            # Left side blocked (<25cm), Right side clear: steer RIGHT away from obstacle!
-            throttler.record_avoid_hint("RIGHT")
-            if motors_enabled and throttler.should_send_turn(35, 200):
-                motor.turn(35, speed=200)
-                throttler.record_turn(35, 200)
-            return pi_latched, f"🔀 US CRITICAL ESCAPE: Left Obs ({us_l_val:.0f}cm) -> Steering RIGHT"
-        else:
-            throttler.record_other("STOP")
-            if motors_enabled:
-                motor.stop()
-            return pi_latched, f"🛑 US AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)", lane_res
+        throttler.record_other("STOP")
+        if motors_enabled:
+            motor.stop()
+        return pi_latched, f"🛑 US AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)", lane_res
 
     # ── 5. Tier 2.5: In-Lane Active Obstacle / Pothole Bypass ────────────────
     # Check if there are active obstacles or potholes inside the driving corridor
@@ -2434,25 +2413,26 @@ def _run_autonomous(
                 us_l, us_r = us.get("left", 999.0), us.get("right", 999.0)
                 score_l, score_r = scores.get("left", 0.0), scores.get("right", 0.0)
 
-                # Prefer side with substantially lower danger / better clearance
-                if (decision == "RIGHT" or score_r < score_l) and (not is_valid_us(us_r) or us_r > us_l + 3.0 or us_r > 25.0):
-                    print("🔀 Auto-Unstick: Right side clear, releasing latch and turning right")
-                    motor.pi_go()
-                    pi_latched = False
-                    throttler.latch_start_time = 0.0
-                    if motors_enabled:
-                        motor.turn(45, speed=200)
-                        throttler.record_turn(45, 200)
-                    return pi_latched, "🔀 ESCAPE: Pivoting RIGHT around obstacle"
-                elif (decision == "LEFT" or score_l < score_r) and (not is_valid_us(us_l) or us_l > us_r + 3.0 or us_l > 25.0):
-                    print("🔀 Auto-Unstick: Left side clear, releasing latch and turning left")
-                    motor.pi_go()
-                    pi_latched = False
-                    throttler.latch_start_time = 0.0
-                    if motors_enabled:
-                        motor.turn(-45, speed=200)
-                        throttler.record_turn(-45, 200)
-                    return pi_latched, "🔀 ESCAPE: Pivoting LEFT around obstacle"
+                # Prefer side with substantially lower danger / verified clear space (>= 35cm)
+                if not us_blocked:
+                    if (decision == "RIGHT" or score_r < score_l) and (is_valid_us(us_r) and us_r > 35.0):
+                        print("🔀 Auto-Unstick: Right side clear, releasing latch and turning right")
+                        motor.pi_go()
+                        pi_latched = False
+                        throttler.latch_start_time = 0.0
+                        if motors_enabled:
+                            motor.turn(45, speed=200)
+                            throttler.record_turn(45, 200)
+                        return pi_latched, "🔀 ESCAPE: Pivoting RIGHT around obstacle"
+                    elif (decision == "LEFT" or score_l < score_r) and (is_valid_us(us_l) and us_l > 35.0):
+                        print("🔀 Auto-Unstick: Left side clear, releasing latch and turning left")
+                        motor.pi_go()
+                        pi_latched = False
+                        throttler.latch_start_time = 0.0
+                        if motors_enabled:
+                            motor.turn(-45, speed=200)
+                            throttler.record_turn(-45, 200)
+                        return pi_latched, "🔀 ESCAPE: Pivoting LEFT around obstacle"
 
             throttler.record_other("PI_STOPPED")
             return pi_latched, "🛑 PI_STOPPED (Obstacle Imminent)"
@@ -2513,21 +2493,22 @@ def _run_autonomous(
                 return pi_latched, recovery_action
 
     if us_blocked:
-        # Check if one side has clear escape corridor
+        # Check if one side has genuine wide-open escape corridor (>= 50cm) and the blocked side is not critically jammed (>= 14cm).
+        # Otherwise, stop immediately to prevent swinging into walls.
         valid_l = is_valid_us(us_l_val)
         valid_r = is_valid_us(us_r_val)
-        left_clear = not valid_l or us_l_val >= EMERGENCY_STOP_DISTANCE_CM
-        right_clear = not valid_r or us_r_val >= EMERGENCY_STOP_DISTANCE_CM
+        left_wide_open = valid_l and us_l_val >= 50.0
+        right_wide_open = valid_r and us_r_val >= 50.0
 
-        if left_clear and not right_clear:
-            # Right side blocked (<25cm), Left side clear: steer LEFT away from obstacle!
+        if left_wide_open and not right_wide_open and valid_r and us_r_val >= 14.0:
+            # Right side blocked (<25cm), Left side genuinely wide open (>=50cm): steer LEFT!
             throttler.record_avoid_hint("LEFT")
             if motors_enabled and throttler.should_send_turn(-35, 200):
                 motor.turn(-35, speed=200)
                 throttler.record_turn(-35, 200)
             return pi_latched, f"🔀 US CRITICAL ESCAPE: Right Obstacle ({us_r_val:.0f}cm) -> Steering LEFT"
-        elif right_clear and not left_clear:
-            # Left side blocked (<25cm), Right side clear: steer RIGHT away from obstacle!
+        elif right_wide_open and not left_wide_open and valid_l and us_l_val >= 14.0:
+            # Left side blocked (<25cm), Right side genuinely wide open (>=50cm): steer RIGHT!
             throttler.record_avoid_hint("RIGHT")
             if motors_enabled and throttler.should_send_turn(35, 200):
                 motor.turn(35, speed=200)
@@ -3084,6 +3065,8 @@ def run_pipeline(
         # Configure Arduino runtime defaults per PROTOCOL.md
         motor._send("TUNE SET TELEM_STREAM 1")
         motor._send("TUNE SET CLIFF_ENABLE 0")
+        motor._send("TUNE SET AVOID_REV_MS 100")
+        motor._send("TUNE SET AVOID_FWD_MS 0")
         motor.pi_go()
         motor.status()
 
@@ -3095,8 +3078,8 @@ def run_pipeline(
         safe_threshold=EMERGENCY_STOP_DISTANCE_CM,
         backup_speed=200,
         turn_speed=200,
-        backup_timeout_s=0.2,
-        turn_duration_s=0.5,
+        backup_timeout_s=0.1,
+        turn_duration_s=0.3,
         turn_angle_deg=45,
         confirm_count=2,
         motor=motor,

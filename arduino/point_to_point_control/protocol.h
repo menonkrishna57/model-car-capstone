@@ -64,8 +64,8 @@
 // Calibrate all three phases on the physical chassis before demo.
 // Phase sequence: Reverse → Skid-turn → Resume forward
 // =============================================================================
-#define AVOID_REVERSE_MS         200     // Phase 1: Back away from obstacle (ms)
-#define AVOID_CORNER_REV_MAX_MS  200     // Max reverse duration during dual obstacle / corner backup (ms)
+#define AVOID_REVERSE_MS         100     // Phase 1: Back away from obstacle (ms)
+#define AVOID_CORNER_REV_MAX_MS  100     // Max reverse duration during dual obstacle / corner backup (ms)
 #define AVOID_TURN_MS            500     // Phase 2: Skid-steer turn away from obstacle (ms)
 #define AVOID_RESUME_MS          2000    // Phase 3: Drive forward on new heading (ms)
 #define AVOID_SPEED              200     // PWM speed used for phases 1 & 2 (0–255, calibrated >= 200)

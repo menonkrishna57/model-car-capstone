@@ -52,8 +52,8 @@ class CornerRecoveryController:
         safe_threshold: float = 25.0,
         backup_speed: int = 200,
         turn_speed: int = 200,
-        backup_timeout_s: float = 0.2,
-        turn_duration_s: float = 0.5,
+        backup_timeout_s: float = 0.1,
+        turn_duration_s: float = 0.3,
         turn_angle_deg: int = 45,
         confirm_count: int = 1,
         motor: Any = None,
@@ -172,7 +172,7 @@ class CornerRecoveryController:
                 us_left >= self.safe_threshold and
                 us_right >= self.safe_threshold
             )
-            timed_out = elapsed >= self.backup_timeout_s
+            timed_out = (elapsed + 1e-4) >= self.backup_timeout_s
 
             if both_cleared or timed_out:
                 # Reverse terminates! Transition immediately to TURN.
@@ -198,7 +198,7 @@ class CornerRecoveryController:
         # ── State 3: TURN ────────────────────────────────────────────────────
         if self._state == RecoveryState.TURN:
             turn_elapsed = current_time - (self.turn_start_time or current_time)
-            if turn_elapsed >= self.turn_duration_s:
+            if (turn_elapsed + 1e-4) >= self.turn_duration_s:
                 # Turn maneuver completed! Transition to IDLE so forward navigation resumes.
                 self.reset()
                 return False, "IDLE"

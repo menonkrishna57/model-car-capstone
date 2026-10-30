@@ -68,7 +68,7 @@ def test_two_consecutive_pings_trigger_reverse():
 
     assert is_recovering is True
     assert controller.state == RecoveryState.BACKUP
-    assert any("REV 200 200" in cmd for cmd in serial_dev.written_commands)
+    assert any("REV 200 100" in cmd for cmd in serial_dev.written_commands)
 
 
 def test_single_sided_obstacle_executes_evasion_instead_of_freezing():
@@ -121,3 +121,34 @@ def test_manual_mode_reverse_not_killed_by_front_wall():
     man_act = sys_state.manual_action
     should_autobrake = us_blocked and not sys_state.manual_override_obstacles and (man_act in ("FORWARD", "FWD"))
     assert should_autobrake is False, "Front wall must not auto-brake a reverse maneuver in manual mode!"
+
+
+def test_wall_approaching_close_safely_autobrakes_instead_of_turning():
+    """Bug 5: When approaching a wall where one sensor reads <25cm and the other is NOT wide open (e.g. 26cm or invalid),
+    car must safely auto-brake (motor.stop()) rather than commanding an aggressive turn that slams into the wall."""
+    motor, serial_dev = create_mock_motor()
+    # Left is 20cm, Right is 26cm (facing a wall, neither side is wide open)
+    motor.latest_sonar = {"left": 20.0, "right": 26.0, "rear": 999.0}
+    sensors = SensorManager(motor_controller=motor)
+    throttler = CommandThrottler()
+    corner_recovery = CornerRecoveryController(motor=motor)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    pi_latched, action_label = _run_autonomous(
+        motor=motor,
+        sensors=sensors,
+        detections=[],
+        us_blocked=True,
+        frame=frame,
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+        fresh_inference=True,
+        corner_recovery=corner_recovery,
+    )
+
+    # Must STOP with US AUTO-BRAKE, not command a turn into the wall
+    assert "US AUTO-BRAKE" in action_label
+    assert any("STOP" in cmd for cmd in serial_dev.written_commands)
+    turn_cmds = [cmd for cmd in serial_dev.written_commands if "TURN" in cmd]
+    assert len(turn_cmds) == 0, f"Expected NO turn into wall, got: {turn_cmds}"
