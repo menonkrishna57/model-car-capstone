@@ -102,6 +102,15 @@ FOLLOW_SLOW_SPEED   = 180
 DRIVE_CMD_DURATION_MS = 300     # Duration in ms sent with DRIVE commands
 DRIVE_THROTTLE_INTERVAL_S = 0.18 # Interval between repeated DRIVE commands (~5.5 Hz)
 
+# A TURN command is a complete, timed skid-steer manoeuvre on the Uno, not a
+# continuous steering setpoint.  Do not react to every camera frame as though
+# it were a servo command: that repeatedly replaces a turn before the chassis
+# has moved and produces the familiar left/right "hunting" behaviour.
+LANE_STEER_EMA_ALPHA = 0.28
+LANE_TURN_MAX_BURST_DEG = 18
+LANE_TURN_SETTLE_S = 0.30
+LANE_REVERSAL_CONFIRM_FRAMES = 3
+
 # ── Camera Controls & AWB Definitions ────────────────────────────────────────
 try:
     from libcamera import controls, Transform
@@ -287,6 +296,76 @@ class CommandThrottler:
     def record_other(self, cmd: str):
         self.last_cmd = cmd
         self.last_speed = None
+
+
+class LaneSteeringStabilizer:
+    """Convert noisy visual steering estimates into safe skid-steer bursts.
+
+    Lane detection runs at camera rate, while the Arduino executes ``TURN`` as
+    a timed action.  This controller smooths the visual estimate, limits each
+    correction to a small burst, and requires consecutive opposite-direction
+    estimates before permitting a reversal.  It intentionally has no integral
+    term: the next post-turn camera frame is the feedback that removes residual
+    error.
+    """
+
+    def __init__(
+        self,
+        ema_alpha: float = LANE_STEER_EMA_ALPHA,
+        max_turn_deg: int = LANE_TURN_MAX_BURST_DEG,
+        settle_s: float = LANE_TURN_SETTLE_S,
+        reversal_confirm_frames: int = LANE_REVERSAL_CONFIRM_FRAMES,
+    ):
+        self.ema_alpha = float(np.clip(ema_alpha, 0.01, 1.0))
+        self.max_turn_deg = max(1, int(max_turn_deg))
+        self.settle_s = max(0.0, float(settle_s))
+        self.reversal_confirm_frames = max(1, int(reversal_confirm_frames))
+        self.filtered_angle: Optional[float] = None
+        self.last_direction = 0
+        self.opposite_frames = 0
+        self.turn_settle_until = 0.0
+
+    def reset(self):
+        self.filtered_angle = None
+        self.last_direction = 0
+        self.opposite_frames = 0
+        self.turn_settle_until = 0.0
+
+    def is_settling(self, now: Optional[float] = None) -> bool:
+        return (time.monotonic() if now is None else now) < self.turn_settle_until
+
+    def mark_turn_sent(self, now: Optional[float] = None):
+        now = time.monotonic() if now is None else now
+        self.turn_settle_until = now + self.settle_s
+
+    def update(self, raw_angle_deg: float, deadband_deg: float) -> int:
+        """Return a bounded turn burst, or zero when a reversal is unconfirmed."""
+        if not math.isfinite(raw_angle_deg):
+            return 0
+
+        if self.filtered_angle is None:
+            self.filtered_angle = float(raw_angle_deg)
+        else:
+            self.filtered_angle += self.ema_alpha * (float(raw_angle_deg) - self.filtered_angle)
+
+        angle = self.filtered_angle
+        if abs(angle) <= deadband_deg:
+            self.last_direction = 0
+            self.opposite_frames = 0
+            return 0
+
+        direction = 1 if angle > 0 else -1
+        if self.last_direction and direction != self.last_direction:
+            self.opposite_frames += 1
+            if self.opposite_frames < self.reversal_confirm_frames:
+                return 0
+        else:
+            self.opposite_frames = 0
+
+        self.last_direction = direction
+        self.opposite_frames = 0
+        magnitude = min(self.max_turn_deg, max(1, int(round(abs(angle)))))
+        return direction * magnitude
 
 
 # =============================================================================
@@ -2090,6 +2169,7 @@ def _run_lane(
     motors_enabled: bool,
     throttler: CommandThrottler,
     sys_state: Optional[SystemState] = None,
+    lane_steering: Optional[LaneSteeringStabilizer] = None,
 ) -> Tuple[bool, str, LaneDetectionResult]:
     """
     Executes one loop iteration of Chart-Paper Lane Following mode (Option A).
@@ -2216,11 +2296,41 @@ def _run_lane(
         throttler.record_other("STOP")
         return pi_latched, f"⚠️ LANE LOST ({lane_res.lost_frames}f): Holding Safe Stop", lane_res
 
+    # In production one stabilizer lives for the whole lane-follow run.  The
+    # optional fallback preserves the public helper API used by offline tests.
+    if lane_steering is None:
+        lane_steering = LaneSteeringStabilizer()
+
     # Either locked onto lane (DUAL_LOCKED, SINGLE_LEFT, SINGLE_RIGHT) or active coasting with valid trajectory
-    delta = lane_res.steer_angle_deg
     is_coasting = (lane_res.status == "LANE_LOST")
 
-    if abs(delta) <= lane_detector.steer_deadband_deg:
+    # The vision result is intentionally held for a few frames during a brief
+    # tape gap.  It is safe to coast straight through that gap, but issuing a
+    # stale skid-steer burst can turn the car into the missing boundary.
+    if is_coasting:
+        lane_steering.update(0.0, lane_detector.steer_deadband_deg)
+        target_speed = LANE_CRUISE_SPEED
+        if motors_enabled and throttler.should_send_drive(target_speed):
+            motor.drive(target_speed, throttler.drive_duration_ms)
+            throttler.record_drive(target_speed)
+        return (
+            pi_latched,
+            f"⚠️ LANE COASTING ({lane_res.lost_frames}/{lane_detector.lost_max_frames}): Straight",
+            lane_res,
+        )
+
+    # Never replace a live Arduino turn; wait for its telemetry (and retain a
+    # local settling guard for the serial round trip) before evaluating the
+    # next burst.  Camera safety and ultrasonic checks above still preempt it.
+    if arduino_state in ("TURNING", "STATE_TURNING") or lane_steering.is_settling():
+        return pi_latched, "🛣️ LANE TURN SETTLING: Awaiting Updated Camera Pose", lane_res
+
+    steer_cmd = lane_steering.update(
+        lane_res.steer_angle_deg,
+        lane_detector.steer_deadband_deg,
+    )
+
+    if steer_cmd == 0:
         target_speed = LANE_CRUISE_SPEED
         if motors_enabled:
             if throttler.should_send_drive(target_speed):
@@ -2228,22 +2338,16 @@ def _run_lane(
                 throttler.record_drive(target_speed)
         else:
             target_speed = 0
-        if is_coasting:
-            action_label = f"⚠️ LANE COASTING ({lane_res.lost_frames}/{lane_detector.lost_max_frames}): Straight"
-        else:
-            action_label = f"🛣️ LANE LOCKED ({lane_res.status}): Straight (PWM {LANE_CRUISE_SPEED})"
+        action_label = f"🛣️ LANE LOCKED ({lane_res.status}): Straight (PWM {LANE_CRUISE_SPEED})"
     else:
-        steer_cmd = int(round(delta))
         target_speed = LANE_CURVE_SPEED
         if motors_enabled:
             if throttler.should_send_turn(steer_cmd, target_speed):
                 motor.turn(steer_cmd, speed=target_speed)
                 throttler.record_turn(steer_cmd, target_speed)
+                lane_steering.mark_turn_sent()
         steer_dir = "RIGHT" if steer_cmd > 0 else "LEFT"
-        if is_coasting:
-            action_label = f"⚠️ LANE COASTING ({lane_res.lost_frames}/{lane_detector.lost_max_frames}): Steer {steer_dir} ({abs(steer_cmd)}°)"
-        else:
-            action_label = f"🛣️ LANE STEER {steer_dir} ({abs(steer_cmd)}° | PWM {LANE_CURVE_SPEED})"
+        action_label = f"🛣️ LANE STEER {steer_dir} ({abs(steer_cmd)}° | PWM {LANE_CURVE_SPEED})"
 
     return pi_latched, action_label, lane_res
 
@@ -2963,6 +3067,7 @@ def run_pipeline(
 
     # ── 3b. Chart-Paper Lane Following Components ────────────────────────────
     lane_detector = ChartLaneDetector(color_mode=system_state.lane_color_mode)
+    lane_steering = LaneSteeringStabilizer()
 
     # ── 4. Camera Setup ──────────────────────────────────────────────────────
     use_picam2 = False
@@ -3128,6 +3233,7 @@ def run_pipeline(
                     motors_enabled=motors_en,
                     throttler=throttler,
                     sys_state=system_state,
+                    lane_steering=lane_steering,
                 )
             elif current_ctrl_mode == "follow":
                 follow_state, pi_latched, action_label = _run_follow(

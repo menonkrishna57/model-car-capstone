@@ -41,6 +41,7 @@ from car.perception.lane_detector import (
 )
 from car.main import (
     CommandThrottler,
+    LaneSteeringStabilizer,
     SystemState,
     DiagnosticHandler,
     StreamingServer,
@@ -178,6 +179,48 @@ def test_curved_track_steering():
     res_left = detector.detect(frame_left)
     assert res_left.status == "DUAL_LOCKED"
     assert res_left.steer_angle_deg < -4.0
+
+
+def test_one_frame_pair_jump_coasts_instead_of_reversing_steering():
+    """A false pair in the next frame must not replace an established lane lock."""
+    detector = ChartLaneDetector(color_mode="dark")
+    centered = create_synthetic_chart_paper_frame(width=640, height=480)
+    first = detector.detect(centered)
+    assert first.status == "DUAL_LOCKED"
+
+    # Both false lines are geometrically plausible, but have moved almost a
+    # third of the image in one camera frame.  This models the common case
+    # where a reflection or an adjacent tape segment wins the histogram.
+    false_pair = create_synthetic_chart_paper_frame(
+        width=640, height=480, left_x_frac=0.54, right_x_frac=0.91
+    )
+    rejected = detector.detect(false_pair)
+
+    assert rejected.status == "LANE_LOST"
+    assert rejected.center_coeffs is not None
+    assert abs(rejected.steer_angle_deg - first.steer_angle_deg) <= 1.0
+
+
+def test_single_line_side_handoff_jump_coasts_instead_of_reversing():
+    """A newly classified opposite boundary also needs centreline continuity."""
+    detector = ChartLaneDetector(color_mode="dark")
+    left_only = create_synthetic_chart_paper_frame(
+        width=640, height=480, left_x_frac=0.25, draw_right=False
+    )
+    first = detector.detect(left_only)
+    assert first.status == "SINGLE_LEFT"
+
+    # The sole peak is far enough right to be classified as SINGLE_RIGHT, so
+    # it has no same-side history.  Its reconstructed centre is implausibly
+    # far from the preceding SINGLE_LEFT centre and must be treated as noise.
+    false_right = create_synthetic_chart_paper_frame(
+        width=640, height=480, right_x_frac=0.95, draw_left=False
+    )
+    rejected = detector.detect(false_right)
+
+    assert rejected.status == "LANE_LOST"
+    assert rejected.center_coeffs is not None
+    assert abs(rejected.steer_angle_deg - first.steer_angle_deg) <= 1.0
 
 
 # =============================================================================
@@ -323,6 +366,20 @@ def test_run_lane_curved_steer():
     assert res.status == "DUAL_LOCKED"
     assert "LANE STEER RIGHT" in action
     assert any("TURN" in c and str(LANE_CURVE_SPEED) in c for c in serial_dev.written_commands)
+
+
+def test_lane_steering_stabilizer_rejects_one_frame_reversal_and_limits_burst():
+    """A noisy opposite estimate must not interrupt a timed skid-steer turn."""
+    stabilizer = LaneSteeringStabilizer(
+        ema_alpha=1.0,
+        max_turn_deg=18,
+        reversal_confirm_frames=3,
+    )
+
+    assert stabilizer.update(40.0, deadband_deg=6.0) == 18
+    assert stabilizer.update(-20.0, deadband_deg=6.0) == 0
+    assert stabilizer.update(-20.0, deadband_deg=6.0) == 0
+    assert stabilizer.update(-20.0, deadband_deg=6.0) == -18
 
 
 def test_run_lane_in_lane_hazard_bypass():
