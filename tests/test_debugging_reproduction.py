@@ -152,3 +152,89 @@ def test_wall_approaching_close_safely_autobrakes_instead_of_turning():
     assert any("STOP" in cmd for cmd in serial_dev.written_commands)
     turn_cmds = [cmd for cmd in serial_dev.written_commands if "TURN" in cmd]
     assert len(turn_cmds) == 0, f"Expected NO turn into wall, got: {turn_cmds}"
+
+
+def test_recovery_does_not_repeat_consecutively_preventing_blind_reverse_into_walls():
+    """Verify that after completing 1 recovery (backup + turn), if the car is still blocked,
+    it does NOT trigger another backup, and instead safely holds in place."""
+    motor, serial_dev = create_mock_motor()
+    controller = CornerRecoveryController(motor=motor, confirm_count=1, backup_timeout_s=0.1, turn_duration_s=0.3)
+
+    t0 = 100.0
+    # Step 1: Trigger recovery
+    controller.update(us_left=15.0, us_right=15.0, current_time=t0)
+    assert controller.state == RecoveryState.BACKUP
+    assert any("REV 200 100" in cmd for cmd in serial_dev.written_commands)
+    serial_dev.written_commands.clear()
+
+    # Step 2: Timeout backup -> enters TURN
+    controller.update(us_left=15.0, us_right=15.0, current_time=t0 + 0.12)
+    assert controller.state == RecoveryState.TURN
+
+    # Step 3: Complete TURN -> transitions to IDLE and enters cooldown
+    is_rec, action = controller.update(us_left=15.0, us_right=15.0, current_time=t0 + 0.45)
+    assert is_rec is False
+    assert controller.state == RecoveryState.IDLE
+    assert controller.can_trigger(current_time=t0 + 0.46) is False
+
+    # Step 4: Next tick while still facing wall (15cm) - MUST NOT trigger another backup!
+    is_rec2, action2 = controller.update(us_left=15.0, us_right=15.0, current_time=t0 + 0.50)
+    assert is_rec2 is False
+    assert controller.state == RecoveryState.IDLE
+    # No new REV command dispatched!
+    assert not any("REV" in cmd for cmd in serial_dev.written_commands)
+
+
+def test_single_sided_wall_jam_executes_recovery_nudge_when_closely_jammed():
+    """Verify that if car is jammed close against a wall (Left=6cm, Right=30cm),
+    it executes a brief 100ms reverse nudge and steers right away from the left wall,
+    rather than freezing or crashing."""
+    motor, serial_dev = create_mock_motor()
+    motor.latest_sonar = {"left": 6.0, "right": 30.0, "rear": 999.0}
+    sensors = SensorManager(motor_controller=motor)
+    throttler = CommandThrottler()
+    corner_recovery = CornerRecoveryController(motor=motor, confirm_count=1)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    pi_latched, action_label = _run_autonomous(
+        motor=motor,
+        sensors=sensors,
+        detections=[],
+        us_blocked=True,
+        frame=frame,
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+        fresh_inference=True,
+        corner_recovery=corner_recovery,
+    )
+
+    # Must initiate recovery backup (100ms)
+    assert corner_recovery.state == RecoveryState.BACKUP
+    assert any("REV 200 100" in cmd for cmd in serial_dev.written_commands)
+
+
+def test_arduino_avoidance_overridden_by_pi():
+    """Verify that if Arduino enters AVOIDING state, Pi does not yield,
+    but immediately overrides it with PI_STOP/PI_GO to prevent inverted crash."""
+    motor, serial_dev = create_mock_motor()
+    motor.latest_state = "AVOIDING"
+    sensors = SensorManager(motor_controller=motor)
+    throttler = CommandThrottler()
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    pi_latched, action_label = _run_autonomous(
+        motor=motor,
+        sensors=sensors,
+        detections=[],
+        us_blocked=False,
+        frame=frame,
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+        fresh_inference=True,
+    )
+
+    assert "OVERRIDING ARDUINO" in action_label
+    assert any("PI_STOP" in cmd for cmd in serial_dev.written_commands)
+    assert any("PI_GO" in cmd for cmd in serial_dev.written_commands)

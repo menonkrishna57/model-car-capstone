@@ -2,10 +2,12 @@
 corner_recovery.py — Dual Ultrasonic Corner Collision Backup and Turn Recovery
 =============================================================================
 Implements Requirement 2:
-When both ultrasonic sensors report an obstacle collision (such as when trapped in a corner),
-the car reverses until both sensors report that it is safe or 200ms has elapsed, and then
-performs a turn maneuver away from the corner before resuming forward navigation.
-Includes multi-ping confirmation to suppress spurious ultrasonic noise spikes.
+When ultrasonic sensors report an obstacle collision (such as when trapped in a corner
+or critically jammed against a wall), the car reverses for a brief nudge (100ms) until
+sensors clear or timeout elapses, and then performs a turn maneuver away from the obstacle
+before resuming forward navigation.
+Includes multi-ping confirmation to suppress spurious ultrasonic noise spikes,
+and a strict single-attempt cooldown limiter to prevent continuous blind reversing.
 """
 
 from enum import Enum
@@ -42,8 +44,8 @@ class CornerRecoveryController:
 
     States:
         - IDLE: Monitoring sensors. Forward navigation active.
-        - BACKUP: Reversing at PWM 200 for up to 200ms or until both sensors clear >= 25cm.
-        - TURN: Turning +/-45 deg away from corner towards greater clearance at PWM 200.
+        - BACKUP: Reversing at PWM 200 for up to 100ms or until sensors clear >= 25cm.
+        - TURN: Turning +/-45 deg away from obstacle towards greater clearance at PWM 200.
     """
 
     def __init__(
@@ -56,6 +58,8 @@ class CornerRecoveryController:
         turn_duration_s: float = 0.3,
         turn_angle_deg: int = 45,
         confirm_count: int = 1,
+        cooldown_s: float = 2.0,
+        max_attempts: int = 1,
         motor: Any = None,
     ):
         self.collision_threshold = float(collision_threshold)
@@ -66,6 +70,8 @@ class CornerRecoveryController:
         self.turn_duration_s = float(turn_duration_s)
         self.turn_angle_deg = int(turn_angle_deg)
         self.confirm_count = max(1, int(confirm_count))
+        self.cooldown_s = float(cooldown_s)
+        self.max_attempts = int(max_attempts)
         self.motor = motor
 
         self._state: RecoveryState = RecoveryState.IDLE
@@ -75,6 +81,8 @@ class CornerRecoveryController:
         self.last_turn_angle: int = 0
         self.last_us_left: Optional[float] = None
         self.last_us_right: Optional[float] = None
+        self.last_recovery_time: float = 0.0
+        self.attempt_count: int = 0
 
     @property
     def state(self) -> RecoveryState:
@@ -84,6 +92,25 @@ class CornerRecoveryController:
     def is_recovering(self) -> bool:
         """True if currently executing backup or turn escape recovery."""
         return self._state != RecoveryState.IDLE
+
+    def can_trigger(self, current_time: Optional[float] = None) -> bool:
+        """
+        Returns True if controller is eligible to initiate a new recovery maneuver.
+        Enforces cooldown and max attempt limits to prevent continuous blind reverses.
+        """
+        if current_time is None:
+            current_time = time.monotonic()
+        if self._state != RecoveryState.IDLE:
+            return True
+        if self.attempt_count >= self.max_attempts:
+            return False
+        if current_time < (self.last_recovery_time + self.cooldown_s):
+            return False
+        return True
+
+    def reset_attempts(self) -> None:
+        """Resets the attempt counter when the vehicle is in clear open space."""
+        self.attempt_count = 0
 
     def is_corner_collision(self, us_left: Any, us_right: Any) -> bool:
         """
@@ -95,8 +122,45 @@ class CornerRecoveryController:
             return False
         return us_left <= self.collision_threshold and us_right <= self.collision_threshold
 
+    def start_recovery(
+        self,
+        us_left: Any,
+        us_right: Any,
+        motor: Any = _SENTINEL,
+        enabled: bool = True,
+        current_time: Optional[float] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Initiates a single recovery maneuver (100ms reverse nudge + turn away from obstacle).
+        Used when the vehicle is closely jammed against a wall or obstacle.
+        """
+        if current_time is None:
+            current_time = time.monotonic()
+        if motor is _SENTINEL:
+            motor = self.motor
+        if not enabled:
+            motor = None
+
+        valid_l = is_valid_us(us_left)
+        valid_r = is_valid_us(us_right)
+        if valid_l:
+            self.last_us_left = float(us_left)
+        if valid_r:
+            self.last_us_right = float(us_right)
+
+        self._state = RecoveryState.BACKUP
+        self.start_time = current_time
+        self._collision_counter = 0
+
+        if enabled and motor is not None and hasattr(motor, "reverse"):
+            motor.reverse(speed=self.backup_speed, duration_ms=int(self.backup_timeout_s * 1000))
+
+        cl = f"{float(us_left):.1f}cm" if valid_l else "invalid"
+        cr = f"{float(us_right):.1f}cm" if valid_r else "invalid"
+        return True, f"🔄 OBSTACLE BACKUP ({cl} / {cr})"
+
     def reset(self) -> None:
-        """Resets controller state to IDLE and clears timers and collision counter."""
+        """Resets controller state to IDLE and clears active maneuver timers."""
         self._state = RecoveryState.IDLE
         self._collision_counter = 0
         self.start_time = None
@@ -146,6 +210,8 @@ class CornerRecoveryController:
         # ── State 1: IDLE ────────────────────────────────────────────────────
         if self._state == RecoveryState.IDLE:
             if self.is_corner_collision(us_left, us_right):
+                if not self.can_trigger(current_time):
+                    return False, "IDLE (Recovery cooldown active)"
                 self._collision_counter += 1
                 if self._collision_counter >= self.confirm_count:
                     # Confirmed dual obstacle collision detected! Initiate reverse backup.
@@ -166,7 +232,7 @@ class CornerRecoveryController:
 
             # Check termination conditions:
             # 1. Both sensors clear to safe distance (>= 25.0cm)
-            # 2. Or backup timeout (>= 1.0s) has elapsed
+            # 2. Or backup timeout (>= 100ms) has elapsed
             both_cleared = (
                 valid_l and valid_r and
                 us_left >= self.safe_threshold and
@@ -199,7 +265,9 @@ class CornerRecoveryController:
         if self._state == RecoveryState.TURN:
             turn_elapsed = current_time - (self.turn_start_time or current_time)
             if (turn_elapsed + 1e-4) >= self.turn_duration_s:
-                # Turn maneuver completed! Transition to IDLE so forward navigation resumes.
+                # Turn maneuver completed! Record timestamp and increment attempt counter to enforce cooldown.
+                self.last_recovery_time = current_time
+                self.attempt_count += 1
                 self.reset()
                 return False, "IDLE"
 

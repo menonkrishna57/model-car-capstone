@@ -2221,10 +2221,13 @@ def _run_lane(
             throttler.record_other("PI_STOPPED")
             return pi_latched, "🛑 PI_STOPPED (Lane Latch Active)", lane_res
 
-    # ── 3. Respect Arduino Autonomous Reflex States (Tier 2 & 1.5) ────────────
+    # ── 3. Neutralize Inverted Arduino Autonomous Reflex States (Tier 2 & 1.5) ─
     if arduino_state in ("AVOIDING", "STATE_AVOIDING", "CLIFF_REVERSING", "STATE_CLIFF_REVERSING"):
-        throttler.record_other(arduino_state)
-        return pi_latched, f"🔀 ARDUINO {arduino_state} (Yielding)", lane_res
+        print(f"⚠️ Arduino entered {arduino_state} — overriding with PI_STOP to prevent inverted crash.")
+        motor.pi_stop()
+        motor.pi_go()
+        throttler.record_other("OVERRIDE_AVOID")
+        return pi_latched, f"🛑 OVERRIDING ARDUINO {arduino_state}", lane_res
 
     if arduino_state in ("CLIFF_STOPPED", "STATE_CLIFF_STOPPED"):
         throttler.record_other(arduino_state)
@@ -2449,10 +2452,13 @@ def _run_autonomous(
             throttler.record_other("PI_STOPPED")
             return pi_latched, "🛑 PI_STOPPED (Camera Latch Active)"
 
-    # ── 3. Respect Arduino Autonomous Reflex States (Tier 2 & 1.5) ────────────
+    # ── 3. Neutralize Inverted Arduino Autonomous Reflex States (Tier 2 & 1.5) ─
     if arduino_state in ("AVOIDING", "STATE_AVOIDING", "CLIFF_REVERSING", "STATE_CLIFF_REVERSING"):
-        throttler.record_other(arduino_state)
-        return pi_latched, f"🔀 ARDUINO {arduino_state} (Yielding)"
+        print(f"⚠️ Arduino entered {arduino_state} — overriding with PI_STOP to prevent inverted crash.")
+        motor.pi_stop()
+        motor.pi_go()
+        throttler.record_other("OVERRIDE_AVOID")
+        return pi_latched, f"🛑 OVERRIDING ARDUINO {arduino_state}"
 
     # ── 4. Handle Cliff Latched Stop (Tier 1.5) ───────────────────────────────
     if arduino_state in ("CLIFF_STOPPED", "STATE_CLIFF_STOPPED"):
@@ -2475,16 +2481,58 @@ def _run_autonomous(
             pi_latched = True
             return pi_latched, "🛑 PI_STOPPED (Arduino Latched)"
 
-    # ── 5. Ultrasonic Critical Stop / Corner Recovery (< EMERGENCY_STOP_DISTANCE_CM) ──
+    # ── 5. Ultrasonic Critical Stop / Obstacle Recovery (< EMERGENCY_STOP_DISTANCE_CM) ──
     us_l_val = us.get('left', 999.0)
     us_r_val = us.get('right', 999.0)
-    if corner_recovery is not None:
-        if corner_recovery.is_recovering or corner_recovery.is_corner_collision(us_l_val, us_r_val):
-            recovering, recovery_action = corner_recovery.update(
+
+    # 5a. If corner/obstacle recovery is actively executing, advance its FSM
+    if corner_recovery is not None and corner_recovery.is_recovering:
+        recovering, recovery_action = corner_recovery.update(
+            us_left=us_l_val,
+            us_right=us_r_val,
+            motor=motor,
+            enabled=motors_enabled,
+        )
+        if recovering:
+            throttler.record_other("CORNER_RECOVERY")
+            if not motors_enabled:
+                return pi_latched, f"⏸️ BENCH SAFE: {recovery_action} (Suppressed)"
+            return pi_latched, recovery_action
+
+    # 5b. If front path is blocked (< 25cm)
+    if us_blocked:
+        valid_l = is_valid_us(us_l_val)
+        valid_r = is_valid_us(us_r_val)
+        left_wide_open = valid_l and us_l_val >= 50.0
+        right_wide_open = valid_r and us_r_val >= 50.0
+
+        if left_wide_open and not right_wide_open and valid_r and us_r_val >= 18.0:
+            # Right side blocked (<25cm), Left side genuinely wide open (>=50cm): steer LEFT!
+            throttler.record_avoid_hint("LEFT")
+            if motors_enabled and throttler.should_send_turn(-35, 200):
+                motor.turn(-35, speed=200)
+                throttler.record_turn(-35, 200)
+            return pi_latched, f"🔀 US CRITICAL ESCAPE: Right Obstacle ({us_r_val:.0f}cm) -> Steering LEFT"
+        elif right_wide_open and not left_wide_open and valid_l and us_l_val >= 18.0:
+            # Left side blocked (<25cm), Right side genuinely wide open (>=50cm): steer RIGHT!
+            throttler.record_avoid_hint("RIGHT")
+            if motors_enabled and throttler.should_send_turn(35, 200):
+                motor.turn(35, speed=200)
+                throttler.record_turn(35, 200)
+            return pi_latched, f"🔀 US CRITICAL ESCAPE: Left Obstacle ({us_l_val:.0f}cm) -> Steering RIGHT"
+
+        # Neither side is wide open, OR car is jammed close (< 18cm, e.g. 6cm into wall):
+        # Trigger brief 100ms reverse nudge + turn away IF recovery is allowed (max 1 attempt)
+        now_time = time.monotonic()
+        is_jammed = (valid_l and us_l_val < 18.0) or (valid_r and us_r_val < 18.0) or (valid_l and valid_r and us_l_val <= 25.0 and us_r_val <= 25.0)
+
+        if corner_recovery is not None and is_jammed and corner_recovery.can_trigger(now_time):
+            recovering, recovery_action = corner_recovery.start_recovery(
                 us_left=us_l_val,
                 us_right=us_r_val,
                 motor=motor,
                 enabled=motors_enabled,
+                current_time=now_time,
             )
             if recovering:
                 throttler.record_other("CORNER_RECOVERY")
@@ -2492,33 +2540,15 @@ def _run_autonomous(
                     return pi_latched, f"⏸️ BENCH SAFE: {recovery_action} (Suppressed)"
                 return pi_latched, recovery_action
 
-    if us_blocked:
-        # Check if one side has genuine wide-open escape corridor (>= 50cm) and the blocked side is not critically jammed (>= 14cm).
-        # Otherwise, stop immediately to prevent swinging into walls.
-        valid_l = is_valid_us(us_l_val)
-        valid_r = is_valid_us(us_r_val)
-        left_wide_open = valid_l and us_l_val >= 50.0
-        right_wide_open = valid_r and us_r_val >= 50.0
+        # Otherwise safely auto-brake and HOLD in place. DO NOT reverse again!
+        throttler.record_other("STOP")
+        if motors_enabled:
+            motor.stop()
+        return pi_latched, f"🛑 US AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)"
 
-        if left_wide_open and not right_wide_open and valid_r and us_r_val >= 14.0:
-            # Right side blocked (<25cm), Left side genuinely wide open (>=50cm): steer LEFT!
-            throttler.record_avoid_hint("LEFT")
-            if motors_enabled and throttler.should_send_turn(-35, 200):
-                motor.turn(-35, speed=200)
-                throttler.record_turn(-35, 200)
-            return pi_latched, f"🔀 US CRITICAL ESCAPE: Right Obstacle ({us_r_val:.0f}cm) -> Steering LEFT"
-        elif right_wide_open and not left_wide_open and valid_l and us_l_val >= 14.0:
-            # Left side blocked (<25cm), Right side genuinely wide open (>=50cm): steer RIGHT!
-            throttler.record_avoid_hint("RIGHT")
-            if motors_enabled and throttler.should_send_turn(35, 200):
-                motor.turn(35, speed=200)
-                throttler.record_turn(35, 200)
-            return pi_latched, f"🔀 US CRITICAL ESCAPE: Left Obstacle ({us_l_val:.0f}cm) -> Steering RIGHT"
-        else:
-            throttler.record_other("STOP")
-            if motors_enabled:
-                motor.stop()
-            return pi_latched, f"🛑 US AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)"
+    # Reset recovery attempt counter when both sensors are clear in open space (> 30cm)
+    if corner_recovery is not None and is_valid_us(us_l_val) and us_l_val > 30.0 and is_valid_us(us_r_val) and us_r_val > 30.0:
+        corner_recovery.reset_attempts()
 
     # ── 6. Active Obstacle Avoidance & Steering ──────────────────────────────
     scores = compute_zone_scores(valid_detections, frame_w, frame_h, sonar=us)
@@ -3062,12 +3092,8 @@ def run_pipeline(
                 print(f"  🤖 Arduino ready: {line}")
                 break
             time.sleep(0.05)
-        # Configure Arduino runtime defaults per PROTOCOL.md
-        motor._send("TUNE SET TELEM_STREAM 1")
-        motor._send("TUNE SET CLIFF_ENABLE 0")
-        motor._send("TUNE SET AVOID_REV_MS 100")
-        motor._send("TUNE SET AVOID_FWD_MS 0")
-        motor.pi_go()
+        # Configure Arduino runtime defaults: disable inverted Tier 2 avoidance & cliff
+        motor.configure_arduino_runtime()
         motor.status()
 
     sensors = SensorManager(motor_controller=motor)

@@ -278,6 +278,23 @@ class MotorController:
         """Resets parameters to compile-time factory defaults."""
         return self._send("TUNE RESET")
 
+    def configure_arduino_runtime(self) -> bool:
+        """
+        Disables onboard inverted Tier-2 autonomous avoidance and cliff reflexes,
+        ensuring the Pi has authoritative control over chassis actuation.
+        """
+        if not self.is_connected():
+            return False
+        self._send("TUNE SET TELEM_STREAM 1")
+        self._send("TUNE SET CLIFF_ENABLE 0")
+        self._send("TUNE SET US_THRESH 0")
+        self._send("TUNE SET AVOID_SPD 0")
+        self._send("TUNE SET AVOID_REV_MS 0")
+        self._send("TUNE SET AVOID_FWD_MS 0")
+        self._send("TUNE SET AVOID_TURN_MS 0")
+        self.pi_go()
+        return True
+
     # ── Telemetry Reader ──────────────────────────────────────────────────────
 
     def read_telemetry(self) -> Optional[str]:
