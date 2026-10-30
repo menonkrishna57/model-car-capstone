@@ -137,3 +137,133 @@ def test_reproduce_false_target_too_close_at_normal_following_distance():
     # It MUST NOT report TARGET TOO CLOSE (Holding) at 2.2m!
     assert "TARGET TOO CLOSE" not in action, f"Falsely reported TARGET TOO CLOSE at 2.2m! Action: {action}"
     assert "FOLLOWING" in action or "Cruise" in action or "Fast" in action, f"Expected FOLLOWING action, got {action}"
+
+
+def test_reproduce_follow_steering_over_amplification_and_deadband():
+    """
+    Demonstrates bug: 'its turning too much when it sees me'.
+    1. Small offset (center_x = 360, offset = 40px ~= 3.3 deg) should fall in deadband
+       and command DRIVE (straight), NOT in-place skid-turn!
+    2. Moderate offset (center_x = 440, offset = 120px ~= 10.0 deg) should command
+       a moderate turn burst (<= 15 deg), NOT an aggressive over-steer (36 deg - 45 deg)!
+    """
+    motor, mock_serial = create_mock_motor()
+    sensors = SensorManager()
+    pid = PID(P=0.085, I=0.0, D=0.02)
+    pid.SetPoint = 320
+    throttler = CommandThrottler()
+    sys_state = SystemState()
+
+    tracker = ObjectTracker()
+    # Case 1: Person slightly off-center (x=310, w=100 -> center_x = 360, offset = 40px)
+    tgt_box = (310, 80, 100, 300)
+    frame = make_realistic_person_frame(bbox=tgt_box, full_body=True)
+    tracker.lock_on(frame, tgt_box)
+
+    state, latched, action = _run_follow(
+        motor=motor,
+        sensors=sensors,
+        tracker=tracker,
+        pid=pid,
+        detections=[{"bbox": [310, 80, 410, 380], "class_name": "person", "confidence": 0.9, "type": "positive"}],
+        us_blocked=False,
+        frame=frame,
+        follow_state="TRACKING",
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+        sys_state=sys_state,
+    )
+
+    # 40px offset (~3.3 deg) MUST NOT trigger an in-place TURN command; it should DRIVE straight!
+    turn_cmds = [cmd for cmd in mock_serial.written_commands if cmd.startswith("TURN")]
+    drive_cmds = [cmd for cmd in mock_serial.written_commands if cmd.startswith("DRIVE")]
+    assert len(turn_cmds) == 0, f"Small 3.3 deg offset triggered in-place TURN: {turn_cmds}"
+    assert len(drive_cmds) > 0, f"Expected DRIVE command for small offset, got none. Action: {action}"
+
+    # Case 2: Moderate offset (center_x = 440, offset = 120px ~= 10 deg)
+    mock_serial.written_commands.clear()
+    tgt_box_offset = (390, 80, 100, 300)
+    frame_offset = make_realistic_person_frame(bbox=tgt_box_offset, full_body=True)
+    tracker.lock_on(frame_offset, tgt_box_offset)
+
+    state, latched, action = _run_follow(
+        motor=motor,
+        sensors=sensors,
+        tracker=tracker,
+        pid=pid,
+        detections=[{"bbox": [390, 80, 490, 380], "class_name": "person", "confidence": 0.9, "type": "positive"}],
+        us_blocked=False,
+        frame=frame_offset,
+        follow_state="TRACKING",
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+        sys_state=sys_state,
+    )
+
+    turn_cmds = [cmd for cmd in mock_serial.written_commands if cmd.startswith("TURN")]
+    assert len(turn_cmds) == 1, f"Expected 1 TURN command, got {turn_cmds}"
+    angle_arg = int(turn_cmds[0].split()[1])
+    # Turn angle must be bounded (<= 18 deg burst limit) and reasonable for a 10 deg physical error
+    assert 5 <= angle_arg <= 18, f"Turn command angle {angle_arg} is over-amplified! Expected <= 18 deg."
+
+
+def test_follow_turn_settling_guard_prevents_command_stacking():
+    """
+    When Arduino is in STATE_TURNING or within settling window,
+    _run_follow must NOT issue additional turn commands.
+    """
+    motor, mock_serial = create_mock_motor()
+    sensors = SensorManager()
+    pid = PID(P=0.085, I=0.0, D=0.02)
+    pid.SetPoint = 320
+    throttler = CommandThrottler()
+    sys_state = SystemState()
+
+    tracker = ObjectTracker()
+    tgt_box = (390, 80, 100, 300)  # offset to right
+    frame = make_realistic_person_frame(bbox=tgt_box, full_body=True)
+    tracker.lock_on(frame, tgt_box)
+
+    # 1. First iteration triggers a turn
+    state, latched, action = _run_follow(
+        motor=motor,
+        sensors=sensors,
+        tracker=tracker,
+        pid=pid,
+        detections=[{"bbox": [390, 80, 490, 380], "class_name": "person", "confidence": 0.9, "type": "positive"}],
+        us_blocked=False,
+        frame=frame,
+        follow_state="TRACKING",
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+        sys_state=sys_state,
+    )
+    turn_cmds = [cmd for cmd in mock_serial.written_commands if cmd.startswith("TURN")]
+    assert len(turn_cmds) == 1
+
+    # 2. Arduino reports it is currently executing the turn: STATE_TURNING
+    motor.latest_state = "STATE_TURNING"
+    mock_serial.written_commands.clear()
+
+    state, latched, action = _run_follow(
+        motor=motor,
+        sensors=sensors,
+        tracker=tracker,
+        pid=pid,
+        detections=[{"bbox": [390, 80, 490, 380], "class_name": "person", "confidence": 0.9, "type": "positive"}],
+        us_blocked=False,
+        frame=frame,
+        follow_state="TRACKING",
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+        sys_state=sys_state,
+    )
+
+    # Must NOT send another command while Arduino is turning!
+    assert len(mock_serial.written_commands) == 0, f"Turn queued while Arduino was TURNING: {mock_serial.written_commands}"
+    assert "SETTLING" in action or "TURNING" in action
+

@@ -52,6 +52,11 @@ FOLLOW_SEARCH_STEP_DEG = 28            # Degrees per stepped turn toward last_se
 FOLLOW_SEARCH_TURN_SPEED = 200         # PWM speed for search turns during RE_ACQUIRE (>= 200)
 FOLLOW_SEARCH_MAX_STEPS = 4            # Max directional search turns before holding stationary
 FOLLOW_SEARCH_INTERVAL_S = 0.85        # Delay (s) between search turns to stabilize camera & scan
+FOLLOW_STEER_DEADBAND_DEG = 7          # Deadband (+/-7 deg ~= +/-84px corridor) where car drives straight
+FOLLOW_TURN_MAX_BURST_DEG = 18         # Max in-place turn burst in degrees to prevent overshoot
+FOLLOW_TURN_SETTLE_S = 0.28            # Settling time (s) post-turn for camera & chassis stabilization
+FOLLOW_REVERSAL_CONFIRM_FRAMES = 2     # Require 2 opposite frames before reversing turn direction
+FOLLOW_STEER_EMA_ALPHA = 0.35          # Smoothing factor for raw visual angle estimates
 
 # ── Chart-Paper Lane Detection & Following (Option A) ────────────────────────
 LANE_ROI_Y_MIN_FRAC = 0.45             # Scan lower 55% of frame for chart paper lines
@@ -73,4 +78,3 @@ LANE_HSV_RANGES = {
     "green": {"lower": [38, 70, 50], "upper": [88, 255, 255]},
     "pink": {"lower": [140, 50, 100], "upper": [179, 255, 255]},
 }
-

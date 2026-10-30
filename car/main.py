@@ -59,6 +59,11 @@ from car.perception.config import (
     FOLLOW_SEARCH_TURN_SPEED,
     FOLLOW_SEARCH_MAX_STEPS,
     FOLLOW_SEARCH_INTERVAL_S,
+    FOLLOW_STEER_DEADBAND_DEG,
+    FOLLOW_TURN_MAX_BURST_DEG,
+    FOLLOW_TURN_SETTLE_S,
+    FOLLOW_REVERSAL_CONFIRM_FRAMES,
+    FOLLOW_STEER_EMA_ALPHA,
     LANE_ROI_Y_MIN_FRAC,
     LANE_LOOKAHEAD_Y_FRAC,
     LANE_DEFAULT_WIDTH_FRAC,
@@ -368,6 +373,32 @@ class LaneSteeringStabilizer:
         return direction * magnitude
 
 
+class FollowSteeringStabilizer(LaneSteeringStabilizer):
+    """Convert noisy visual tracking angles into safe, bounded skid-steer bursts.
+
+    Features:
+      - Deadband (+/-7 deg ~= +/-84px corridor): Drives forward straight when target is roughly centered.
+      - EMA smoothing (alpha=0.35): Rejects single-frame bounding box detection jitter.
+      - Reversal confirmation: Requires consecutive frames before flipping turn direction to eliminate hunting.
+      - Turn burst clamping (max 18 deg): Prevents aggressive spins from flinging target out of camera FOV.
+      - Settling guard: Pauses commands while Arduino executes turn or during post-turn stabilization.
+    """
+
+    def __init__(
+        self,
+        ema_alpha: float = FOLLOW_STEER_EMA_ALPHA,
+        max_turn_deg: int = FOLLOW_TURN_MAX_BURST_DEG,
+        settle_s: float = FOLLOW_TURN_SETTLE_S,
+        reversal_confirm_frames: int = FOLLOW_REVERSAL_CONFIRM_FRAMES,
+    ):
+        super().__init__(
+            ema_alpha=ema_alpha,
+            max_turn_deg=max_turn_deg,
+            settle_s=settle_s,
+            reversal_confirm_frames=reversal_confirm_frames,
+        )
+
+
 # =============================================================================
 # System Runtime State
 # =============================================================================
@@ -405,6 +436,7 @@ class SystemState:
         self.calibration_progress: float = 0.0
         self.last_seen_side: str = "CENTER"
         self.non_target_persons: list = []
+        self.follow_steering: Optional[FollowSteeringStabilizer] = None
 
         # Lane Detection & Following State
         self.lane_color_mode: str = LANE_COLOR_MODE
@@ -2617,6 +2649,7 @@ def _run_follow(
     throttler: CommandThrottler,
     fresh_inference: bool = True,
     sys_state: Optional[SystemState] = None,
+    follow_steering: Optional[FollowSteeringStabilizer] = None,
 ) -> Tuple[str, bool, str]:
     """
     One loop iteration of follow-me mode.
@@ -2629,9 +2662,18 @@ def _run_follow(
     us = sensors.read_ultrasonic()
     arduino_state = (motor.latest_state or "UNKNOWN").upper()
 
+    if follow_steering is None:
+        if sys_state and getattr(sys_state, "follow_steering", None) is not None:
+            follow_steering = sys_state.follow_steering
+        else:
+            follow_steering = FollowSteeringStabilizer()
+            if sys_state:
+                sys_state.follow_steering = follow_steering
+
     # ── Handle Web UI / Pending Triggers ─────────────────────────────────────
     if sys_state and getattr(sys_state, "pending_reset_target", False):
         tracker.reset()
+        follow_steering.reset()
         follow_state = "WAIT_CALIBRATION"
         sys_state.pending_reset_target = False
         sys_state.target_bbox = None
@@ -2828,6 +2870,7 @@ def _run_follow(
             motor.pi_stop()
             pi_latched = True
             throttler.record_other("PI_STOP")
+            follow_steering.reset()
             follow_state = "RE_ACQUIRE"
             if sys_state:
                 sys_state.follow_state = "RE_ACQUIRE"
@@ -2845,6 +2888,7 @@ def _run_follow(
                 motor.pi_stop()
                 pi_latched = True
                 throttler.record_other("PI_STOP")
+                follow_steering.reset()
                 return follow_state, pi_latched, "🛑 PI_STOP: Non-Target Obstacle"
             else:
                 throttler.record_other("PI_STOPPED")
@@ -2863,6 +2907,7 @@ def _run_follow(
         # Respect Arduino autonomous states
         if arduino_state in ("AVOIDING", "STATE_AVOIDING", "CLIFF_REVERSING", "STATE_CLIFF_REVERSING"):
             throttler.record_other(arduino_state)
+            follow_steering.reset()
             return follow_state, pi_latched, f"🔀 ARDUINO {arduino_state} (Yielding)"
 
         if arduino_state in ("CLIFF_STOPPED", "STATE_CLIFF_STOPPED"):
@@ -2884,18 +2929,26 @@ def _run_follow(
         # Critical Ultrasonic auto-brake
         if us_blocked:
             throttler.record_other("STOP")
+            follow_steering.reset()
             if motors_enabled:
                 motor.stop()
             return follow_state, pi_latched, "🛑 US AUTO-BRAKE (< 25cm)"
+
+        # Respect Arduino turning state & local post-turn settling guard
+        # Never issue additional motion commands while the chassis is executing a turn
+        # or settling to acquire an updated, steady camera pose.
+        if arduino_state in ("TURNING", "STATE_TURNING") or follow_steering.is_settling():
+            throttler.record_other(arduino_state)
+            return follow_state, pi_latched, "🎯 FOLLOW TURN SETTLING: Awaiting Updated Camera Pose"
 
         # Steering & Follow Speed Modulation
         x, y, w, h = tgt_box
         center_x = x + w / 2.0
         bbox_h_frac = h / max(frame_h, 1)
 
+        # Compute raw angular deviation from center
         pid.update(center_x)
-        angle = -int(pid.output)
-        angle = max(-45, min(45, angle))
+        raw_angle = -float(pid.output)
 
         # Active Obstacle Bypass While Following
         scores = compute_zone_scores(all_obstacles, frame_w, frame_h, sonar=us) if all_obstacles else {}
@@ -2907,16 +2960,18 @@ def _run_follow(
 
         if decision in ("LEFT", "RIGHT"):
             avoid_override = True
-            angle = -35 if decision == "LEFT" else 35
+            steer_cmd = -25 if decision == "LEFT" else 25
             if throttler.should_send_avoid_hint(decision):
                 motor.pi_avoid(decision)
                 throttler.record_avoid_hint(decision)
         elif is_valid_us(us_l) and us_l < 42.0 and (not is_valid_us(us_r) or us_r > us_l + 10.0):
             avoid_override = True
-            angle = max(25, angle)
+            steer_cmd = 20
         elif is_valid_us(us_r) and us_r < 42.0 and (not is_valid_us(us_l) or us_l > us_r + 10.0):
             avoid_override = True
-            angle = min(-25, angle)
+            steer_cmd = -20
+        else:
+            steer_cmd = follow_steering.update(raw_angle, deadband_deg=FOLLOW_STEER_DEADBAND_DEG)
 
         prefix = "🔀 BYPASS+FOLLOW" if avoid_override else "🎯 FOLLOWING"
 
@@ -2939,49 +2994,38 @@ def _run_follow(
             if motors_enabled:
                 motor.stop()
             throttler.record_other("STOP")
+            follow_steering.reset()
             action_label = "🎯 TARGET TOO CLOSE (Holding)"
-        elif bbox_h_frac > FOLLOW_IDEAL_MIN:
-            spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_CRUISE_SPEED
-            action_label = f"{prefix} (Cruise PWM {spd}, Steer {angle}°)"
-            if motors_enabled:
-                if abs(angle) < 5:
-                    if throttler.should_send_drive(spd):
-                        motor.drive(spd, throttler.drive_duration_ms)
-                        throttler.record_drive(spd)
-                else:
-                    if throttler.should_send_turn(angle, spd):
-                        motor.turn(angle, speed=spd)
-                        throttler.record_turn(angle, spd)
-            else:
-                action_label = f"⏸️ BENCH SAFE: {prefix} CRUISE (Suppressed)"
-        elif bbox_h_frac > FOLLOW_GETTING_FAR:
-            spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
-            action_label = f"{prefix} (Fast PWM {spd}, Steer {angle}°)"
-            if motors_enabled:
-                if abs(angle) < 5:
-                    if throttler.should_send_drive(spd):
-                        motor.drive(spd, throttler.drive_duration_ms)
-                        throttler.record_drive(spd)
-                else:
-                    if throttler.should_send_turn(angle, spd):
-                        motor.turn(angle, speed=spd)
-                        throttler.record_turn(angle, spd)
-            else:
-                action_label = f"⏸️ BENCH SAFE: {prefix} FAST (Suppressed)"
         else:
-            spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
-            action_label = f"{prefix} (PWM {spd}, Steer {angle}°)"
-            if motors_enabled:
-                if abs(angle) < 5:
+            if bbox_h_frac > FOLLOW_IDEAL_MIN:
+                spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_CRUISE_SPEED
+                mode_str = "Cruise"
+            elif bbox_h_frac > FOLLOW_GETTING_FAR:
+                spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
+                mode_str = "Fast"
+            else:
+                spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
+                mode_str = "Far"
+
+            if steer_cmd == 0:
+                action_label = f"{prefix} ({mode_str} PWM {spd}, Straight)"
+                if motors_enabled:
                     if throttler.should_send_drive(spd):
                         motor.drive(spd, throttler.drive_duration_ms)
                         throttler.record_drive(spd)
                 else:
-                    if throttler.should_send_turn(angle, spd):
-                        motor.turn(angle, speed=spd)
-                        throttler.record_turn(angle, spd)
+                    action_label = f"⏸️ BENCH SAFE: {prefix} {mode_str.upper()} (Suppressed)"
             else:
-                action_label = f"⏸️ BENCH SAFE: {prefix} FAR (Suppressed)"
+                steer_dir = "RIGHT" if steer_cmd > 0 else "LEFT"
+                turn_spd = max(spd, 200)
+                action_label = f"{prefix} (Turn {steer_dir} {abs(steer_cmd)}° | PWM {turn_spd})"
+                if motors_enabled:
+                    if throttler.should_send_turn(steer_cmd, turn_spd):
+                        motor.turn(steer_cmd, speed=turn_spd)
+                        throttler.record_turn(steer_cmd, turn_spd)
+                        follow_steering.mark_turn_sent()
+                else:
+                    action_label = f"⏸️ BENCH SAFE: {prefix} TURN {steer_dir} (Suppressed)"
 
         return follow_state, pi_latched, action_label
 
@@ -3119,10 +3163,15 @@ def run_pipeline(
 
     # ── 3. Follow-me Components ──────────────────────────────────────────────
     tracker = ObjectTracker()
-    steering_pid = PID(P=0.3, I=0.01, D=0.05)
+    # Kp maps pixel error directly to physical camera angle:
+    # Camera HFOV is 53.5 deg across 640 px -> ~0.0836 deg/px.
+    # Ki is 0.0 to prevent integral windup on timed skid-steer bursts.
+    steering_pid = PID(P=0.0836, I=0.0, D=0.0)
     steering_pid.SetPoint = CAMERA_WIDTH / 2.0
     steering_pid.setSampleTime(0.05)
-    steering_pid.setWindup(50)
+    steering_pid.setWindup(10)
+    follow_steering = FollowSteeringStabilizer()
+    system_state.follow_steering = follow_steering
     follow_state = "LOCK_ON"
 
     # ── 3b. Chart-Paper Lane Following Components ────────────────────────────
@@ -3311,6 +3360,7 @@ def run_pipeline(
                     throttler=throttler,
                     fresh_inference=fresh_inference,
                     sys_state=system_state,
+                    follow_steering=follow_steering,
                 )
                 system_state.follow_state = follow_state
             else:
