@@ -33,6 +33,7 @@ from car.perception.config import (
     LANE_MAX_STEER_DEG,
     LANE_STEER_DEADBAND_DEG,
     LANE_COLOR_MODE,
+    LANE_HSV_RANGES,
 )
 
 
@@ -161,8 +162,8 @@ class ChartLaneDetector:
         self.lost_frames = 0
 
     def set_color_mode(self, mode: str):
-        """Switches lane line color preset (dark, yellow, blue, white)."""
-        valid = {"dark", "yellow", "blue", "white"}
+        """Switches lane line color preset (ribbons: orange, brown, green, pink; legacy: dark, yellow, blue, white)."""
+        valid = {"dark", "yellow", "blue", "white", "orange", "brown", "green", "pink"}
         m = mode.lower().strip()
         if m in valid:
             self.color_mode = m
@@ -216,6 +217,30 @@ class ChartLaneDetector:
             blur = cv2.GaussianBlur(gray, (5, 5), 0)
             _, mask = cv2.threshold(blur, 195, 255, cv2.THRESH_BINARY)
 
+        elif self.color_mode == "orange":
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            lower = np.array(LANE_HSV_RANGES.get("orange", {}).get("lower", [5, 120, 80]), dtype=np.uint8)
+            upper = np.array(LANE_HSV_RANGES.get("orange", {}).get("upper", [22, 255, 255]), dtype=np.uint8)
+            mask = cv2.inRange(hsv, lower, upper)
+
+        elif self.color_mode == "brown":
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            lower = np.array(LANE_HSV_RANGES.get("brown", {}).get("lower", [5, 60, 30]), dtype=np.uint8)
+            upper = np.array(LANE_HSV_RANGES.get("brown", {}).get("upper", [20, 200, 160]), dtype=np.uint8)
+            mask = cv2.inRange(hsv, lower, upper)
+
+        elif self.color_mode == "green":
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            lower = np.array(LANE_HSV_RANGES.get("green", {}).get("lower", [38, 70, 50]), dtype=np.uint8)
+            upper = np.array(LANE_HSV_RANGES.get("green", {}).get("upper", [88, 255, 255]), dtype=np.uint8)
+            mask = cv2.inRange(hsv, lower, upper)
+
+        elif self.color_mode == "pink":
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            lower = np.array(LANE_HSV_RANGES.get("pink", {}).get("lower", [140, 50, 100]), dtype=np.uint8)
+            upper = np.array(LANE_HSV_RANGES.get("pink", {}).get("upper", [179, 255, 255]), dtype=np.uint8)
+            mask = cv2.inRange(hsv, lower, upper)
+
         else:
             # Fallback to dark
             gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -224,6 +249,11 @@ class ChartLaneDetector:
         # Morphological opening removes small specks
         clean_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, clean_kernel)
+
+        # Morphological dilation for satin ribbons bridges specular voids & thickens tracks
+        if self.color_mode in ("orange", "brown", "green", "pink"):
+            dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask = cv2.dilate(mask, dilate_kernel, iterations=2)
 
         # ── Zero out active obstacle and pothole printout bounding boxes ────────
         if exclude_boxes:

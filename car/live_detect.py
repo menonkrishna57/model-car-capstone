@@ -125,7 +125,7 @@ control_mode = "autonomous"             # "autonomous", "lane", or "manual"
 manual_override_obstacles = False       # True = Ignore all obstacles & ultrasonic brake in manual mode
 manual_speed = 185                      # Default manual drive PWM (100 - 255)
 manual_action = "IDLE"                  # Current manual direction / status
-lane_color_mode = "dark"
+lane_color_mode = "orange"
 lane_detector = ChartLaneDetector(color_mode=lane_color_mode)
 last_lane_res = None
 
@@ -680,7 +680,7 @@ PAGE = """<!DOCTYPE html>
     <button id="btn-motors" class="btn-danger" onclick="toggleMotors()">🚗 Enable Motors (M)</button>
     <button id="btn-mode" onclick="toggleControlMode()">🎮 Mode: Manual (C)</button>
     <button id="btn-lane" onclick="setMode('lane')">🛣️ Lane Mode</button>
-    <button id="btn-lane-color" onclick="cycleLaneColor()">🎨 Lane: Dark</button>
+    <button id="btn-lane-color" onclick="cycleLaneColor()" data-color="orange">🎨 Lane: Orange</button>
     <button id="btn-override" onclick="toggleOverride()">🔓 Override Obstacles (O)</button>
     <button id="btn-remote" class="btn-active" onclick="toggleRemoteWidget()">🕹️ Remote</button>
     <button id="btn-invert" class="btn-active" onclick="toggleInvertMotors()">🔄 Polarity: Inverted (I)</button>
@@ -825,13 +825,13 @@ PAGE = """<!DOCTYPE html>
     }
 
     function cycleLaneColor() {
-      const colors = ['dark', 'yellow', 'blue', 'white'];
+      const colors = ['orange', 'brown', 'green', 'pink'];
       const btn = document.getElementById('btn-lane-color');
-      let curr = (btn ? btn.getAttribute('data-color') : '') || 'dark';
+      let curr = (btn ? btn.getAttribute('data-color') : '') || 'orange';
       let nextIdx = (colors.indexOf(curr) + 1) % colors.length;
       let nextCol = colors[nextIdx];
       fetch('/set_lane_color?color=' + nextCol).then(r => r.json()).then(d => {
-        if (btn) {
+        if (btn && d.color) {
           btn.setAttribute('data-color', d.color);
           btn.innerText = '🎨 Lane: ' + d.color.toUpperCase();
         }
@@ -1397,17 +1397,26 @@ class Handler(server.BaseHTTPRequestHandler):
             self.wfile.write(resp)
 
         elif path == '/set_lane_color':
-            col = query.get('color', ['dark'])[0].lower()
-            if col in ('dark', 'yellow', 'blue', 'white'):
+            col = query.get('color', ['orange'])[0].lower().strip()
+            valid_colors = {"orange", "brown", "green", "pink", "dark", "yellow", "blue", "white"}
+            if col in valid_colors:
                 lane_color_mode = col
-                lane_detector.set_color_mode(col)
-            print(f"🎨 Lane color mode set: {lane_color_mode.upper()}")
-            resp = json.dumps({"status": "ok", "color": lane_color_mode}).encode('utf-8')
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(resp)))
-            self.end_headers()
-            self.wfile.write(resp)
+                if lane_detector:
+                    lane_detector.set_color_mode(col)
+                print(f"🎨 Lane color mode set: {lane_color_mode.upper()}")
+                resp = json.dumps({"status": "ok", "color": lane_color_mode}).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+            else:
+                resp = json.dumps({"status": "error", "message": f"Invalid lane color mode '{col}'"}).encode('utf-8')
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
 
         elif path == '/set_speed':
             try:

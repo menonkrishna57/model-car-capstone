@@ -64,5 +64,13 @@ LANE_CRUISE_SPEED = 185                # Forward PWM speed when centered in lane
 LANE_CURVE_SPEED = 180                 # PWM speed when executing corrective lane turns (>= 180)
 LANE_STEER_DEADBAND_DEG = 6            # Deadband (deg) within which car drives straight
 LANE_MAX_STEER_DEG = 38                # Maximum skid-steer correction angle for sharp paper curves
-LANE_COLOR_MODE = "dark"               # "dark" (black lines on white chart paper), "yellow", "blue", "white"
+LANE_COLOR_MODE = "orange"             # Default ribbon color: "orange", "brown", "green", "pink" (legacy presets: "dark", "yellow", "blue", "white")
+
+# Satin Ribbon HSV Color Boundaries [H: 0-179, S: 0-255, V: 0-255]
+LANE_HSV_RANGES = {
+    "orange": {"lower": [5, 120, 80], "upper": [22, 255, 255]},
+    "brown": {"lower": [5, 60, 30], "upper": [20, 200, 160]},
+    "green": {"lower": [38, 70, 50], "upper": [88, 255, 255]},
+    "pink": {"lower": [140, 50, 100], "upper": [179, 255, 255]},
+}
 

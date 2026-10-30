@@ -678,9 +678,9 @@ PAGE = """<!DOCTYPE html>
       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 19L8 5M16 5l4 14M12 7v2M12 13v2M12 19v2"/></svg>
       <span>Lane Mode</span>
     </button>
-    <button id="btn-lane-color" onclick="cycleLaneColor()" data-color="dark">
+    <button id="btn-lane-color" onclick="cycleLaneColor()" data-color="orange">
       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.93 0 1.5-.67 1.5-1.5 0-.39-.15-.74-.39-1.01-.24-.26-.37-.61-.37-.99 0-.83.67-1.5 1.5-1.5H16c3.31 0 6-2.69 6-6 0-4.97-4.48-9-10-9z"/></svg>
-      <span>Lane: DARK</span>
+      <span>Lane: ORANGE</span>
     </button>
     <button id="btn-follow" onclick="setMode('follow')">
       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
@@ -896,13 +896,13 @@ PAGE = """<!DOCTYPE html>
     }
 
     function cycleLaneColor() {
-      const colors = ['dark', 'yellow', 'blue', 'white'];
+      const colors = ['orange', 'brown', 'green', 'pink'];
       const btn = document.getElementById('btn-lane-color');
-      let curr = (btn ? btn.getAttribute('data-color') : '') || 'dark';
+      let curr = (btn ? btn.getAttribute('data-color') : '') || 'orange';
       let nextIdx = (colors.indexOf(curr) + 1) % colors.length;
       let nextCol = colors[nextIdx];
       fetch('/set_lane_color?color=' + nextCol).then(r => r.json()).then(d => {
-        if (btn) {
+        if (btn && d.color) {
           btn.setAttribute('data-color', d.color);
           const span = btn.querySelector('span');
           if (span) span.innerText = 'Lane: ' + d.color.toUpperCase();
@@ -1650,19 +1650,27 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(resp)
 
         elif path == '/set_lane_color':
-            color = query.get('color', ['dark'])[0].lower().strip()
-            if color in ("dark", "yellow", "blue", "white"):
+            color = query.get('color', ['orange'])[0].lower().strip()
+            valid_colors = {"orange", "brown", "green", "pink", "dark", "yellow", "blue", "white"}
+            if color in valid_colors:
                 with sys_state.lock:
                     sys_state.lane_color_mode = color
                     if hasattr(self.server, "lane_detector") and self.server.lane_detector:
                         self.server.lane_detector.set_color_mode(color)
-            print(f"🎨 Lane color mode set to: {color.upper()}")
-            resp = json.dumps({"status": "ok", "color": color}).encode('utf-8')
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(resp)))
-            self.end_headers()
-            self.wfile.write(resp)
+                print(f"🎨 Lane color mode set to: {color.upper()}")
+                resp = json.dumps({"status": "ok", "color": color}).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+            else:
+                resp = json.dumps({"status": "error", "message": f"Invalid lane color mode '{color}'"}).encode('utf-8')
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
 
         elif path == '/select_target':
             try:
