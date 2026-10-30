@@ -50,15 +50,32 @@ from car.perception.config import (
 # Minimum histogram correlation score to accept a candidate as the owner.
 REACQUIRE_THRESHOLD = FOLLOW_SIMILARITY_THRESHOLD
 
-# Number of HSV histogram bins per channel for the appearance profile.
-_HIST_BINS = [18, 24, 16]  # Hue (0-180), Saturation (0-256), Value (0-256)
-_HIST_RANGES = [0, 180, 0, 256, 0, 256]
+# Number of HSV histogram bins per channel for the 2D (Hue x Saturation) profile.
+# 18 Hue bins (10 deg each) x 8 Saturation bins (32 units each) = 144 bins.
+_HIST_BINS = [18, 8]
+_HIST_RANGES = [0, 180, 0, 256]
+
+
+def _smooth_hue_2d(hist_2d: np.ndarray) -> np.ndarray:
+    """
+    Applies circular smoothing along the Hue axis (axis 0) of a 2D (H, S) histogram.
+    Hue wraps around (0 and 180 are neighbors), eliminating sharp bin-boundary quantization jitter.
+    """
+    h_bins = hist_2d.shape[0]
+    smoothed = np.zeros_like(hist_2d, dtype=np.float32)
+    for h in range(h_bins):
+        h_prev = (h - 1) % h_bins
+        h_next = (h + 1) % h_bins
+        smoothed[h, :] = 0.50 * hist_2d[h, :] + 0.25 * hist_2d[h_prev, :] + 0.25 * hist_2d[h_next, :]
+    cv2.normalize(smoothed, smoothed, norm_type=cv2.NORM_L1)
+    return smoothed
 
 
 def _extract_hsv_hist(crop: np.ndarray, apply_clahe: bool = True) -> Optional[np.ndarray]:
     """
-    Computes a flattened, L1-normalised 3D HSV histogram for a BGR crop.
-    Applies CLAHE on the V channel to normalize indoor/outdoor illumination.
+    Computes a 2D Hue-Saturation (18 Hue x 8 Saturation) histogram with circular Hue smoothing.
+    Hue and Saturation provide color constancy across intensity/shadow changes.
+    Applies CLAHE on the V channel and masks out extreme shadows (< 25) and blown-out highlights.
     Returns None if the crop is empty or too small.
     """
     if crop is None or crop.size == 0 or crop.shape[0] < 4 or crop.shape[1] < 4:
@@ -71,22 +88,31 @@ def _extract_hsv_hist(crop: np.ndarray, apply_clahe: bool = True) -> Optional[np
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(grid_x, grid_y))
         hsv[:, :, 2] = clahe.apply(hsv[:, :, 2])
 
-    hist = cv2.calcHist([hsv], [0, 1, 2], None, _HIST_BINS, _HIST_RANGES)
-    cv2.normalize(hist, hist, norm_type=cv2.NORM_L1)
-    return hist.flatten()
+    v = hsv[:, :, 2]
+    s = hsv[:, :, 1]
+    # Filter out near-black shadows and blown-out highlights where Hue is unstable
+    mask = (v > 25) & (v < 250) & (s > 15)
+    if np.sum(mask) < 15:
+        mask = (v > 15)
+    mask = mask.astype(np.uint8) * 255
+
+    hist = cv2.calcHist([hsv], [0, 1], mask, _HIST_BINS, _HIST_RANGES)
+    smoothed = _smooth_hue_2d(hist)
+    return smoothed.flatten().astype(np.float32)
 
 
 def _build_appearance_profile(frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Dict[str, Any]:
     """
-    Extracts inner-core 3-zone clothing histograms and body figure ratios.
+    Extracts inner-core clothing histograms (adaptive torso, overall body, and 3-zone)
+    and body figure ratios. Adapts gracefully when partial body is visible (clipped at top).
 
     Args:
         frame: Full BGR frame.
         bbox: (x, y, w, h) bounding box of the person.
 
     Returns:
-        Dict with keys: upper_hist, mid_hist, lower_hist, aspect_ratio,
-        upper_lower_contrast, torso_taper_ratio, bbox_area.
+        Dict with keys: upper_hist, mid_hist, lower_hist, torso_hist, overall_hist,
+        is_clipped_top, aspect_ratio, upper_lower_contrast, torso_taper_ratio, bbox_area.
     """
     x, y, w, h = [int(v) for v in bbox]
     fh, fw = frame.shape[:2]
@@ -102,32 +128,44 @@ def _build_appearance_profile(frame: np.ndarray, bbox: Tuple[int, int, int, int]
     if w_c < 4 or h_c < 4:
         return {}
 
-    # Inner crop horizontally: central 60% (excluding background edges)
-    x1_inner = int(x1 + 0.20 * w_c)
-    x2_inner = int(x1 + 0.80 * w_c)
+    # Inner crop horizontally: central 70% (excluding background edges)
+    x1_inner = int(x1 + 0.15 * w_c)
+    x2_inner = int(x1 + 0.85 * w_c)
     if x2_inner - x1_inner < 4:
         x1_inner, x2_inner = x1, x2
 
-    # Vertical 3-band split:
-    # 1. Upper torso (shirt / chest): 15% to 50%
-    y_up1 = y1 + int(0.15 * h_c)
-    y_up2 = max(y_up1 + 4, y1 + int(0.50 * h_c))
+    is_clipped_top = bool(y1 <= 10)
 
-    # 2. Mid torso (waist / jacket line): 40% to 68%
-    y_mid1 = y1 + int(0.40 * h_c)
-    y_mid2 = max(y_mid1 + 4, y1 + int(0.68 * h_c))
-
-    # 3. Lower body (pants / legs): 55% to 90%
-    y_low1 = y1 + int(0.55 * h_c)
-    y_low2 = max(y_low1 + 4, y1 + int(0.90 * h_c))
+    # Adaptive vertical splitting:
+    if is_clipped_top:
+        # Close to camera: head is above frame; top of box is already chest/shirt
+        y_up1 = y1
+        y_up2 = max(y_up1 + 4, y1 + int(0.45 * h_c))
+        y_mid1 = y1 + int(0.20 * h_c)
+        y_mid2 = max(y_mid1 + 4, y1 + int(0.65 * h_c))
+        y_low1 = y1 + int(0.50 * h_c)
+        y_low2 = min(fh, y2)
+        torso_crop = frame[y1:min(fh, y1 + int(0.60 * h_c)), x1_inner:x2_inner]
+    else:
+        # Full body in view: head in top 15%
+        y_up1 = y1 + int(0.15 * h_c)
+        y_up2 = max(y_up1 + 4, y1 + int(0.50 * h_c))
+        y_mid1 = y1 + int(0.35 * h_c)
+        y_mid2 = max(y_mid1 + 4, y1 + int(0.68 * h_c))
+        y_low1 = y1 + int(0.55 * h_c)
+        y_low2 = max(y_low1 + 4, y1 + int(0.92 * h_c))
+        torso_crop = frame[y1 + int(0.15 * h_c):min(fh, y1 + int(0.65 * h_c)), x1_inner:x2_inner]
 
     upper_crop = frame[y_up1:min(fh, y_up2), x1_inner:x2_inner]
     mid_crop = frame[y_mid1:min(fh, y_mid2), x1_inner:x2_inner]
     lower_crop = frame[y_low1:min(fh, y_low2), x1_inner:x2_inner]
+    overall_crop = frame[y1:min(fh, y2), x1_inner:x2_inner]
 
     upper_hist = _extract_hsv_hist(upper_crop)
     mid_hist = _extract_hsv_hist(mid_crop)
     lower_hist = _extract_hsv_hist(lower_crop)
+    torso_hist = _extract_hsv_hist(torso_crop if torso_crop.size > 0 else upper_crop)
+    overall_hist = _extract_hsv_hist(overall_crop)
 
     # Body figure & proportion features
     aspect_ratio = float(h_c) / max(float(w_c), 1.0)
@@ -162,6 +200,9 @@ def _build_appearance_profile(frame: np.ndarray, bbox: Tuple[int, int, int, int]
         "upper_hist": upper_hist,
         "mid_hist": mid_hist,
         "lower_hist": lower_hist,
+        "torso_hist": torso_hist,
+        "overall_hist": overall_hist,
+        "is_clipped_top": is_clipped_top,
         "aspect_ratio": aspect_ratio,
         "upper_lower_contrast": upper_lower_contrast,
         "torso_taper_ratio": torso_taper_ratio,
@@ -173,41 +214,85 @@ def _compare_profiles(profile: Dict[str, Any], candidate_profile: Dict[str, Any]
     """
     Computes a composite similarity score in [0.0, 1.0] between two appearance profiles.
     Combines:
-      - 70% Clothing similarity (weighted correlation across upper, mid, lower bands)
-      - 30% Figure & proportion similarity (aspect ratio, contrast, torso taper)
+      - 85% Clothing & color constancy (torso + overall + 3-zone correlation and overlap)
+      - 15% Figure similarity (aspect ratio & contrast, relaxed during partial-to-full body transitions)
     """
     if not profile or not candidate_profile:
         return 0.0
 
-    # ── 1. Clothing Similarity (70% weight) ──────────────────────────────────
-    zone_weights = [("upper_hist", 0.45), ("mid_hist", 0.20), ("lower_hist", 0.35)]
+    # ── 1. Clothing & Color Constancy (85% weight) ───────────────────────────
     clothing_scores = []
     clothing_weights = []
 
-    for key, weight in zone_weights:
-        h1 = profile.get(key)
-        h2 = candidate_profile.get(key)
-        if h1 is not None and h2 is not None:
-            if np.sum(h1) > 0 and np.sum(h2) > 0 and np.std(h1) > 1e-7 and np.std(h2) > 1e-7:
+    is_clip1 = profile.get("is_clipped_top", False)
+    is_clip2 = candidate_profile.get("is_clipped_top", False)
+    transitioning_framing = (is_clip1 != is_clip2)
+
+    # 1a. Torso histogram (Primary stable color signature across scale changes)
+    t1 = profile.get("torso_hist")
+    t2 = candidate_profile.get("torso_hist")
+    if t1 is not None and t2 is not None and np.sum(t1) > 0 and np.sum(t2) > 0:
+        corr_t = float(cv2.compareHist(t1.astype(np.float32), t2.astype(np.float32), cv2.HISTCMP_CORREL))
+        bhat_t = 1.0 - float(cv2.compareHist(t1.astype(np.float32), t2.astype(np.float32), cv2.HISTCMP_BHATTACHARYYA))
+        sim_t = max(0.0, 0.50 * max(0.0, corr_t) + 0.50 * max(0.0, bhat_t))
+        w_t = 0.60 if transitioning_framing else 0.35
+        clothing_scores.append(sim_t * w_t)
+        clothing_weights.append(w_t)
+
+    # 1b. Overall body histogram (Palette across whole visible body)
+    o1 = profile.get("overall_hist")
+    o2 = candidate_profile.get("overall_hist")
+    if o1 is not None and o2 is not None and np.sum(o1) > 0 and np.sum(o2) > 0:
+        corr_o = float(cv2.compareHist(o1.astype(np.float32), o2.astype(np.float32), cv2.HISTCMP_CORREL))
+        bhat_o = 1.0 - float(cv2.compareHist(o1.astype(np.float32), o2.astype(np.float32), cv2.HISTCMP_BHATTACHARYYA))
+        sim_o = max(0.0, 0.50 * max(0.0, corr_o) + 0.50 * max(0.0, bhat_o))
+        w_o = 0.40 if transitioning_framing else 0.25
+        clothing_scores.append(sim_o * w_o)
+        clothing_weights.append(w_o)
+
+    # 1c. 3-Zone clothing histograms (upper, mid, lower) - evaluate when framing is similar
+    if not transitioning_framing:
+        zone_weights = [("upper_hist", 0.18), ("mid_hist", 0.08), ("lower_hist", 0.14)]
+        for key, weight in zone_weights:
+            h1 = profile.get(key)
+            h2 = candidate_profile.get(key)
+            if h1 is not None and h2 is not None and np.sum(h1) > 0 and np.sum(h2) > 0:
                 corr = float(cv2.compareHist(
                     h1.reshape(-1, 1).astype(np.float32),
                     h2.reshape(-1, 1).astype(np.float32),
                     cv2.HISTCMP_CORREL
                 ))
+                bhat = 1.0 - float(cv2.compareHist(
+                    h1.reshape(-1, 1).astype(np.float32),
+                    h2.reshape(-1, 1).astype(np.float32),
+                    cv2.HISTCMP_BHATTACHARYYA
+                ))
                 if math.isnan(corr):
                     corr = 0.0
-                clothing_scores.append(max(0.0, corr) * weight)
+                if math.isnan(bhat):
+                    bhat = 0.0
+                zone_sim = max(0.0, 0.50 * max(0.0, corr) + 0.50 * max(0.0, bhat))
+                clothing_scores.append(zone_sim * weight)
                 clothing_weights.append(weight)
 
     if not clothing_scores or sum(clothing_weights) == 0:
-        return 0.0
+        clothing_sim = 0.0
+    else:
+        clothing_sim = sum(clothing_scores) / sum(clothing_weights)
 
-    clothing_sim = sum(clothing_scores) / sum(clothing_weights)
+    # ── 2. Figure & Proportion Similarity (15% weight) ───────────────────────
+    is_clip1 = profile.get("is_clipped_top", False)
+    is_clip2 = candidate_profile.get("is_clipped_top", False)
 
-    # ── 2. Figure & Proportion Similarity (30% weight) ───────────────────────
     ar1 = profile.get("aspect_ratio", 2.0)
     ar2 = candidate_profile.get("aspect_ratio", 2.0)
-    sim_ar = math.exp(-((ar1 - ar2) / 0.65) ** 2)
+
+    # If transitioning between clipped partial-body (close) and full-body (far),
+    # aspect ratio naturally shifts from ~1.2 to ~3.0; do not penalize this transition!
+    if is_clip1 != is_clip2:
+        sim_ar = 0.85
+    else:
+        sim_ar = math.exp(-((ar1 - ar2) / 0.85) ** 2)
 
     c1 = profile.get("upper_lower_contrast", 0.5)
     c2 = candidate_profile.get("upper_lower_contrast", 0.5)
@@ -215,12 +300,12 @@ def _compare_profiles(profile: Dict[str, Any], candidate_profile: Dict[str, Any]
 
     t1 = profile.get("torso_taper_ratio", 1.0)
     t2 = candidate_profile.get("torso_taper_ratio", 1.0)
-    sim_taper = math.exp(-((t1 - t2) / 0.75) ** 2)
+    sim_taper = math.exp(-((t1 - t2) / 1.0) ** 2)
 
-    figure_sim = 0.40 * sim_ar + 0.30 * sim_contrast + 0.30 * sim_taper
+    figure_sim = 0.50 * sim_ar + 0.25 * sim_contrast + 0.25 * sim_taper
 
     # ── 3. Weighted Combination ──────────────────────────────────────────────
-    total_score = 0.70 * clothing_sim + 0.30 * figure_sim
+    total_score = 0.85 * clothing_sim + 0.15 * figure_sim
     return float(np.clip(total_score, 0.0, 1.0))
 
 
@@ -411,6 +496,9 @@ class ObjectTracker:
             "upper_hist": _avg_hist("upper_hist"),
             "mid_hist": _avg_hist("mid_hist"),
             "lower_hist": _avg_hist("lower_hist"),
+            "torso_hist": _avg_hist("torso_hist"),
+            "overall_hist": _avg_hist("overall_hist"),
+            "is_clipped_top": any(s.get("is_clipped_top", False) for s in self._calibration_samples),
             "aspect_ratio": float(np.mean([s.get("aspect_ratio", 2.0) for s in self._calibration_samples])),
             "upper_lower_contrast": float(np.mean([s.get("upper_lower_contrast", 0.5) for s in self._calibration_samples])),
             "torso_taper_ratio": float(np.mean([s.get("torso_taper_ratio", 1.0) for s in self._calibration_samples])),
@@ -557,8 +645,15 @@ class ObjectTracker:
                         self.bbox = None
                         return False, None, None, persons, kcf_score
 
+                # Check alignment with KCF box (IoU or center alignment across scale changes)
+                aligned_with_kcf = False
+                if best_p and kcf_box:
+                    cx_kcf = kcf_box[0] + kcf_box[2] / 2.0
+                    cx_p = best_p["_box_xywh"][0] + best_p["_box_xywh"][2] / 2.0
+                    aligned_with_kcf = (best_p["_iou"] > 0.15) or (abs(cx_p - cx_kcf) < 0.25 * frame.shape[1] and best_p["_iou"] > 0.05)
+
                 # If a YOLO detection matches the target well and aligns with KCF box, re-anchor on fresh inference
-                if best_p and best_p["_score"] >= FOLLOW_SIMILARITY_THRESHOLD and best_p["_iou"] > 0.35:
+                if best_p and best_p["_score"] >= FOLLOW_SIMILARITY_THRESHOLD and aligned_with_kcf:
                     if fresh_inference:
                         self._init_cv_tracker(frame, best_p["_box_xywh"])
                         if self.is_tracking:
@@ -568,7 +663,7 @@ class ObjectTracker:
                     non_target = [p for p in persons if p is not target_det]
                     return self.is_tracking, self.bbox, target_det, non_target, best_p["_score"]
                 else:
-                    target_det = best_p if (best_p and best_p["_iou"] > 0.35 and best_p["_score"] >= FOLLOW_TRACK_VERIFY_THRESHOLD) else None
+                    target_det = best_p if (best_p and aligned_with_kcf and best_p["_score"] >= FOLLOW_TRACK_VERIFY_THRESHOLD) else None
                     non_target = [p for p in persons if p is not target_det]
                     return True, self.bbox, target_det, non_target, kcf_score
             else:
