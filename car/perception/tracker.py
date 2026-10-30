@@ -41,6 +41,7 @@ from car.perception.config import (
     FOLLOW_SIMILARITY_THRESHOLD,
     FOLLOW_TRACK_VERIFY_THRESHOLD,
     FOLLOW_ANTI_CONFUSION_MARGIN,
+    FOLLOW_COAST_MAX_FRAMES,
     FOLLOW_SEARCH_STEP_DEG,
     FOLLOW_SEARCH_TURN_SPEED,
     FOLLOW_SEARCH_MAX_STEPS,
@@ -51,7 +52,7 @@ from car.perception.config import (
 REACQUIRE_THRESHOLD = FOLLOW_SIMILARITY_THRESHOLD
 
 # Number of HSV histogram bins per channel for the appearance profile.
-_HIST_BINS = [18, 24, 16]  # Hue (0-180), Saturation (0-256), Value (0-256)
+_HIST_BINS = [16, 12, 8]  # Hue (0-180), Saturation (0-256), Value (0-256) (Tuned for lighting resilience)
 _HIST_RANGES = [0, 180, 0, 256, 0, 256]
 
 
@@ -207,7 +208,7 @@ def _compare_profiles(profile: Dict[str, Any], candidate_profile: Dict[str, Any]
     # ── 2. Figure & Proportion Similarity (30% weight) ───────────────────────
     ar1 = profile.get("aspect_ratio", 2.0)
     ar2 = candidate_profile.get("aspect_ratio", 2.0)
-    sim_ar = math.exp(-((ar1 - ar2) / 0.65) ** 2)
+    sim_ar = math.exp(-((ar1 - ar2) / 1.10) ** 2)
 
     c1 = profile.get("upper_lower_contrast", 0.5)
     c2 = candidate_profile.get("upper_lower_contrast", 0.5)
@@ -215,7 +216,7 @@ def _compare_profiles(profile: Dict[str, Any], candidate_profile: Dict[str, Any]
 
     t1 = profile.get("torso_taper_ratio", 1.0)
     t2 = candidate_profile.get("torso_taper_ratio", 1.0)
-    sim_taper = math.exp(-((t1 - t2) / 0.75) ** 2)
+    sim_taper = math.exp(-((t1 - t2) / 1.25) ** 2)
 
     figure_sim = 0.40 * sim_ar + 0.30 * sim_contrast + 0.30 * sim_taper
 
@@ -269,6 +270,11 @@ class ObjectTracker:
         # Directional search step tracking
         self.search_steps_taken: int = 0
         self.last_search_step_time: float = 0.0
+
+        # Tracking persistence / coasting grace period
+        self.lost_frames: int = 0
+        self.max_lost_frames: int = FOLLOW_COAST_MAX_FRAMES
+        self.last_known_bbox: Optional[Tuple[int, int, int, int]] = None
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -356,6 +362,8 @@ class ObjectTracker:
             self.is_calibrating = False
             self.is_tracking = False
             self.bbox = None
+            self.lost_frames = 0
+            self.last_known_bbox = None
             self._calibration_samples.clear()
             self._calibration_bboxes.clear()
             return False
@@ -444,6 +452,8 @@ class ObjectTracker:
 
         self._init_cv_tracker(frame, bbox)
         self.bbox = bbox if self.is_tracking else None
+        self.last_known_bbox = self.bbox
+        self.lost_frames = 0
         if self.is_tracking and self.bbox is not None:
             self._update_side_memory(self.bbox, frame.shape[1])
             self.reset_search()
@@ -478,6 +488,8 @@ class ObjectTracker:
 
         if not self.is_tracking:
             self.bbox = None
+            self.lost_frames = 0
+            self.last_known_bbox = None
 
     # ── Phase 2: Tracking & Anti-Confusion ───────────────────────────────────
 
@@ -495,11 +507,10 @@ class ObjectTracker:
         success, bbox = self.tracker.update(frame)
         if success:
             self.bbox = tuple(int(v) for v in bbox)
+            self.last_known_bbox = self.bbox
             self._update_side_memory(self.bbox, frame.shape[1])
             return True, self.bbox
         else:
-            self.is_tracking = False
-            self.bbox = None
             return False, None
 
     def update_with_detections(
@@ -512,7 +523,9 @@ class ObjectTracker:
         Continuous YOLO-anchored anti-confusion verification:
           - Advances KCF tracker
           - Separates target from non_target_persons
-          - Re-anchors KCF to matching YOLO box to prevent drift (only on fresh inference)
+          - Re-anchors KCF to matching YOLO box to adapt scale and prevent drift
+          - Coasts smoothly across momentary occlusions / motion blur (up to FOLLOW_COAST_MAX_FRAMES)
+          - Online EMA profile adaptation to handle changing lighting and angles
           - Drops tracking to RE_ACQUIRE if bystander causes confusion or occlusion.
 
         Returns:
@@ -527,6 +540,8 @@ class ObjectTracker:
                 return True, kcf_box, None, persons, 1.0
             return False, None, None, persons, 0.0
 
+        ref_box = kcf_box or self.last_known_bbox or self.bbox
+
         # Score all person detections against stored profile
         for p in persons:
             bx1, by1, bx2, by2 = [int(v) for v in p["bbox"]]
@@ -534,71 +549,122 @@ class ObjectTracker:
             p["_box_xywh"] = p_box
             p["_prof"] = _build_appearance_profile(frame, p_box)
             p["_score"] = _compare_profiles(self._owner_profile, p["_prof"])
-            p["_iou"] = _box_iou(kcf_box, p_box) if kcf_box else 0.0
+            p["_iou"] = _box_iou(ref_box, p_box) if ref_box else 0.0
 
         persons_sorted = sorted(persons, key=lambda d: d.get("_score", 0.0), reverse=True)
         best_p = persons_sorted[0] if persons_sorted else None
         second_p = persons_sorted[1] if len(persons_sorted) > 1 else None
+        margin = (best_p["_score"] - second_p["_score"]) if (best_p and second_p) else 1.0
 
         # Evaluate KCF current box similarity
-        kcf_prof = _build_appearance_profile(frame, kcf_box) if kcf_box else {}
+        kcf_prof = _build_appearance_profile(frame, kcf_box) if (kcf_success and kcf_box) else {}
         kcf_score = _compare_profiles(self._owner_profile, kcf_prof) if kcf_prof else 0.0
 
-        if kcf_success and kcf_box is not None:
-            # Check if KCF appearance is still confident
-            if kcf_score >= FOLLOW_TRACK_VERIFY_THRESHOLD:
-                # Anti-confusion gate: check if multiple persons are near/overlapping tracker box
-                overlapping = [p for p in persons if (p.get("_iou", 0.0) > 0.15 or (best_p and _box_iou(best_p["_box_xywh"], p["_box_xywh"]) > 0.20))]
-                if len(overlapping) > 1:
-                    margin = best_p["_score"] - (second_p["_score"] if second_p else 0.0)
-                    if margin < FOLLOW_ANTI_CONFUSION_MARGIN:
-                        # Ambiguous distractor overlapping target: drop tracking to RE_ACQUIRE
-                        self.is_tracking = False
-                        self.bbox = None
-                        return False, None, None, persons, kcf_score
+        # ── 1. Anti-Confusion Distractor Occlusion Check ──────────────────────
+        # If an overlapping person is present with LOW score (< 0.35) while KCF also degrades:
+        # a distractor person is occluding the target box -> drop immediately rather than tracking distractor.
+        if (
+            best_p
+            and best_p.get("_iou", 0.0) > 0.20
+            and best_p["_score"] < FOLLOW_TRACK_VERIFY_THRESHOLD
+            and kcf_score < FOLLOW_TRACK_VERIFY_THRESHOLD
+        ):
+            self.is_tracking = False
+            self.bbox = None
+            self.lost_frames = 0
+            return False, None, None, persons, best_p["_score"]
 
-                # If a YOLO detection matches the target well and aligns with KCF box, re-anchor on fresh inference
-                if best_p and best_p["_score"] >= FOLLOW_SIMILARITY_THRESHOLD and best_p["_iou"] > 0.35:
-                    if fresh_inference:
-                        self._init_cv_tracker(frame, best_p["_box_xywh"])
-                        if self.is_tracking:
-                            self.bbox = best_p["_box_xywh"]
-                            self._update_side_memory(self.bbox, frame.shape[1])
-                    target_det = best_p
-                    non_target = [p for p in persons if p is not target_det]
-                    return self.is_tracking, self.bbox, target_det, non_target, best_p["_score"]
-                else:
-                    target_det = best_p if (best_p and best_p["_iou"] > 0.35 and best_p["_score"] >= FOLLOW_TRACK_VERIFY_THRESHOLD) else None
-                    non_target = [p for p in persons if p is not target_det]
-                    return True, self.bbox, target_det, non_target, kcf_score
+        # ── 2. Determine if any YOLO detection matches target ─────────────────
+        is_target_yolo_match = False
+        if best_p:
+            if best_p["_score"] >= FOLLOW_SIMILARITY_THRESHOLD and margin >= FOLLOW_ANTI_CONFUSION_MARGIN:
+                is_target_yolo_match = True
+            elif len(persons) == 1 and best_p["_score"] >= 0.35 and (best_p["_iou"] > 0.15 or self.lost_frames > 0):
+                # Target is the lone person in scene; tolerate posture/lighting shift
+                is_target_yolo_match = True
+            elif best_p["_iou"] > 0.30 and best_p["_score"] >= FOLLOW_TRACK_VERIFY_THRESHOLD and margin >= FOLLOW_ANTI_CONFUSION_MARGIN:
+                is_target_yolo_match = True
+
+        # ── 3. Branch: YOLO Target Match Found ────────────────────────────────
+        if is_target_yolo_match and best_p is not None:
+            self.lost_frames = 0
+            # Re-anchor KCF to fresh YOLO box only on fresh inference or when KCF failed/degraded
+            if fresh_inference and (not kcf_success or kcf_score < FOLLOW_TRACK_VERIFY_THRESHOLD or best_p["_iou"] > 0.25):
+                self._init_cv_tracker(frame, best_p["_box_xywh"])
+                self.bbox = best_p["_box_xywh"]
+                self.last_known_bbox = self.bbox
+                self._update_side_memory(self.bbox, frame.shape[1])
+            elif not kcf_success or kcf_box is None:
+                self._init_cv_tracker(frame, best_p["_box_xywh"])
+                self.bbox = best_p["_box_xywh"]
+                self.last_known_bbox = self.bbox
+                self._update_side_memory(self.bbox, frame.shape[1])
             else:
-                # KCF appearance has degraded (< 0.50). Check if target is elsewhere in frame
-                if best_p and best_p["_score"] >= FOLLOW_SIMILARITY_THRESHOLD:
-                    margin = best_p["_score"] - (second_p["_score"] if second_p else 0.0)
-                    if second_p is None or margin >= FOLLOW_ANTI_CONFUSION_MARGIN:
-                        # Clear target detection elsewhere; re-anchor to it!
-                        self.lock_on(frame, best_p["_box_xywh"], profile=self._owner_profile)
-                        target_det = best_p
-                        non_target = [p for p in persons if p is not target_det]
-                        return self.is_tracking, self.bbox, target_det, non_target, best_p["_score"]
+                self.bbox = kcf_box
+                self.last_known_bbox = self.bbox
 
-                # Occluded or ambiguous distractor: drop tracking rather than following wrong person
+            # Online profile EMA adaptation when confident to absorb lighting changes
+            if best_p["_score"] > 0.65:
+                for hist_key in ("upper_hist", "mid_hist", "lower_hist"):
+                    h_tgt = self._owner_profile.get(hist_key)
+                    h_cur = best_p["_prof"].get(hist_key)
+                    if h_tgt is not None and h_cur is not None:
+                        self._owner_profile[hist_key] = (0.95 * h_tgt + 0.05 * h_cur).astype(np.float32)
+                if "aspect_ratio" in self._owner_profile and "aspect_ratio" in best_p["_prof"]:
+                    self._owner_profile["aspect_ratio"] = float(
+                        0.90 * self._owner_profile["aspect_ratio"] + 0.10 * best_p["_prof"]["aspect_ratio"]
+                    )
+
+            target_det = best_p
+            non_target = [p for p in persons if p is not target_det]
+            self.is_tracking = True
+            return True, self.bbox, target_det, non_target, best_p["_score"]
+
+        # ── 4. Branch: KCF is Confidently Tracking (No fresh YOLO target match) ─
+        if kcf_success and kcf_box is not None and kcf_score >= FOLLOW_TRACK_VERIFY_THRESHOLD:
+            # Overlapping distractor ambiguity gate
+            overlapping = [
+                p for p in persons
+                if (p.get("_iou", 0.0) > 0.15 or (best_p and _box_iou(best_p["_box_xywh"], p["_box_xywh"]) > 0.20))
+            ]
+            if len(overlapping) > 1 and margin < FOLLOW_ANTI_CONFUSION_MARGIN:
                 self.is_tracking = False
                 self.bbox = None
+                self.lost_frames = 0
                 return False, None, None, persons, kcf_score
 
-        # If KCF was not successful, attempt direct recovery from YOLO detections
-        if best_p and best_p["_score"] >= FOLLOW_SIMILARITY_THRESHOLD:
-            margin = best_p["_score"] - (second_p["_score"] if second_p else 0.0)
-            if second_p is None or margin >= FOLLOW_ANTI_CONFUSION_MARGIN:
-                self.lock_on(frame, best_p["_box_xywh"], profile=self._owner_profile)
-                target_det = best_p
-                non_target = [p for p in persons if p is not target_det]
-                return self.is_tracking, self.bbox, target_det, non_target, best_p["_score"]
+            self.lost_frames = 0
+            self.last_known_bbox = self.bbox
+            target_det = best_p if (best_p and best_p["_iou"] > 0.35 and best_p["_score"] >= FOLLOW_TRACK_VERIFY_THRESHOLD) else None
+            non_target = [p for p in persons if p is not target_det]
+            self.is_tracking = True
+            return True, self.bbox, target_det, non_target, kcf_score
 
+        # ── 5. Branch: Momentary Degradation / Motion Blur -> Coasting Buffer ──
+        # If there's an ambiguous distractor overlapping the track box:
+        if best_p and best_p.get("_iou", 0.0) > 0.20 and margin < FOLLOW_ANTI_CONFUSION_MARGIN:
+            self.is_tracking = False
+            self.bbox = None
+            self.lost_frames = 0
+            return False, None, None, persons, kcf_score
+
+        self.lost_frames += 1
+        if self.lost_frames <= self.max_lost_frames:
+            # Coast the bounding box using last velocity
+            self.is_tracking = True
+            if self.last_known_bbox is not None:
+                x, y, w, h = self.last_known_bbox
+                dx = int(self.last_vx * frame.shape[1])
+                coasted_x = max(0, min(frame.shape[1] - w, x + dx))
+                self.bbox = (coasted_x, y, w, h)
+                self.last_known_bbox = self.bbox
+                self._update_side_memory(self.bbox, frame.shape[1])
+            return True, self.bbox, None, persons, max(kcf_score, 0.40)
+
+        # Grace period exhausted -> target is genuinely lost
         self.is_tracking = False
         self.bbox = None
-        return False, None, None, persons, 0.0
+        return False, None, None, persons, kcf_score
 
     # ── Phase 3: Re-Acquisition & Directional Search ──────────────────────────
 
@@ -639,7 +705,9 @@ class ObjectTracker:
                 if best_score < (FOLLOW_SIMILARITY_THRESHOLD + FOLLOW_ANTI_CONFUSION_MARGIN):
                     return False
 
-        if best_score >= FOLLOW_SIMILARITY_THRESHOLD and best_bbox is not None:
+        req_thresh = FOLLOW_SIMILARITY_THRESHOLD if len(scored_candidates) > 1 else min(FOLLOW_SIMILARITY_THRESHOLD, 0.38)
+        if best_score >= req_thresh and best_bbox is not None:
+            self.lost_frames = 0
             return self.lock_on(frame, best_bbox, profile=self._owner_profile)
 
         return False
@@ -701,6 +769,8 @@ class ObjectTracker:
         self.is_tracking = False
         self.tracker = None
         self.bbox = None
+        self.lost_frames = 0
+        self.last_known_bbox = None
 
     def reset(self):
         """Full reset including learned owner profile and calibration buffers."""

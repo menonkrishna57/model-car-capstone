@@ -162,7 +162,7 @@ class ChartLaneDetector:
 
     def set_color_mode(self, mode: str):
         """Switches lane line color preset (dark, yellow, blue, white)."""
-        valid = {"dark", "yellow", "blue", "white"}
+        valid = {"dark", "yellow", "blue", "white", "red"}
         m = mode.lower().strip()
         if m in valid:
             self.color_mode = m
@@ -215,6 +215,12 @@ class ChartLaneDetector:
             gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
             blur = cv2.GaussianBlur(gray, (5, 5), 0)
             _, mask = cv2.threshold(blur, 195, 255, cv2.THRESH_BINARY)
+
+        elif self.color_mode == "red":
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            mask1 = cv2.inRange(hsv, np.array([0, 70, 60]), np.array([10, 255, 255]))
+            mask2 = cv2.inRange(hsv, np.array([170, 70, 60]), np.array([180, 255, 255]))
+            mask = cv2.bitwise_or(mask1, mask2)
 
         else:
             # Fallback to dark

@@ -39,7 +39,7 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 
 import cv2  
 import numpy as np
@@ -89,12 +89,13 @@ CRUISE_SPEED = 180
 SLOW_SPEED   = 120
 
 # ── Follow-me speed modulation (bbox height vs frame height) ─────────────────
-FOLLOW_TOO_CLOSE    = 0.50   # > 50% → stop / hold
-FOLLOW_IDEAL_MIN    = 0.25   # 25–50% → cruise
-FOLLOW_GETTING_FAR  = 0.10   # 10–25% → speed up
-FOLLOW_CRUISE_SPEED = 160
-FOLLOW_FAST_SPEED   = 200
-FOLLOW_SLOW_SPEED   = 80
+FOLLOW_TOO_CLOSE    = 0.65   # > 65% → stop / hold (~1.0m away)
+FOLLOW_IDEAL_MIN    = 0.28   # 28–65% → cruise (~1.0m - 2.5m away)
+FOLLOW_GETTING_FAR  = 0.12   # 12–28% → speed up (> 2.5m away)
+FOLLOW_CRUISE_SPEED = 180    # Forward PWM speed (cruise)
+FOLLOW_FAST_SPEED   = 210    # Forward PWM speed (fast pursuit)
+FOLLOW_SLOW_SPEED   = 150    # Minimum forward PWM speed (prevents TT motor stall)
+FOLLOW_STEER_DEADBAND_DEG = 12 # Steering deadband (deg) for forward drive pursuit
 
 # ── Command Throttling & Cadence ─────────────────────────────────────────────
 # Prevents flooding the ATmega328P 115200 baud serial rx buffer.
@@ -252,15 +253,20 @@ class CommandThrottler:
         self.last_speed = speed
         self.last_cmd = "DRIVE"
 
-    def should_send_turn(self, target_angle: int, target_speed: int, interval_s: float = 0.12) -> bool:
+    def should_send_turn(self, target_angle: int, target_speed: int, interval_s: float = 0.16) -> bool:
         now = time.monotonic()
+        elapsed = now - self.last_turn_time
         if self.last_cmd != "TURN":
             return True
+        # If switching turn directions (e.g. left to right), allow responsive switch
+        if self.last_turn_angle is not None and (target_angle * self.last_turn_angle < 0) and elapsed >= 0.10:
+            return True
+        # Don't interrupt mid-turn if less than minimum interval to prevent motor twitch
+        if elapsed < interval_s:
+            return False
         if self.last_turn_speed is not None and self.last_turn_speed != target_speed:
             return True
-        if self.last_turn_angle is None or abs(target_angle - self.last_turn_angle) >= 5:
-            return True
-        if (now - self.last_turn_time) >= interval_s:
+        if self.last_turn_angle is None or abs(target_angle - self.last_turn_angle) >= 8:
             return True
         return False
 
@@ -565,7 +571,7 @@ PAGE = """<!DOCTYPE html>
     }
 
     function cycleLaneColor() {
-      const colors = ['dark', 'yellow', 'blue', 'white'];
+      const colors = ['dark', 'yellow', 'blue', 'red', 'white'];
       const btn = document.getElementById('btn-lane-color');
       let curr = (btn ? btn.getAttribute('data-color') : '') || 'dark';
       let nextIdx = (colors.indexOf(curr) + 1) % colors.length;
@@ -1878,6 +1884,7 @@ def _run_follow(
     throttler: CommandThrottler,
     fresh_inference: bool = True,
     sys_state: Optional[SystemState] = None,
+    auto_lock: bool = True,
 ) -> Tuple[str, bool, str]:
     """
     One loop iteration of follow-me mode.
@@ -2001,10 +2008,28 @@ def _run_follow(
             if sys_state:
                 sys_state.follow_state = "TRACKING"
         else:
-            if motors_enabled:
-                motor.stop()
-            throttler.record_other("STOP")
-            return follow_state, pi_latched, "🎯 FOLLOW: Click Person or Calibrate"
+            if auto_lock and persons:
+                # Auto-lock onto the most central / prominent person in view
+                best_p = min(
+                    persons,
+                    key=lambda p: abs((p["bbox"][0] + p["bbox"][2]) / 2.0 - frame_w / 2.0)
+                )
+                x1, y1, x2, y2 = [int(v) for v in best_p["bbox"]]
+                bbox = (x1, y1, x2 - x1, y2 - y1)
+                tracker.start_calibration(frame, bbox)
+                follow_state = "CALIBRATING"
+                if sys_state:
+                    sys_state.follow_state = follow_state
+                    sys_state.target_bbox = bbox
+                    sys_state.calibration_progress = getattr(tracker, "calibration_progress", 0.0)
+                if motors_enabled:
+                    motor.stop()
+                return follow_state, pi_latched, "🎯 AUTO-LOCK: Target Selected"
+            else:
+                if motors_enabled:
+                    motor.stop()
+                throttler.record_other("STOP")
+                return follow_state, pi_latched, "🎯 FOLLOW: Click Person or Calibrate"
 
     # 2. CALIBRATING
     if follow_state == "CALIBRATING":
@@ -2153,6 +2178,9 @@ def _run_follow(
         center_x = x + w / 2.0
         bbox_h_frac = h / max(frame_h, 1)
 
+        if getattr(pid, 'SetPoint', 0.0) == 0.0:
+            pid.SetPoint = frame_w / 2.0
+
         pid.update(center_x)
         angle = -int(pid.output)
         angle = max(-45, min(45, angle))
@@ -2185,48 +2213,50 @@ def _run_follow(
                 motor.stop()
             throttler.record_other("STOP")
             action_label = "🎯 TARGET TOO CLOSE (Holding)"
-        elif bbox_h_frac > FOLLOW_IDEAL_MIN:
-            spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_CRUISE_SPEED
-            action_label = f"{prefix} (Cruise PWM {spd}, Steer {angle}°)"
-            if motors_enabled:
-                if abs(angle) < 5:
-                    if throttler.should_send_drive(spd):
-                        motor.drive(spd, throttler.drive_duration_ms)
-                        throttler.record_drive(spd)
-                else:
-                    if throttler.should_send_turn(angle, spd):
-                        motor.turn(angle, speed=spd)
-                        throttler.record_turn(angle, spd)
-            else:
-                action_label = f"⏸️ BENCH SAFE: {prefix} CRUISE (Suppressed)"
-        elif bbox_h_frac > FOLLOW_GETTING_FAR:
-            spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
-            action_label = f"{prefix} (Fast PWM {spd}, Steer {angle}°)"
-            if motors_enabled:
-                if abs(angle) < 5:
-                    if throttler.should_send_drive(spd):
-                        motor.drive(spd, throttler.drive_duration_ms)
-                        throttler.record_drive(spd)
-                else:
-                    if throttler.should_send_turn(angle, spd):
-                        motor.turn(angle, speed=spd)
-                        throttler.record_turn(angle, spd)
-            else:
-                action_label = f"⏸️ BENCH SAFE: {prefix} FAST (Suppressed)"
         else:
-            spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
-            action_label = f"{prefix} (PWM {spd}, Steer {angle}°)"
+            if bbox_h_frac > FOLLOW_IDEAL_MIN:
+                spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_CRUISE_SPEED
+                range_label = "Cruise"
+            elif bbox_h_frac > FOLLOW_GETTING_FAR:
+                spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
+                range_label = "Fast"
+            else:
+                spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
+                range_label = "Catch-up"
+
+            action_label = f"{prefix} ({range_label} PWM {spd}, Steer {angle}°)"
+
             if motors_enabled:
-                if abs(angle) < 5:
+                now_mono = time.monotonic()
+                time_since_turn = now_mono - throttler.last_turn_time
+
+                # Steer-and-Pursue Decision:
+                # 1. Target in central corridor (|angle| <= FOLLOW_STEER_DEADBAND_DEG):
+                #    Command DRIVE forward directly towards target!
+                # 2. Target at moderate heading (12° < |angle| <= 26°):
+                #    Interleaved steer & pursue: after a turn correction, execute a
+                #    forward DRIVE pulse so the car actually moves forward towards the target.
+                # 3. Target sharply off-axis (|angle| > 26°):
+                #    Issue turn pulse to bring target into front corridor.
+                if abs(angle) <= FOLLOW_STEER_DEADBAND_DEG:
                     if throttler.should_send_drive(spd):
                         motor.drive(spd, throttler.drive_duration_ms)
                         throttler.record_drive(spd)
+                elif abs(angle) <= 26:
+                    if throttler.last_cmd == "TURN" and time_since_turn < 0.28:
+                        if throttler.should_send_drive(spd):
+                            motor.drive(spd, throttler.drive_duration_ms)
+                            throttler.record_drive(spd)
+                    else:
+                        if throttler.should_send_turn(angle, spd):
+                            motor.turn(angle, speed=spd)
+                            throttler.record_turn(angle, spd)
                 else:
                     if throttler.should_send_turn(angle, spd):
                         motor.turn(angle, speed=spd)
                         throttler.record_turn(angle, spd)
             else:
-                action_label = f"⏸️ BENCH SAFE: {prefix} FAR (Suppressed)"
+                action_label = f"⏸️ BENCH SAFE: {prefix} {range_label} (Suppressed)"
 
         return follow_state, pi_latched, action_label
 
@@ -2303,6 +2333,10 @@ def run_pipeline(
     awb_mode: str = "daylight",
     enable_stream: bool = True,
     confidence_thresh: float = 0.4,
+    video_source: Optional[Union[str, int]] = None,
+    show_gui: bool = False,
+    auto_lock: bool = True,
+    lane_color: Optional[str] = None,
 ):
     print(f"🚀 Autonomous RC Car — mode: {mode.upper()}")
     if mode not in ("autonomous", "lane", "follow"):
@@ -2357,47 +2391,65 @@ def run_pipeline(
     steering_pid.setWindup(50)
     follow_state = "LOCK_ON"
 
-    # ── 3b. Chart-Paper Lane Following Components ────────────────────────────
+    # ── 3b. Lane Following Components (Ribbon / Tape Track) ───────────────────
+    if lane_color:
+        system_state.lane_color_mode = lane_color
     lane_detector = ChartLaneDetector(color_mode=system_state.lane_color_mode)
 
     # ── 4. Camera Setup ──────────────────────────────────────────────────────
     use_picam2 = False
     picam2     = None
     cap        = None
+    is_video_file = False
 
-    try:
-        from picamera2 import Picamera2
-        picam2 = Picamera2()
-        system_state.cam_instance = picam2
-
-        # Configure Picamera2 in BGR888 mode
-        cfg = None
-        if Transform is not None:
-            try:
-                cfg = picam2.create_video_configuration(
-                    main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "BGR888"},
-                    transform=Transform(hflip=1, vflip=1)
-                )
-            except Exception:
-                pass
-        if cfg is None:
-            cfg = picam2.create_preview_configuration(
-                main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"}
-            )
-        picam2.configure(cfg)
-        picam2.start()
-        set_awb_mode(picam2, awb_mode)
-        use_picam2 = True
-        print(f"  📷 CSI Camera initialised via Picamera2 ({CAMERA_WIDTH}x{CAMERA_HEIGHT}).")
-    except Exception:
-        print("  📷 Picamera2 unavailable; falling back to cv2.VideoCapture.")
-        cap = cv2.VideoCapture(0)
+    if video_source is not None:
+        source_val = int(video_source) if str(video_source).isdigit() else str(video_source)
+        if isinstance(source_val, str):
+            is_video_file = True
+        print(f"  📷 Opening custom video source: {source_val}")
+        cap = cv2.VideoCapture(source_val)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_WIDTH)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
             cap.set(cv2.CAP_PROP_FPS,          CAMERA_FPS)
         else:
-            print("  📷 No physical camera detected; generating synthetic frames.")
+            print(f"⚠️ Could not open video source {source_val}; falling back to default.")
+            cap = None
+
+    if cap is None:
+        try:
+            from picamera2 import Picamera2
+            picam2 = Picamera2()
+            system_state.cam_instance = picam2
+
+            # Configure Picamera2 in BGR888 mode
+            cfg = None
+            if Transform is not None:
+                try:
+                    cfg = picam2.create_video_configuration(
+                        main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "BGR888"},
+                        transform=Transform(hflip=1, vflip=1)
+                    )
+                except Exception:
+                    pass
+            if cfg is None:
+                cfg = picam2.create_preview_configuration(
+                    main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"}
+                )
+            picam2.configure(cfg)
+            picam2.start()
+            set_awb_mode(picam2, awb_mode)
+            use_picam2 = True
+            print(f"  📷 CSI Camera initialised via Picamera2 ({CAMERA_WIDTH}x{CAMERA_HEIGHT}).")
+        except Exception:
+            print("  📷 Picamera2 unavailable (Laptop/PC dev mode); falling back to cv2.VideoCapture(0).")
+            cap = cv2.VideoCapture(0)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_WIDTH)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+                cap.set(cv2.CAP_PROP_FPS,          CAMERA_FPS)
+            else:
+                print("  📷 No physical camera detected; generating synthetic frames.")
 
     # ── 5. HTTP Streaming Server ─────────────────────────────────────────────
     server_thread = None
@@ -2424,6 +2476,20 @@ def run_pipeline(
             signal.signal(signal.SIGTERM, sig_handler)
         except (ValueError, AttributeError):
             pass
+
+    gui_window_name = "RC Car Capstone - Telemetry HUD"
+    if show_gui:
+        cv2.namedWindow(gui_window_name, cv2.WINDOW_AUTOSIZE)
+
+        def on_gui_mouse_click(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                nx = max(0.0, min(1.0, x / float(CAMERA_WIDTH)))
+                ny = max(0.0, min(1.0, y / float(CAMERA_HEIGHT)))
+                with system_state.lock:
+                    system_state.pending_select_point = (nx, ny)
+                print(f"🎯 Click on box at ({x}, {y}) -> Selected target at ({nx:.2f}, {ny:.2f})")
+
+        cv2.setMouseCallback(gui_window_name, on_gui_mouse_click)
 
     print("✅ System ready. Press Ctrl+C to terminate safely.\n")
 
@@ -2462,6 +2528,10 @@ def run_pipeline(
                     frame = frame_raw.copy()
             elif cap and cap.isOpened():
                 ret, frame = cap.read()
+                if not ret or frame is None:
+                    if is_video_file:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = cap.read()
                 if not ret or frame is None:
                     frame = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
             else:
@@ -2526,6 +2596,7 @@ def run_pipeline(
                     throttler=throttler,
                     fresh_inference=fresh_inference,
                     sys_state=system_state,
+                    auto_lock=auto_lock,
                 )
                 system_state.follow_state = follow_state
             else:
@@ -2552,7 +2623,7 @@ def run_pipeline(
             system_state.fps = fps
 
             # ── G. HUD Rendering & Streaming ─────────────────────────────────
-            if enable_stream and system_state.streaming_output is not None:
+            if (enable_stream and system_state.streaming_output is not None) or show_gui:
                 hud_frame = draw_hud(
                     frame=frame,
                     detections=cached_detections,
@@ -2574,9 +2645,35 @@ def run_pipeline(
                     non_target_persons=system_state.non_target_persons,
                     lane_result=system_state.lane_result,
                 )
-                ok, jpg = cv2.imencode(".jpg", hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if ok:
-                    system_state.streaming_output.write(jpg.tobytes())
+                if enable_stream and system_state.streaming_output is not None:
+                    ok, jpg = cv2.imencode(".jpg", hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if ok:
+                        system_state.streaming_output.write(jpg.tobytes())
+                if show_gui:
+                    cv2.imshow("RC Car Capstone - Telemetry HUD", hud_frame)
+                    k = cv2.waitKey(1) & 0xFF
+                    if k in (ord('q'), 27):
+                        print("\n👋 'q' pressed in GUI window. Exiting...")
+                        system_state.running = False
+                    elif k == ord('c'):
+                        print("🎯 'c' pressed: Calibrating on center target.")
+                        with system_state.lock:
+                            system_state.pending_calibrate_center = True
+                    elif k == ord('r'):
+                        print("🔄 'r' pressed: Resetting target.")
+                        with system_state.lock:
+                            system_state.pending_reset_target = True
+                    elif k == ord('m'):
+                        with system_state.lock:
+                            modes = ["follow", "autonomous", "lane"]
+                            curr_idx = modes.index(system_state.control_mode) if system_state.control_mode in modes else 0
+                            system_state.control_mode = modes[(curr_idx + 1) % len(modes)]
+                            print(f"🔀 Switched mode to: {system_state.control_mode}")
+                    elif k == ord(' '):
+                        with system_state.lock:
+                            system_state.motors_enabled = not system_state.motors_enabled
+                            state_str = "ENABLED" if system_state.motors_enabled else "PAUSED (Bench-Safe)"
+                            print(f"⏸️ Motors: {state_str}")
 
             time.sleep(0.01)
 
@@ -2607,6 +2704,11 @@ def run_pipeline(
             try:
                 httpd.shutdown()
                 httpd.server_close()
+            except Exception:
+                pass
+        if show_gui:
+            try:
+                cv2.destroyAllWindows()
             except Exception:
                 pass
         print("👋 Shutdown complete. Hardware released safely.")
@@ -2672,6 +2774,29 @@ def main():
         default=0.40,
         help="YOLO detection confidence threshold (default: 0.40).",
     )
+    parser.add_argument(
+        "--video",
+        "--source",
+        dest="video_source",
+        default=None,
+        help="Video source: camera index ('0', '1'), video file path ('test.mp4'), or None for auto (Picamera2 on Pi, webcam on PC).",
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Open local OpenCV GUI window with interactive HUD ('q' quit, 'c' lock-on, 'r' reset, 'm' switch mode, space pause). Click any person box to target!",
+    )
+    parser.add_argument(
+        "--no-auto-lock",
+        action="store_true",
+        help="Disable automatic person acquisition (requires clicking on a box or pressing 'c' to target).",
+    )
+    parser.add_argument(
+        "--lane-color",
+        choices=["dark", "yellow", "blue", "red", "white"],
+        default=None,
+        help="Color preset for lane ribbon/tape boundaries ('yellow', 'blue', 'red', 'white', 'dark').",
+    )
 
     args = parser.parse_args()
 
@@ -2685,6 +2810,10 @@ def main():
         awb_mode=args.awb,
         enable_stream=not args.no_stream,
         confidence_thresh=args.conf,
+        video_source=args.video_source,
+        show_gui=args.gui,
+        auto_lock=not args.no_auto_lock,
+        lane_color=args.lane_color,
     )
 
 

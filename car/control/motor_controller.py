@@ -140,13 +140,28 @@ class MotorController:
         """
         Sends an ASCII command terminated with newline.
         Returns True on success, False if disconnected or serial error.
+        In simulated / laptop mode, updates latest_state so HUD reflects current action.
         Callers that need ACK confirmation should call read_telemetry() after.
         """
+        cmd_clean = command.strip()
         with self._lock:
             if not self.is_connected():
+                if self.port == "SIMULATED":
+                    if cmd_clean.startswith("DRIVE"):
+                        self.latest_state = "DRIVING"
+                    elif cmd_clean.startswith("TURN"):
+                        self.latest_state = "TURNING"
+                    elif cmd_clean.startswith("REV"):
+                        self.latest_state = "REVERSING"
+                    elif cmd_clean == "STOP":
+                        self.latest_state = "IDLE"
+                    elif cmd_clean == "PI_STOP":
+                        self.latest_state = "PI_STOPPED"
+                    elif cmd_clean == "PI_GO":
+                        self.latest_state = "IDLE"
                 return False
             try:
-                line = (command.strip() + "\n").encode("utf-8")
+                line = (cmd_clean + "\n").encode("utf-8")
                 self._serial.write(line)
                 self._serial.flush()
                 return True

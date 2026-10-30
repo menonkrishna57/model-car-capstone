@@ -27,6 +27,7 @@ class PID:
         self.ITerm = 0.0
         self.DTerm = 0.0
         self.last_error = 0.0
+        self._first_update = True
 
         # Windup Guard
         self.int_error = 0.0
@@ -40,7 +41,11 @@ class PID:
 
         self.current_time = time.time()
         delta_time = self.current_time - self.last_time
-        delta_error = error - self.last_error
+        if getattr(self, "_first_update", True):
+            self._first_update = False
+            delta_error = 0.0
+        else:
+            delta_error = error - self.last_error
 
         if (delta_time >= self.sample_time):
             self.PTerm = self.Kp * error
