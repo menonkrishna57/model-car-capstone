@@ -90,9 +90,9 @@ CRUISE_SPEED = 180
 SLOW_SPEED   = 180
 
 # ── Follow-me speed modulation (bbox height vs frame height) ─────────────────
-FOLLOW_TOO_CLOSE    = 0.50   # > 50% → stop / hold
-FOLLOW_IDEAL_MIN    = 0.25   # 25–50% → cruise
-FOLLOW_GETTING_FAR  = 0.10   # 10–25% → speed up
+FOLLOW_TOO_CLOSE    = 0.90   # > 90% (or clipped at top + > 82%) → stop / hold (< 1.2m)
+FOLLOW_IDEAL_MIN    = 0.55   # 55–90% → cruise (~1.3m – 2.8m)
+FOLLOW_GETTING_FAR  = 0.35   # 35–55% → speed up (~2.8m – 4.0m)
 FOLLOW_CRUISE_SPEED = 185
 FOLLOW_FAST_SPEED   = 200
 FOLLOW_SLOW_SPEED   = 180
@@ -2920,7 +2920,22 @@ def _run_follow(
 
         prefix = "🔀 BYPASS+FOLLOW" if avoid_override else "🎯 FOLLOWING"
 
-        if bbox_h_frac > FOLLOW_TOO_CLOSE:
+        # Ground-plane follow distance evaluation
+        us_min = min(us_l if is_valid_us(us_l) else 999.0, us_r if is_valid_us(us_r) else 999.0)
+
+        # True close proximity check:
+        # 1. Ultrasonic sensor detects obstacle < 65cm
+        # 2. Vision: Target occupies > 82% of vertical frame AND top edge is clipped (y <= 10, head above frame)
+        # 3. Vision: Target fills > 90% of vertical frame regardless (distance < 1.1m)
+        is_target_too_close = False
+        if us_min < 65.0:
+            is_target_too_close = True
+        elif y <= 10 and bbox_h_frac > 0.82:
+            is_target_too_close = True
+        elif bbox_h_frac > FOLLOW_TOO_CLOSE:
+            is_target_too_close = True
+
+        if is_target_too_close:
             if motors_enabled:
                 motor.stop()
             throttler.record_other("STOP")
