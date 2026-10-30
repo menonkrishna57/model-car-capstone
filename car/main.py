@@ -39,7 +39,7 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Dict, List, Optional, Tuple, Any
 
 import cv2  
 import numpy as np
@@ -79,6 +79,7 @@ from car.perception.lane_detector import ChartLaneDetector, LaneCurve, LaneDetec
 from car.control.motor_controller import MotorController
 from car.control.navigation import NavigationSystem
 from car.control.pid import PID
+from car.control.corner_recovery import CornerRecoveryController
 
 # ── Architecture §6 Rule 2 — Bounding-box height thresholds ──────────────────
 BBOX_STOP_THRESHOLD = 0.40   # > 40% of frame height → PI_STOP
@@ -86,21 +87,29 @@ BBOX_SLOW_THRESHOLD = 0.15   # 15–40% → caution / reduce PWM
 
 # Cruise and slow PWM values (0–255)
 CRUISE_SPEED = 180
-SLOW_SPEED   = 120
+SLOW_SPEED   = 180
 
 # ── Follow-me speed modulation (bbox height vs frame height) ─────────────────
-FOLLOW_TOO_CLOSE    = 0.65   # > 65% → stop / hold (~1.0m away)
-FOLLOW_IDEAL_MIN    = 0.28   # 28–65% → cruise (~1.0m - 2.5m away)
-FOLLOW_GETTING_FAR  = 0.12   # 12–28% → speed up (> 2.5m away)
-FOLLOW_CRUISE_SPEED = 180    # Forward PWM speed (cruise)
-FOLLOW_FAST_SPEED   = 210    # Forward PWM speed (fast pursuit)
-FOLLOW_SLOW_SPEED   = 150    # Minimum forward PWM speed (prevents TT motor stall)
-FOLLOW_STEER_DEADBAND_DEG = 12 # Steering deadband (deg) for forward drive pursuit
+FOLLOW_TOO_CLOSE    = 0.50   # > 50% → stop / hold
+FOLLOW_IDEAL_MIN    = 0.25   # 25–50% → cruise
+FOLLOW_GETTING_FAR  = 0.10   # 10–25% → speed up
+FOLLOW_CRUISE_SPEED = 185
+FOLLOW_FAST_SPEED   = 200
+FOLLOW_SLOW_SPEED   = 180
 
 # ── Command Throttling & Cadence ─────────────────────────────────────────────
 # Prevents flooding the ATmega328P 115200 baud serial rx buffer.
 DRIVE_CMD_DURATION_MS = 300     # Duration in ms sent with DRIVE commands
 DRIVE_THROTTLE_INTERVAL_S = 0.18 # Interval between repeated DRIVE commands (~5.5 Hz)
+
+# A TURN command is a complete, timed skid-steer manoeuvre on the Uno, not a
+# continuous steering setpoint.  Do not react to every camera frame as though
+# it were a servo command: that repeatedly replaces a turn before the chassis
+# has moved and produces the familiar left/right "hunting" behaviour.
+LANE_STEER_EMA_ALPHA = 0.28
+LANE_TURN_MAX_BURST_DEG = 18
+LANE_TURN_SETTLE_S = 0.30
+LANE_REVERSAL_CONFIRM_FRAMES = 3
 
 # ── Camera Controls & AWB Definitions ────────────────────────────────────────
 try:
@@ -253,20 +262,15 @@ class CommandThrottler:
         self.last_speed = speed
         self.last_cmd = "DRIVE"
 
-    def should_send_turn(self, target_angle: int, target_speed: int, interval_s: float = 0.16) -> bool:
+    def should_send_turn(self, target_angle: int, target_speed: int, interval_s: float = 0.12) -> bool:
         now = time.monotonic()
-        elapsed = now - self.last_turn_time
         if self.last_cmd != "TURN":
             return True
-        # If switching turn directions (e.g. left to right), allow responsive switch
-        if self.last_turn_angle is not None and (target_angle * self.last_turn_angle < 0) and elapsed >= 0.10:
-            return True
-        # Don't interrupt mid-turn if less than minimum interval to prevent motor twitch
-        if elapsed < interval_s:
-            return False
         if self.last_turn_speed is not None and self.last_turn_speed != target_speed:
             return True
-        if self.last_turn_angle is None or abs(target_angle - self.last_turn_angle) >= 8:
+        if self.last_turn_angle is None or abs(target_angle - self.last_turn_angle) >= 5:
+            return True
+        if (now - self.last_turn_time) >= interval_s:
             return True
         return False
 
@@ -294,6 +298,76 @@ class CommandThrottler:
         self.last_speed = None
 
 
+class LaneSteeringStabilizer:
+    """Convert noisy visual steering estimates into safe skid-steer bursts.
+
+    Lane detection runs at camera rate, while the Arduino executes ``TURN`` as
+    a timed action.  This controller smooths the visual estimate, limits each
+    correction to a small burst, and requires consecutive opposite-direction
+    estimates before permitting a reversal.  It intentionally has no integral
+    term: the next post-turn camera frame is the feedback that removes residual
+    error.
+    """
+
+    def __init__(
+        self,
+        ema_alpha: float = LANE_STEER_EMA_ALPHA,
+        max_turn_deg: int = LANE_TURN_MAX_BURST_DEG,
+        settle_s: float = LANE_TURN_SETTLE_S,
+        reversal_confirm_frames: int = LANE_REVERSAL_CONFIRM_FRAMES,
+    ):
+        self.ema_alpha = float(np.clip(ema_alpha, 0.01, 1.0))
+        self.max_turn_deg = max(1, int(max_turn_deg))
+        self.settle_s = max(0.0, float(settle_s))
+        self.reversal_confirm_frames = max(1, int(reversal_confirm_frames))
+        self.filtered_angle: Optional[float] = None
+        self.last_direction = 0
+        self.opposite_frames = 0
+        self.turn_settle_until = 0.0
+
+    def reset(self):
+        self.filtered_angle = None
+        self.last_direction = 0
+        self.opposite_frames = 0
+        self.turn_settle_until = 0.0
+
+    def is_settling(self, now: Optional[float] = None) -> bool:
+        return (time.monotonic() if now is None else now) < self.turn_settle_until
+
+    def mark_turn_sent(self, now: Optional[float] = None):
+        now = time.monotonic() if now is None else now
+        self.turn_settle_until = now + self.settle_s
+
+    def update(self, raw_angle_deg: float, deadband_deg: float) -> int:
+        """Return a bounded turn burst, or zero when a reversal is unconfirmed."""
+        if not math.isfinite(raw_angle_deg):
+            return 0
+
+        if self.filtered_angle is None:
+            self.filtered_angle = float(raw_angle_deg)
+        else:
+            self.filtered_angle += self.ema_alpha * (float(raw_angle_deg) - self.filtered_angle)
+
+        angle = self.filtered_angle
+        if abs(angle) <= deadband_deg:
+            self.last_direction = 0
+            self.opposite_frames = 0
+            return 0
+
+        direction = 1 if angle > 0 else -1
+        if self.last_direction and direction != self.last_direction:
+            self.opposite_frames += 1
+            if self.opposite_frames < self.reversal_confirm_frames:
+                return 0
+        else:
+            self.opposite_frames = 0
+
+        self.last_direction = direction
+        self.opposite_frames = 0
+        magnitude = min(self.max_turn_deg, max(1, int(round(abs(angle)))))
+        return direction * magnitude
+
+
 # =============================================================================
 # System Runtime State
 # =============================================================================
@@ -303,14 +377,16 @@ class SystemState:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.motors_enabled: bool = True     # False = Bench-test safe mode (no physical drive)
+        self.motors_enabled: bool = False    # Requirement R2: Initialize disarmed by default
+        self.emergency_stop: bool = False    # True = Operator safety emergency stop active
         self.invert_motors: bool = False     # True = TT motor polarity inversion fix
         self.active_action_label: str = "IDLE (Safety Hold)"
         self.current_awb: str = "daylight"
+        self.swap_rb: bool = True            # Requirement R2: True = BGR color swap for Pi 5 CSI camera
         self.current_mode: str = "autonomous"
         self.control_mode: str = "autonomous"  # "autonomous" or "manual"
         self.manual_override_obstacles: bool = False  # True = Ignore camera/ultrasonic obstacle stops in manual mode
-        self.manual_speed: int = 185           # Manual drive PWM (130, 185, 235)
+        self.manual_speed: int = 185           # Manual drive PWM (180, 205, 235)
         self.manual_action: str = "IDLE"       # Current manual remote action
         self.pi_latched: bool = False
         self.fps: float = 0.0
@@ -358,165 +434,464 @@ PAGE = """<!DOCTYPE html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Autonomous RC Car — Perception & Diagnostic HUD</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #0d1117;
-      --card-glass: rgba(18, 22, 30, 0.85);
-      --border-glass: rgba(255, 255, 255, 0.15);
-      --accent: #58a6ff; --success: #3fb950; --danger: #f85149; --warning: #d29922; --text: #f0f6fc; --muted: #8b949e;
+      --bg-app: #080b11;
+      --bg-surface: rgba(13, 18, 28, 0.82);
+      --bg-surface-elevated: rgba(20, 27, 42, 0.92);
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-glass: rgba(255, 255, 255, 0.12);
+      --border-active: rgba(56, 189, 248, 0.45);
+
+      --accent: #38bdf8;
+      --accent-bg: rgba(56, 189, 248, 0.14);
+      --accent-border: rgba(56, 189, 248, 0.35);
+
+      --status-emerald: #10b981;
+      --status-emerald-bg: rgba(16, 185, 129, 0.14);
+      --status-emerald-border: rgba(16, 185, 129, 0.35);
+
+      --status-amber: #f59e0b;
+      --status-amber-bg: rgba(245, 158, 11, 0.14);
+      --status-amber-border: rgba(245, 158, 11, 0.35);
+
+      --status-rose: #f43f5e;
+      --status-rose-bg: rgba(244, 63, 94, 0.18);
+      --status-rose-border: rgba(244, 63, 94, 0.40);
+
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+
+      --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+      --liquid-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 12px 32px -8px rgba(0, 0, 0, 0.75);
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
-      background: var(--bg); color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      width: 100vw; height: 100vh; overflow: hidden;
-      display: flex; justify-content: center; align-items: center; user-select: none;
+      background: var(--bg-app); color: var(--text-main);
+      font-family: var(--font-sans);
+      width: 100vw; height: 100vh; height: 100dvh;
+      overflow: hidden;
+      display: flex; flex-direction: column;
+      user-select: none;
+      -webkit-font-smoothing: antialiased;
     }
+
+    /* Structured Header Dock in Normal Document Flow */
+    header#topbar {
+      height: 44px; min-height: 44px; width: 100%;
+      background: var(--bg-surface);
+      backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 14px; gap: 10px;
+      z-index: 100; flex-shrink: 0;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.4);
+      transition: opacity 0.25s ease;
+    }
+    .brand-group {
+      display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+      font-weight: 600; font-size: 0.82rem; letter-spacing: -0.01em; color: var(--text-main);
+    }
+    .brand-sub {
+      font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-dim); font-weight: 500;
+      padding: 2px 6px; background: rgba(255, 255, 255, 0.04); border-radius: 6px; border: 1px solid var(--border-subtle);
+    }
+    .telemetry-bar {
+      display: flex; align-items: center; gap: 6px; overflow-x: auto;
+      scrollbar-width: none; -ms-overflow-style: none;
+    }
+    .telemetry-bar::-webkit-scrollbar { display: none; }
+
+    /* Badges */
+    .badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 3px 8px; border-radius: 8px;
+      font-size: 0.72rem; font-weight: 600;
+      letter-spacing: -0.01em; white-space: nowrap;
+      transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .badge .num {
+      font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+    }
+    .badge-mode {
+      background: var(--accent-bg); color: var(--accent); border: 1px solid var(--accent-border);
+    }
+    .badge-daylight {
+      background: var(--status-amber-bg); color: var(--status-amber); border: 1px solid var(--status-amber-border);
+    }
+    .badge-motors-on {
+      background: var(--status-emerald-bg); color: var(--status-emerald); border: 1px solid var(--status-emerald-border);
+    }
+    .badge-motors-off {
+      background: var(--status-rose-bg); color: var(--status-rose); border: 1px solid var(--status-rose-border);
+    }
+    .badge-invert-on {
+      background: var(--accent-bg); color: var(--accent); border: 1px solid var(--accent-border);
+    }
+    .badge-invert-off {
+      background: rgba(255, 255, 255, 0.04); color: var(--text-muted); border: 1px solid var(--border-subtle);
+    }
+    .badge-us {
+      background: var(--status-emerald-bg); color: var(--status-emerald); border: 1px solid var(--status-emerald-border);
+      font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+    }
+
+    /* Central Video Viewport */
     #viewport {
-      position: absolute; top: 0; left: 0; width: 100vw; height: 100vh;
-      display: flex; justify-content: center; align-items: center; background: #000;
+      flex: 1; min-height: 0; width: 100%;
+      position: relative;
+      display: flex; justify-content: center; align-items: center;
+      background: #000; overflow: hidden;
     }
-    img#stream { width: 100%; height: 100%; object-fit: contain; display: block; }
-    header {
-      position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
-      background: var(--card-glass); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-      border: 1px solid var(--border-glass); border-radius: 30px; padding: 6px 18px;
-      display: flex; align-items: center; gap: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); z-index: 100;
+    img#stream {
+      max-width: 100%; max-height: 100%; width: auto; height: auto;
+      object-fit: contain; display: block;
+      cursor: crosshair;
     }
-    .badge { padding: 4px 10px; border-radius: 12px; font-size: 0.75rem; font-weight: 700; }
-    .badge-mode { background: rgba(88, 166, 255, 0.2); color: var(--accent); border: 1px solid var(--accent); }
-    .badge-daylight { background: rgba(227, 179, 65, 0.2); color: #e3b341; border: 1px solid #e3b341; }
-    .badge-motors-on { background: rgba(63, 185, 80, 0.2); color: var(--success); border: 1px solid var(--success); }
-    .badge-motors-off { background: rgba(248, 81, 73, 0.2); color: var(--danger); border: 1px solid var(--danger); }
-    .badge-invert-on { background: rgba(88, 166, 255, 0.2); color: var(--accent); border: 1px solid var(--accent); }
-    .badge-invert-off { background: rgba(139, 148, 158, 0.2); color: var(--muted); border: 1px solid var(--muted); }
-    .badge-us { background: rgba(63, 185, 80, 0.2); color: var(--success); border: 1px solid var(--success); }
+
+    /* Bottom Controls Dock */
     .controls-dock {
-      position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
-      background: var(--card-glass); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-      border: 1px solid var(--border-glass); border-radius: 28px; padding: 6px 14px;
-      display: flex; align-items: center; gap: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); z-index: 100;
-      transition: all 0.3s ease;
+      position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+      background: var(--bg-surface);
+      backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--border-glass); border-radius: 20px;
+      padding: 5px 8px;
+      display: flex; align-items: center; gap: 5px;
+      box-shadow: var(--liquid-shadow); z-index: 100;
+      max-width: calc(100vw - 28px); overflow-x: auto;
+      scrollbar-width: none; -ms-overflow-style: none;
+      transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
     }
-    .controls-dock.hidden { opacity: 0; pointer-events: none; transform: translateX(-50%) translateY(20px); }
+    .controls-dock::-webkit-scrollbar { display: none; }
+    .controls-dock.hidden {
+      opacity: 0; pointer-events: none; transform: translateX(-50%) translateY(24px);
+    }
+    .dock-divider {
+      width: 1px; height: 20px; background: var(--border-subtle); margin: 0 2px; flex-shrink: 0;
+    }
+
+    /* Buttons */
     button {
-      background: rgba(255, 255, 255, 0.08); color: var(--text); border: 1px solid var(--border-glass);
-      padding: 7px 14px; border-radius: 18px; font-size: 0.8rem; font-weight: 600; cursor: pointer;
-      display: inline-flex; align-items: center; gap: 6px; transition: background 0.2s;
+      background: rgba(255, 255, 255, 0.04); color: var(--text-main);
+      border: 1px solid var(--border-subtle);
+      padding: 6px 11px; border-radius: 12px;
+      font-family: var(--font-sans); font-size: 0.74rem; font-weight: 500;
+      letter-spacing: -0.01em; cursor: pointer; white-space: nowrap;
+      display: inline-flex; align-items: center; gap: 6px;
+      transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+      flex-shrink: 0;
     }
-    button:hover { background: rgba(255, 255, 255, 0.18); }
-    button.btn-active { background: #1f6feb; border-color: #58a6ff; }
-    button.btn-danger { background: rgba(248, 81, 73, 0.25); border-color: var(--danger); color: #ff7b72; }
-    button.btn-success { background: rgba(63, 185, 80, 0.25); border-color: var(--success); color: #56d364; }
-    .shortcut-tip { position: absolute; bottom: 6px; right: 12px; font-size: 0.7rem; color: var(--muted); opacity: 0.6; }
+    button:hover {
+      background: rgba(255, 255, 255, 0.09); border-color: rgba(255, 255, 255, 0.18);
+    }
+    button:active {
+      transform: scale(0.96) translateY(1px);
+    }
+    button.btn-active {
+      background: var(--accent-bg); border-color: var(--accent-border); color: var(--accent); font-weight: 600;
+    }
+    button.btn-danger {
+      background: var(--status-rose-bg); border-color: var(--status-rose-border); color: #fecdd3;
+    }
+    button.btn-danger:hover {
+      background: rgba(244, 63, 94, 0.26);
+    }
+    button.btn-success {
+      background: var(--status-emerald-bg); border-color: var(--status-emerald-border); color: #a7f3d0;
+    }
+    button.btn-success:hover {
+      background: rgba(16, 185, 129, 0.22);
+    }
+
+    /* SVG icon utility */
+    .icon {
+      width: 14px; height: 14px; flex-shrink: 0;
+      stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+    }
+
+    /* Remote D-Pad Panel */
     .remote-panel {
-      position: absolute; bottom: 80px; right: 20px;
-      background: var(--card-glass); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-      border: 1px solid var(--border-glass); border-radius: 16px; padding: 12px;
+      position: absolute; bottom: 74px; right: 16px;
+      background: var(--bg-surface-elevated);
+      backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--border-glass); border-radius: 16px;
+      padding: 12px;
       display: flex; flex-direction: column; gap: 8px; z-index: 99;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.6);
-      transition: all 0.3s ease;
+      box-shadow: var(--liquid-shadow);
+      transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
     }
-    .remote-panel.hidden { opacity: 0; pointer-events: none; transform: translateY(20px); }
+    .remote-panel.hidden {
+      opacity: 0; pointer-events: none; transform: translateY(20px) scale(0.96);
+    }
     .remote-header {
-      display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem; font-weight: 700;
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 0.78rem; font-weight: 600; color: var(--text-main);
     }
-    .speed-pills { display: flex; gap: 4px; }
+    .speed-pills { display: flex; gap: 3px; }
     .btn-speed {
-      padding: 3px 8px; font-size: 0.7rem; border-radius: 10px; background: rgba(255,255,255,0.08); border: 1px solid var(--border-glass); color: var(--text); cursor: pointer;
+      padding: 3px 8px; font-size: 0.7rem; border-radius: 8px;
+      font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+      background: rgba(255, 255, 255, 0.04); border: 1px solid var(--border-subtle);
+      color: var(--text-muted); cursor: pointer;
     }
-    .btn-speed.active { background: #1f6feb; border-color: #58a6ff; font-weight: 700; }
+    .btn-speed.active {
+      background: var(--accent-bg); border-color: var(--accent); color: var(--accent); font-weight: 700;
+    }
     .dpad-grid {
-      display: grid; grid-template-columns: repeat(3, 44px); grid-template-rows: repeat(3, 44px); gap: 6px; justify-content: center;
+      display: grid; grid-template-columns: repeat(3, 44px); grid-template-rows: repeat(3, 44px); gap: 6px;
+      justify-content: center;
     }
     .dpad-btn {
-      width: 44px; height: 44px; padding: 0; border-radius: 10px; font-size: 1rem; font-weight: 700;
-      background: rgba(255,255,255,0.08); border: 1px solid var(--border-glass); color: var(--text);
-      display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer;
+      width: 44px; height: 44px; padding: 0; border-radius: 10px;
+      background: rgba(255, 255, 255, 0.04); border: 1px solid var(--border-subtle);
+      color: var(--text-main);
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      cursor: pointer;
+      transition: transform 0.1s cubic-bezier(0.16, 1, 0.3, 1), background 0.12s ease;
     }
-    .dpad-btn:hover { background: rgba(255,255,255,0.2); }
-    .dpad-btn:active { background: #1f6feb; border-color: #58a6ff; transform: scale(0.95); }
-    .dpad-stop { background: rgba(248,81,73,0.2); border-color: var(--danger); color: #ff7b72; }
-    .key-hint { font-size: 0.55rem; color: var(--muted); margin-top: 1px; }
+    .dpad-btn:hover {
+      background: rgba(255, 255, 255, 0.1); border-color: rgba(255, 255, 255, 0.18);
+    }
+    .dpad-btn:active, .dpad-btn.key-pressed {
+      transform: scale(0.92) translateY(1px);
+      background: var(--accent-bg); border-color: var(--accent); color: var(--accent);
+    }
+    .dpad-stop {
+      background: var(--status-rose-bg); border-color: var(--status-rose-border); color: #fecdd3;
+    }
+    .dpad-stop:active, .dpad-stop.key-pressed {
+      background: rgba(244, 63, 94, 0.35); border-color: var(--status-rose); color: #fff;
+    }
+    .key-hint {
+      font-family: var(--font-mono); font-size: 0.58rem; color: var(--text-dim); margin-top: 1px;
+    }
+    .dpad-hint {
+      font-size: 0.64rem; color: var(--text-dim); text-align: center;
+      font-family: var(--font-mono);
+    }
+
+    .shortcut-tip {
+      position: absolute; bottom: 6px; right: 14px;
+      font-size: 0.66rem; color: var(--text-dim); font-family: var(--font-mono);
+      opacity: 0.75; pointer-events: none; z-index: 50;
+    }
+    .shortcut-tip b { color: var(--text-muted); }
+
+    /* Modal */
     .modal {
       display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-      background: rgba(0,0,0,0.85); z-index: 1000; justify-content: center; align-items: center; padding: 20px;
+      background: rgba(4, 7, 13, 0.88); backdrop-filter: blur(8px);
+      z-index: 1000; justify-content: center; align-items: center; padding: 20px;
     }
     .modal.show { display: flex; }
-    .modal-box { background: #161b22; border: 1px solid #30363d; border-radius: 10px; max-width: 680px; width: 100%; padding: 16px; }
-    .modal-box img { width: 100%; border-radius: 6px; margin-top: 10px; display: block; }
+    .modal-box {
+      background: var(--bg-surface-elevated); border: 1px solid var(--border-glass);
+      border-radius: 14px; max-width: 680px; width: 100%; padding: 18px;
+      box-shadow: var(--liquid-shadow);
+    }
+    .modal-box img { width: 100%; border-radius: 8px; margin-top: 12px; display: block; border: 1px solid var(--border-subtle); }
   </style>
 </head>
 <body>
+  <header id="topbar">
+    <div class="brand-group">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9L16 10l-2-4H6L4 10.1C3.2 10.3 2.5 11.1 2.5 12v4c0 .6.4 1 1 1h2"/><circle cx="7" cy="17" r="2"/><circle cx="17" cy="17" r="2"/></svg>
+      <span>Autonomous RC Car</span>
+      <span class="brand-sub">Pi 5 &harr; Uno</span>
+    </div>
+    <div class="telemetry-bar">
+      <div class="badge badge-mode" id="mode-badge" onclick="toggleControlMode()" style="cursor:pointer" title="Click to toggle Mode (C)">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 15h3M1 9h3M1 15h3"/></svg>
+        <span id="mode-badge-text">MODE: AUTONOMOUS</span>
+      </div>
+      <div class="badge badge-invert-off" id="target-badge" onclick="calibrateTarget()" style="cursor:pointer" title="Click to Calibrate (L)">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+        <span id="target-badge-text">TARGET: UNCALIBRATED</span>
+      </div>
+      <div class="badge badge-invert-off" id="override-badge" onclick="toggleOverride()" style="cursor:pointer" title="Toggle Manual Obstacle Override (O)">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        <span id="override-badge-text">OVERRIDE: OFF</span>
+      </div>
+      <div class="badge badge-daylight" id="swap-rb-badge" onclick="toggleSwapRb()" style="cursor:pointer" title="Toggle Camera RGB/BGR Channel Swap (K)">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>
+        <span id="swap-rb-badge-text">COLOR: BGR (SWAP ON)</span>
+      </div>
+      <div class="badge badge-daylight" id="awb-badge">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        <span id="awb-badge-text">AWB: DAYLIGHT</span>
+      </div>
+      <div class="badge badge-motors-off" id="motors-badge" onclick="toggleMotors()" style="cursor:pointer" title="Toggle Motor Power (M)">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        <span id="motors-badge-text">MOTORS: BENCH SAFE [OFF]</span>
+      </div>
+      <div class="badge badge-invert-off" id="invert-badge" onclick="toggleInvertMotors()" style="cursor:pointer" title="Toggle Motor Polarity (I)">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m17 2 4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+        <span id="invert-badge-text">POLARITY: NORMAL</span>
+      </div>
+      <div class="badge badge-us" id="sonar-badge">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M2 12h4M18 12h4M8 8a6 6 0 0 1 8 0M6 5a10 10 0 0 1 12 0"/></svg>
+        <span id="sonar-badge-text">US: L=--- R=---</span>
+      </div>
+    </div>
+  </header>
+
   <div id="viewport">
     <img id="stream" src="stream.mjpg" alt="Autonomous Perception Stream">
   </div>
 
-  <header id="topbar">
-    <div style="font-weight:700; font-size:0.85rem">🏎️ MPSTME Capstone — Pi 5 ↔ Uno</div>
-    <div class="badge badge-mode" id="mode-badge" onclick="toggleControlMode()" style="cursor:pointer" title="Click to toggle Mode (C)">MODE: AUTONOMOUS 🤖</div>
-    <div class="badge badge-invert-off" id="target-badge" onclick="calibrateTarget()" style="cursor:pointer" title="Click to Calibrate (L)">TARGET: UNCALIBRATED 🎯</div>
-    <div class="badge badge-invert-off" id="override-badge" onclick="toggleOverride()" style="cursor:pointer" title="Toggle Manual Obstacle Override (O)">OVERRIDE: OFF 🛡️</div>
-    <div class="badge badge-daylight" id="awb-badge">AWB: DAYLIGHT ☀️</div>
-    <div class="badge badge-motors-on" id="motors-badge">MOTORS: ACTIVE ⚡</div>
-    <div class="badge badge-invert-off" id="invert-badge">POLARITY: NORMAL ➡️</div>
-    <div class="badge badge-us" id="sonar-badge">US: L=--- R=---</div>
-  </header>
-
   <div class="controls-dock" id="dock">
-    <button id="btn-motors" class="btn-success" onclick="toggleMotors()">🛑 Disable Motors (M)</button>
-    <button id="btn-mode" onclick="toggleControlMode()">🎮 Mode: Toggle (C)</button>
-    <button id="btn-lane" onclick="setMode('lane')">🛣️ Lane Mode</button>
-    <button id="btn-lane-color" onclick="cycleLaneColor()">🎨 Lane: Dark</button>
-    <button id="btn-follow" onclick="setMode('follow')">🎯 Follow Mode</button>
-    <button id="btn-cal-target" class="btn-active" onclick="calibrateTarget()">🎯 Calibrate Target (L)</button>
-    <button id="btn-reset-target" onclick="resetTarget()">🔄 Reset Target</button>
-    <button id="btn-override" onclick="toggleOverride()">🔓 Override Obstacles (O)</button>
-    <button id="btn-remote" onclick="toggleRemoteWidget()">🕹️ D-Pad</button>
-    <button id="btn-invert" onclick="toggleInvertMotors()">🔄 Polarity: Normal (I)</button>
-    <button class="btn-active" id="btn-daylight" onclick="setAwb('daylight')">☀️ Daylight</button>
-    <button onclick="setAwb('auto')">🔄 Auto</button>
-    <button onclick="setAwb('indoor')">💡 Indoor</button>
-    <button onclick="releaseLatch()" class="btn-active">✅ Release Latch (PI_GO)</button>
-    <button onclick="emergencyStop()" class="btn-danger">🛑 E-STOP (Space)</button>
-    <button onclick="testPulse()">🏎️ Test Pulse</button>
-    <button onclick="testTurn(45)">🔄 Test Turn</button>
-    <button onclick="toggleFullscreen()">⛶ Fullscreen</button>
-    <button onclick="openRef()">📷 Ref daylight.jpg</button>
-    <button onclick="toggleDock()" style="padding:7px 10px">👁️</button>
+    <button id="btn-motors" class="btn-danger" onclick="toggleMotors()">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+      <span>Enable Motors (M)</span>
+    </button>
+    <button id="btn-mode" onclick="toggleControlMode()">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 15h3M1 9h3M1 15h3"/></svg>
+      <span>Mode: Toggle (C)</span>
+    </button>
+    <button id="btn-lane" onclick="setMode('lane')">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 19L8 5M16 5l4 14M12 7v2M12 13v2M12 19v2"/></svg>
+      <span>Lane Mode</span>
+    </button>
+    <button id="btn-lane-color" onclick="cycleLaneColor()" data-color="orange">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.93 0 1.5-.67 1.5-1.5 0-.39-.15-.74-.39-1.01-.24-.26-.37-.61-.37-.99 0-.83.67-1.5 1.5-1.5H16c3.31 0 6-2.69 6-6 0-4.97-4.48-9-10-9z"/></svg>
+      <span>Lane: ORANGE</span>
+    </button>
+    <button id="btn-follow" onclick="setMode('follow')">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+      <span>Follow Mode</span>
+    </button>
+    <button id="btn-cal-target" class="btn-active" onclick="calibrateTarget()">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="8"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>
+      <span>Calibrate Target (L)</span>
+    </button>
+    <button id="btn-reset-target" onclick="resetTarget()">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+      <span>Reset Target</span>
+    </button>
+    <button id="btn-override" onclick="toggleOverride()">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      <span>Override Obstacles (O)</span>
+    </button>
+    <button id="btn-remote" onclick="toggleRemoteWidget()">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="2" y="6" width="20" height="12" rx="4"/><path d="M6 12h4M8 10v4M15 11h.01M18 13h.01"/></svg>
+      <span>D-Pad</span>
+    </button>
+
+    <div class="dock-divider"></div>
+
+    <button id="btn-invert" onclick="toggleInvertMotors()">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m17 2 4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+      <span>Polarity: Normal (I)</span>
+    </button>
+    <button id="btn-swap-rb" class="btn-active" onclick="toggleSwapRb()">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>
+      <span>Swap R/B: ON (K)</span>
+    </button>
+
+    <div class="dock-divider"></div>
+
+    <button id="btn-awb-daylight" data-awb="daylight" class="btn-active" onclick="setAwb('daylight')">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+      <span>Daylight</span>
+    </button>
+    <button id="btn-awb-auto" data-awb="auto" onclick="setAwb('auto')">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+      <span>Auto</span>
+    </button>
+    <button id="btn-awb-indoor" data-awb="indoor" onclick="setAwb('indoor')">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg>
+      <span>Indoor</span>
+    </button>
+
+    <div class="dock-divider"></div>
+
+    <button id="btn-release" class="btn-active" onclick="releaseLatch()">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+      <span>Release Latch (PI_GO)</span>
+    </button>
+    <button id="btn-estop" class="btn-danger" onclick="emergencyStop()">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"/><rect x="9" y="9" width="6" height="6"/></svg>
+      <span>E-STOP (Space)</span>
+    </button>
+
+    <div class="dock-divider"></div>
+
+    <button id="btn-pulse" onclick="testPulse()">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      <span>Test Pulse</span>
+    </button>
+    <button id="btn-turn" onclick="testTurn(45)">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m17 2 4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+      <span>Test Turn</span>
+    </button>
+    <button id="btn-fs" onclick="toggleFullscreen()">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+      <span>Fullscreen</span>
+    </button>
+    <button id="btn-ref" onclick="openRef()">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+      <span>Ref daylight.jpg</span>
+    </button>
+    <button id="btn-dock-toggle" onclick="toggleDock()" style="padding:6px 9px" title="Toggle Dock (H)">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+    </button>
   </div>
 
   <!-- Floating Remote Control Widget (D-Pad) -->
   <div class="remote-panel hidden" id="remote-panel">
     <div class="remote-header">
-      <span>🎮 Remote Control</span>
+      <span style="display:inline-flex; align-items:center; gap:6px">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="2" y="6" width="20" height="12" rx="4"/><path d="M6 12h4M8 10v4M15 11h.01M18 13h.01"/></svg>
+        Remote Control
+      </span>
       <div class="speed-pills">
-        <button class="btn-speed" onclick="setSpeed(130)" id="spd-130">130</button>
-        <button class="btn-speed active" onclick="setSpeed(185)" id="spd-185">185</button>
+        <button class="btn-speed active" onclick="setSpeed(180)" id="spd-180">180</button>
+        <button class="btn-speed" onclick="setSpeed(205)" id="spd-205">205</button>
         <button class="btn-speed" onclick="setSpeed(235)" id="spd-235">235</button>
       </div>
     </div>
     <div class="dpad-grid">
       <div></div>
-      <button class="dpad-btn" id="dpad-up" onmousedown="startDrive('forward')" onmouseup="stopDrive()" onmouseleave="stopDrive()" ontouchstart="startDrive('forward')" ontouchend="stopDrive()">▲<span class="key-hint">W</span></button>
+      <button class="dpad-btn" id="dpad-up" onmousedown="startDrive('forward')" onmouseup="stopDrive()" onmouseleave="stopDrive()" ontouchstart="startDrive('forward')" ontouchend="stopDrive()">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>
+        <span class="key-hint">W</span>
+      </button>
       <div></div>
-      <button class="dpad-btn" id="dpad-left" onmousedown="startDrive('left')" onmouseup="stopDrive()" onmouseleave="stopDrive()" ontouchstart="startDrive('left')" ontouchend="stopDrive()">◀<span class="key-hint">A</span></button>
-      <button class="dpad-btn dpad-stop" id="dpad-stop" onclick="stopDrive()">■<span class="key-hint">Space</span></button>
-      <button class="dpad-btn" id="dpad-right" onmousedown="startDrive('right')" onmouseup="stopDrive()" onmouseleave="stopDrive()" ontouchstart="startDrive('right')" ontouchend="stopDrive()">▶<span class="key-hint">D</span></button>
+      <button class="dpad-btn" id="dpad-left" onmousedown="startDrive('left')" onmouseup="stopDrive()" onmouseleave="stopDrive()" ontouchstart="startDrive('left')" ontouchend="stopDrive()">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        <span class="key-hint">A</span>
+      </button>
+      <button class="dpad-btn dpad-stop" id="dpad-stop" onclick="stopDrive()">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+        <span class="key-hint">Space</span>
+      </button>
+      <button class="dpad-btn" id="dpad-right" onmousedown="startDrive('right')" onmouseup="stopDrive()" onmouseleave="stopDrive()" ontouchstart="startDrive('right')" ontouchend="stopDrive()">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+        <span class="key-hint">D</span>
+      </button>
       <div></div>
-      <button class="dpad-btn" id="dpad-down" onmousedown="startDrive('reverse')" onmouseup="stopDrive()" onmouseleave="stopDrive()" ontouchstart="startDrive('reverse')" ontouchend="stopDrive()">▼<span class="key-hint">S</span></button>
+      <button class="dpad-btn" id="dpad-down" onmousedown="startDrive('reverse')" onmouseup="stopDrive()" onmouseleave="stopDrive()" ontouchstart="startDrive('reverse')" ontouchend="stopDrive()">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        <span class="key-hint">S</span>
+      </button>
       <div></div>
     </div>
-    <div style="font-size:0.65rem; color:var(--muted); text-align:center;">WASD or Arrow Keys to Drive</div>
+    <div class="dpad-hint">WASD / Arrow Keys &bull; 1-3 Speed</div>
   </div>
 
-  <div class="shortcut-tip"><b>F</b> Fullscreen &bull; <b>M</b> Motors &bull; <b>I</b> Polarity &bull; <b>Space</b> E-Stop &bull; <b>D</b> Daylight &bull; <b>H</b> Dock</div>
+  <div class="shortcut-tip"><b>F</b> Fullscreen &bull; <b>M</b> Motors &bull; <b>I</b> Polarity &bull; <b>K</b> Swap R/B &bull; <b>Space</b> E-Stop &bull; <b>D</b> Daylight &bull; <b>H</b> Dock</div>
 
   <div class="modal" id="modal" onclick="closeRef()">
     <div class="modal-box" onclick="event.stopPropagation()">
-      <div style="display:flex; justify-content:space-between; font-weight:600">
+      <div style="display:flex; justify-content:space-between; align-items:center; font-weight:600; font-size:0.86rem">
         <span>Reference Image: daylight.jpg</span>
-        <span style="cursor:pointer" onclick="closeRef()">&times;</span>
+        <span style="cursor:pointer; font-size:1.2rem; line-height:1; color:var(--text-muted)" onclick="closeRef()">&times;</span>
       </div>
       <img src="daylight.jpg" alt="daylight.jpg reference">
     </div>
@@ -528,6 +903,25 @@ PAGE = """<!DOCTYPE html>
     let currentSpeed = 185;
     let driveInterval = null;
     let activeAction = null;
+    const keysDown = new Set();
+    window.keysDown = keysDown;
+
+    function syncDpadVisuals(activeDir) {
+      document.querySelectorAll('.dpad-btn').forEach(btn => btn.classList.remove('key-pressed'));
+      if (activeDir === 'forward') {
+        const b = document.getElementById('dpad-up');
+        if (b) b.classList.add('key-pressed');
+      } else if (activeDir === 'reverse') {
+        const b = document.getElementById('dpad-down');
+        if (b) b.classList.add('key-pressed');
+      } else if (activeDir === 'left') {
+        const b = document.getElementById('dpad-left');
+        if (b) b.classList.add('key-pressed');
+      } else if (activeDir === 'right') {
+        const b = document.getElementById('dpad-right');
+        if (b) b.classList.add('key-pressed');
+      }
+    }
 
     function toggleOverride() {
       fetch('/toggle_override').then(r => r.json()).then(d => {
@@ -537,14 +931,25 @@ PAGE = """<!DOCTYPE html>
 
     function updateOverrideBadge(enabled) {
       manualOverride = enabled;
-      const b = document.getElementById('override-badge');
+      const b = document.getElementById('override-badge-text');
+      const container = document.getElementById('override-badge');
       const btn = document.getElementById('btn-override');
       if (enabled) {
-        if (b) { b.innerText = 'OVERRIDE: ON 🔓'; b.className = 'badge badge-invert-on'; }
-        if (btn) { btn.innerText = '🛡️ Override: ON (O)'; btn.className = 'btn-active'; }
+        if (b) b.innerText = 'OVERRIDE: ON [UNLOCKED]';
+        if (container) container.className = 'badge badge-invert-on';
+        if (btn) {
+          const span = btn.querySelector('span');
+          if (span) span.innerText = 'Override: ON (O)';
+          btn.className = 'btn-active';
+        }
       } else {
-        if (b) { b.innerText = 'OVERRIDE: OFF 🛡️'; b.className = 'badge badge-invert-off'; }
-        if (btn) { btn.innerText = '🔓 Override Obstacles (O)'; btn.className = ''; }
+        if (b) b.innerText = 'OVERRIDE: OFF [ACTIVE]';
+        if (container) container.className = 'badge badge-invert-off';
+        if (btn) {
+          const span = btn.querySelector('span');
+          if (span) span.innerText = 'Override Obstacles (O)';
+          btn.className = '';
+        }
       }
     }
 
@@ -571,42 +976,49 @@ PAGE = """<!DOCTYPE html>
     }
 
     function cycleLaneColor() {
-      const colors = ['dark', 'yellow', 'blue', 'red', 'white'];
+      const colors = ['orange', 'brown', 'green', 'pink'];
       const btn = document.getElementById('btn-lane-color');
-      let curr = (btn ? btn.getAttribute('data-color') : '') || 'dark';
+      let curr = (btn ? btn.getAttribute('data-color') : '') || 'orange';
       let nextIdx = (colors.indexOf(curr) + 1) % colors.length;
       let nextCol = colors[nextIdx];
       fetch('/set_lane_color?color=' + nextCol).then(r => r.json()).then(d => {
-        if (btn) {
+        if (btn && d.color) {
           btn.setAttribute('data-color', d.color);
-          btn.innerText = '🎨 Lane: ' + d.color.toUpperCase();
+          const span = btn.querySelector('span');
+          if (span) span.innerText = 'Lane: ' + d.color.toUpperCase();
         }
       });
     }
 
     function updateModeBadge(mode) {
+      const bText = document.getElementById('mode-badge-text');
       const badge = document.getElementById('mode-badge');
       const btn = document.getElementById('btn-mode');
+      const btnSpan = btn ? btn.querySelector('span') : null;
       const panel = document.getElementById('remote-panel');
       if (mode === 'manual') {
-        badge.innerText = 'MODE: MANUAL 🎮';
-        badge.className = 'badge badge-motors-on';
-        if (btn) { btn.innerText = '🤖 Mode: Auto (C)'; btn.className = 'btn-active'; }
+        if (bText) bText.innerText = 'MODE: MANUAL';
+        if (badge) badge.className = 'badge badge-motors-on';
+        if (btnSpan) btnSpan.innerText = 'Mode: Auto (C)';
+        if (btn) btn.className = 'btn-active';
         if (panel) panel.classList.remove('hidden');
       } else if (mode === 'lane') {
-        badge.innerText = 'MODE: LANE 🛣️';
-        badge.className = 'badge badge-motors-on';
-        if (btn) { btn.innerText = '🎯 Mode: Follow (C)'; btn.className = 'btn-active'; }
+        if (bText) bText.innerText = 'MODE: LANE';
+        if (badge) badge.className = 'badge badge-motors-on';
+        if (btnSpan) btnSpan.innerText = 'Mode: Follow (C)';
+        if (btn) btn.className = 'btn-active';
         if (panel) panel.classList.add('hidden');
       } else if (mode === 'follow') {
-        badge.innerText = 'MODE: FOLLOW 🎯';
-        badge.className = 'badge badge-invert-on';
-        if (btn) { btn.innerText = '🎮 Mode: Manual (C)'; btn.className = ''; }
+        if (bText) bText.innerText = 'MODE: FOLLOW';
+        if (badge) badge.className = 'badge badge-invert-on';
+        if (btnSpan) btnSpan.innerText = 'Mode: Manual (C)';
+        if (btn) btn.className = '';
         if (panel) panel.classList.add('hidden');
       } else {
-        badge.innerText = 'MODE: AUTONOMOUS 🤖';
-        badge.className = 'badge badge-mode';
-        if (btn) { btn.innerText = '🛣️ Mode: Lane (C)'; btn.className = ''; }
+        if (bText) bText.innerText = 'MODE: AUTONOMOUS';
+        if (badge) badge.className = 'badge badge-mode';
+        if (btnSpan) btnSpan.innerText = 'Mode: Lane (C)';
+        if (btn) btn.className = '';
         if (panel) panel.classList.add('hidden');
       }
     }
@@ -648,21 +1060,27 @@ PAGE = """<!DOCTYPE html>
     function setSpeed(spd) {
       fetch('/set_speed?speed=' + spd).then(r => r.json()).then(d => {
         currentSpeed = d.manual_speed;
-        [130, 185, 235].forEach(s => {
+        [180, 205, 235].forEach(s => {
           const b = document.getElementById('spd-' + s);
           if (b) b.className = (s === currentSpeed) ? 'btn-speed active' : 'btn-speed';
         });
       });
     }
 
-    function startDrive(action) {
-      if (activeAction === action) return;
-      activeAction = action;
+    function sendManualDrive(cmd, speed) {
+      const spd = (speed !== undefined) ? speed : currentSpeed;
+      if (activeAction === cmd) return;
+      activeAction = cmd;
+      syncDpadVisuals(cmd);
       if (driveInterval) clearInterval(driveInterval);
-      fetch('/manual_drive?cmd=' + action + '&speed=' + currentSpeed);
+      fetch('/manual_drive?cmd=' + cmd + '&speed=' + spd);
       driveInterval = setInterval(() => {
-        fetch('/manual_drive?cmd=' + action + '&speed=' + currentSpeed);
+        fetch('/manual_drive?cmd=' + cmd + '&speed=' + currentSpeed);
       }, 220);
+    }
+
+    function startDrive(action) {
+      sendManualDrive(action, currentSpeed);
     }
 
     function stopDrive() {
@@ -671,8 +1089,14 @@ PAGE = """<!DOCTYPE html>
         driveInterval = null;
       }
       activeAction = null;
+      syncDpadVisuals(null);
+      keysDown.clear();
       fetch('/manual_stop');
     }
+
+    window.sendManualDrive = sendManualDrive;
+    window.startDrive = startDrive;
+    window.stopDrive = stopDrive;
 
     function toggleFullscreen() {
       if (!document.fullscreenElement) {
@@ -690,17 +1114,19 @@ PAGE = """<!DOCTYPE html>
 
     function updateMotorsBadge(enabled) {
       const btn = document.getElementById('btn-motors');
+      const btnSpan = btn ? btn.querySelector('span') : null;
+      const bText = document.getElementById('motors-badge-text');
       const badge = document.getElementById('motors-badge');
       if (enabled) {
-        btn.innerText = '🛑 Disable Motors (M)';
-        btn.className = 'btn-success';
-        badge.innerText = 'MOTORS: ACTIVE ⚡';
-        badge.className = 'badge badge-motors-on';
+        if (btnSpan) btnSpan.innerText = 'Disable Motors (M)';
+        if (btn) btn.className = 'btn-success';
+        if (bText) bText.innerText = 'MOTORS: ACTIVE [ON]';
+        if (badge) badge.className = 'badge badge-motors-on';
       } else {
-        btn.innerText = '🚗 Enable Motors (M)';
-        btn.className = 'btn-danger';
-        badge.innerText = 'MOTORS: BENCH SAFE ⏸️';
-        badge.className = 'badge badge-motors-off';
+        if (btnSpan) btnSpan.innerText = 'Enable Motors (M)';
+        if (btn) btn.className = 'btn-danger';
+        if (bText) bText.innerText = 'MOTORS: BENCH SAFE [OFF]';
+        if (badge) badge.className = 'badge badge-motors-off';
       }
     }
 
@@ -712,17 +1138,43 @@ PAGE = """<!DOCTYPE html>
 
     function updateInvertBadge(inverted) {
       const btn = document.getElementById('btn-invert');
+      const btnSpan = btn ? btn.querySelector('span') : null;
+      const bText = document.getElementById('invert-badge-text');
       const badge = document.getElementById('invert-badge');
       if (inverted) {
-        btn.innerText = '🔄 Polarity: Inverted (I)';
-        btn.className = 'btn-active';
-        badge.innerText = 'POLARITY: INVERTED (FWD FIX) 🔄';
-        badge.className = 'badge badge-invert-on';
+        if (btnSpan) btnSpan.innerText = 'Polarity: Inverted (I)';
+        if (btn) btn.className = 'btn-active';
+        if (bText) bText.innerText = 'POLARITY: INVERTED (FWD FIX)';
+        if (badge) badge.className = 'badge badge-invert-on';
       } else {
-        btn.innerText = '🔄 Polarity: Normal (I)';
-        btn.className = '';
-        badge.innerText = 'POLARITY: NORMAL ➡️';
-        badge.className = 'badge badge-invert-off';
+        if (btnSpan) btnSpan.innerText = 'Polarity: Normal (I)';
+        if (btn) btn.className = '';
+        if (bText) bText.innerText = 'POLARITY: NORMAL';
+        if (badge) badge.className = 'badge badge-invert-off';
+      }
+    }
+
+    function toggleSwapRb() {
+      fetch('/toggle_swap_rb').then(r => r.json()).then(d => {
+        updateSwapRbBadge(d.swap_rb);
+      });
+    }
+
+    function updateSwapRbBadge(enabled) {
+      const bText = document.getElementById('swap-rb-badge-text');
+      const badge = document.getElementById('swap-rb-badge');
+      const btn = document.getElementById('btn-swap-rb');
+      const btnSpan = btn ? btn.querySelector('span') : null;
+      if (enabled) {
+        if (bText) bText.innerText = 'COLOR: BGR (SWAP ON)';
+        if (badge) badge.className = 'badge badge-daylight';
+        if (btnSpan) btnSpan.innerText = 'Swap R/B: ON (K)';
+        if (btn) btn.className = 'btn-active';
+      } else {
+        if (bText) bText.innerText = 'COLOR: RAW RGB';
+        if (badge) badge.className = 'badge badge-invert-off';
+        if (btnSpan) btnSpan.innerText = 'Swap R/B: OFF (K)';
+        if (btn) btn.className = '';
       }
     }
 
@@ -747,10 +1199,10 @@ PAGE = """<!DOCTYPE html>
     function setAwb(mode) {
       fetch('/set_awb?mode=' + mode).then(r => r.json()).then(d => {
         if (d.status === 'ok') {
-          document.getElementById('awb-badge').innerText = 'AWB: ' + d.mode.toUpperCase() + (d.mode === 'daylight' ? ' ☀️' : '');
-          document.querySelectorAll('.controls-dock button').forEach(b => {
-            if (b.innerText.toLowerCase().includes(mode)) b.classList.add('btn-active');
-            else if (b.innerText.includes('☀️') || b.innerText.includes('🔄') || b.innerText.includes('💡')) b.classList.remove('btn-active');
+          const bText = document.getElementById('awb-badge-text');
+          if (bText) bText.innerText = 'AWB: ' + d.mode.toUpperCase();
+          document.querySelectorAll('[data-awb]').forEach(b => {
+            b.classList.toggle('btn-active', b.getAttribute('data-awb') === d.mode);
           });
         }
       });
@@ -759,52 +1211,72 @@ PAGE = """<!DOCTYPE html>
     function toggleDock() {
       const dock = document.getElementById('dock');
       const topbar = document.getElementById('topbar');
-      dock.classList.toggle('hidden');
-      topbar.style.opacity = dock.classList.contains('hidden') ? '0' : '1';
+      if (dock) {
+        dock.classList.toggle('hidden');
+        if (topbar) topbar.style.opacity = dock.classList.contains('hidden') ? '0' : '1';
+      }
     }
 
-    function openRef() { document.getElementById('modal').classList.add('show'); }
-    function closeRef() { document.getElementById('modal').classList.remove('show'); }
+    function openRef() {
+      const m = document.getElementById('modal');
+      if (m) m.classList.add('show');
+    }
+    function closeRef() {
+      const m = document.getElementById('modal');
+      if (m) m.classList.remove('show');
+    }
 
     function pollTelemetry() {
       fetch('/telemetry').then(r => r.json()).then(d => {
         const sb = document.getElementById('sonar-badge');
-        if (sb && d.sonar) {
-          const l = (d.sonar.left <= 1.0 || d.sonar.left >= 850.0) ? 'CLR' : d.sonar.left.toFixed(0) + 'cm';
-          const r = (d.sonar.right <= 1.0 || d.sonar.right >= 850.0) ? 'CLR' : d.sonar.right.toFixed(0) + 'cm';
+        const sbText = document.getElementById('sonar-badge-text');
+        if (sb && sbText && d.sonar) {
+          const vl = typeof d.sonar.left === 'number' && d.sonar.left > 1.0 && d.sonar.left < 850.0;
+          const vr = typeof d.sonar.right === 'number' && d.sonar.right > 1.0 && d.sonar.right < 850.0;
+          const l = vl ? d.sonar.left.toFixed(0) + 'cm' : 'CLR';
+          const r = vr ? d.sonar.right.toFixed(0) + 'cm' : 'CLR';
           let usText = `US: L=${l}  R=${r}`;
-          if (d.sonar.rear && d.sonar.rear > 1.0 && d.sonar.rear < 850.0) {
+          if (typeof d.sonar.rear === 'number' && d.sonar.rear > 1.0 && d.sonar.rear < 850.0) {
             usText += `  B=${d.sonar.rear.toFixed(0)}cm`;
           }
-          sb.innerText = usText;
-          if ((d.sonar.left > 1.0 && d.sonar.left < 25.0) || (d.sonar.right > 1.0 && d.sonar.right < 25.0)) {
-            sb.style.background = 'rgba(248, 81, 73, 0.35)';
-            sb.style.borderColor = 'var(--danger)';
-            sb.style.color = '#ff7b72';
-          } else if ((d.sonar.left > 1.0 && d.sonar.left < 45.0) || (d.sonar.right > 1.0 && d.sonar.right < 45.0)) {
-            sb.style.background = 'rgba(227, 179, 65, 0.35)';
-            sb.style.borderColor = 'var(--warning)';
-            sb.style.color = '#e3b341';
+          sbText.innerText = usText;
+          if ((vl && d.sonar.left < 25.0) || (vr && d.sonar.right < 25.0)) {
+            sb.style.background = 'var(--status-rose-bg)';
+            sb.style.borderColor = 'var(--status-rose-border)';
+            sb.style.color = '#fecdd3';
+          } else if ((vl && d.sonar.left < 45.0) || (vr && d.sonar.right < 45.0)) {
+            sb.style.background = 'var(--status-amber-bg)';
+            sb.style.borderColor = 'var(--status-amber-border)';
+            sb.style.color = 'var(--status-amber)';
           } else {
-            sb.style.background = 'rgba(63, 185, 80, 0.2)';
-            sb.style.borderColor = 'var(--success)';
-            sb.style.color = 'var(--success)';
+            sb.style.background = 'var(--status-emerald-bg)';
+            sb.style.borderColor = 'var(--status-emerald-border)';
+            sb.style.color = 'var(--status-emerald)';
+          }
+        }
+        if (d.lane_color) {
+          const btn = document.getElementById('btn-lane-color');
+          if (btn && btn.getAttribute('data-color') !== d.lane_color) {
+            btn.setAttribute('data-color', d.lane_color);
+            const span = btn.querySelector('span');
+            if (span) span.innerText = 'Lane: ' + d.lane_color.toUpperCase();
           }
         }
         if (d.follow_state) {
           const tb = document.getElementById('target-badge');
-          if (tb) {
+          const tbText = document.getElementById('target-badge-text');
+          if (tb && tbText) {
             if (d.follow_state === 'TRACKING') {
-              tb.innerText = `🎯 LOCKED (${(d.target_similarity || 0).toFixed(2)}) [${d.last_seen_side || 'CTR'}]`;
+              tbText.innerText = `LOCKED (${(d.target_similarity || 0).toFixed(2)}) [${d.last_seen_side || 'CTR'}]`;
               tb.className = 'badge badge-motors-on';
             } else if (d.follow_state === 'CALIBRATING') {
-              tb.innerText = `⏳ CALIBRATING (${Math.round((d.calibration_progress || 0) * 100)}%)`;
+              tbText.innerText = `CALIBRATING (${Math.round((d.calibration_progress || 0) * 100)}%)`;
               tb.className = 'badge badge-daylight';
             } else if (d.follow_state === 'RE_ACQUIRE') {
-              tb.innerText = `🔍 SEARCHING [${d.last_seen_side || 'CTR'}]`;
-              tb.className = 'badge badge-us';
+              tbText.innerText = `SEARCHING [${d.last_seen_side || 'CTR'}]`;
+              tb.className = 'badge badge-mode';
             } else {
-              tb.innerText = 'TARGET: CLICK TO SELECT 🎯';
+              tbText.innerText = 'TARGET: CLICK TO SELECT';
               tb.className = 'badge badge-invert-off';
             }
           }
@@ -813,42 +1285,124 @@ PAGE = """<!DOCTYPE html>
           currentControlMode = d.control_mode;
           updateModeBadge(d.control_mode);
         } else if (d.mode) {
-          document.getElementById('mode-badge').innerText = 'MODE: ' + d.mode.toUpperCase();
+          const bText = document.getElementById('mode-badge-text');
+          if (bText) bText.innerText = 'MODE: ' + d.mode.toUpperCase();
         }
         if (d.manual_override_obstacles !== undefined) updateOverrideBadge(d.manual_override_obstacles);
         if (d.motors_enabled !== undefined) updateMotorsBadge(d.motors_enabled);
         if (d.invert_motors !== undefined) updateInvertBadge(d.invert_motors);
+        if (d.swap_rb !== undefined) updateSwapRbBadge(d.swap_rb);
       }).catch(() => {});
     }
     setInterval(pollTelemetry, 300);
 
+    const MOVEMENT_KEYS = {
+      'KeyW': 'forward',
+      'ArrowUp': 'forward',
+      'KeyS': 'reverse',
+      'ArrowDown': 'reverse',
+      'KeyA': 'left',
+      'ArrowLeft': 'left',
+      'KeyD': 'right',
+      'ArrowRight': 'right',
+      'w': 'forward',
+      's': 'reverse',
+      'a': 'left',
+      'd': 'right'
+    };
+
+    function getMovementKey(e) {
+      if (!e) return null;
+      if (e.code && MOVEMENT_KEYS[e.code]) return e.code;
+      if (e.key && MOVEMENT_KEYS[e.key]) return e.key;
+      if (e.key && MOVEMENT_KEYS[e.key.toLowerCase()]) return e.key.toLowerCase();
+      return null;
+    }
+
+    function resolveActiveMovement() {
+      const keys = Array.from(keysDown);
+      for (let i = keys.length - 1; i >= 0; i--) {
+        const cmd = MOVEMENT_KEYS[keys[i]];
+        if (cmd) return cmd;
+      }
+      return null;
+    }
+
+    function removeMovementKey(e) {
+      const mk = getMovementKey(e);
+      if (mk) keysDown.delete(mk);
+      if (e.code) keysDown.delete(e.code);
+      if (e.key) {
+        keysDown.delete(e.key);
+        keysDown.delete(e.key.toLowerCase());
+      }
+    }
+
     window.addEventListener('keydown', (e) => {
-      const k = e.key.toLowerCase();
+      if (e.repeat) return;
+      const k = e.key ? e.key.toLowerCase() : '';
       if (k === 'f') toggleFullscreen();
       if (k === 'm') toggleMotors();
       if (k === 'i') toggleInvertMotors();
+      if (k === 'k') toggleSwapRb();
       if (k === 'c') toggleControlMode();
       if (k === 'l') calibrateTarget();
       if (k === 'o') toggleOverride();
       if (k === 'r') toggleRemoteWidget();
       if (k === 't') testPulse();
-      if (k === ' ') { e.preventDefault(); emergencyStop(); stopDrive(); }
+      if (k === ' ') {
+        e.preventDefault();
+        emergencyStop();
+        keysDown.clear();
+        stopDrive();
+      }
       if (k === 'h') toggleDock();
-      if (k === 'd') setAwb('daylight');
-      if (currentControlMode === 'manual') {
-        if (k === 'w' || e.key === 'ArrowUp') { e.preventDefault(); startDrive('forward'); }
-        if (k === 's' || e.key === 'ArrowDown') { e.preventDefault(); startDrive('reverse'); }
-        if (k === 'a' || e.key === 'ArrowLeft') { e.preventDefault(); startDrive('left'); }
-        if (k === 'd' || e.key === 'ArrowRight') { e.preventDefault(); startDrive('right'); }
-        if (k === '1') setSpeed(130);
-        if (k === '2') setSpeed(185);
+
+      // Disarm Daylight AWB shortcut when in manual drive so 'D' turns right without toggling camera white balance
+      if (k === 'd' && currentControlMode !== 'manual' && typeof currentControlMode !== 'undefined') {
+        setAwb('daylight');
+      }
+
+      const isManual = (currentControlMode === 'manual' || typeof currentControlMode === 'undefined');
+      if (isManual) {
+        if (k === '1') setSpeed(180);
+        if (k === '2') setSpeed(205);
         if (k === '3') setSpeed(235);
+
+        const moveKey = getMovementKey(e);
+        if (moveKey) {
+          e.preventDefault();
+          if (e.repeat) return;
+          keysDown.delete(moveKey);
+          keysDown.add(moveKey);
+          const cmd = resolveActiveMovement();
+          if (cmd) {
+            sendManualDrive(cmd, currentSpeed);
+          }
+        }
       }
     });
 
     window.addEventListener('keyup', (e) => {
-      const k = e.key.toLowerCase();
-      if (['w', 's', 'a', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) {
+      const moveKey = getMovementKey(e);
+      if (moveKey || (e.code && keysDown.has(e.code)) || (e.key && (keysDown.has(e.key) || keysDown.has(e.key.toLowerCase())))) {
+        removeMovementKey(e);
+        if (keysDown.size === 0) {
+          stopDrive();
+        } else {
+          const nextCmd = resolveActiveMovement();
+          if (nextCmd) {
+            sendManualDrive(nextCmd, currentSpeed);
+          } else {
+            stopDrive();
+          }
+        }
+      }
+    });
+
+    window.addEventListener('blur', () => {
+      if (keysDown.size > 0) {
+        keysDown.clear();
         stopDrive();
       }
     });
@@ -866,6 +1420,97 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Suppress standard logging to prevent terminal flooding
         return
+
+    def _handle_telemetry(self):
+        sys_state: SystemState = self.server.sys_state
+        sonar = sys_state.motor.latest_sonar.copy() if sys_state.motor else {"left": 999.0, "right": 999.0}
+        state_str = sys_state.motor.latest_state if sys_state.motor else "UNKNOWN"
+        port_name = sys_state.motor.port if sys_state.motor else "DISCONNECTED"
+        connected = sys_state.motor.is_connected() if sys_state.motor else False
+        with sys_state.lock:
+            motors_enabled = sys_state.motors_enabled
+            invert_motors = sys_state.invert_motors
+            action = sys_state.active_action_label
+            pi_latched = sys_state.pi_latched
+            mode = sys_state.current_mode
+            control_mode = sys_state.control_mode
+            manual_override_obstacles = sys_state.manual_override_obstacles
+            manual_speed = sys_state.manual_speed
+            manual_action = sys_state.manual_action
+            awb = sys_state.current_awb
+            swap_rb = sys_state.swap_rb
+            fps = round(sys_state.fps, 1)
+            follow_state = sys_state.follow_state
+            target_bbox = sys_state.target_bbox
+            target_similarity = round(sys_state.target_similarity, 2)
+            calibration_progress = round(sys_state.calibration_progress, 2)
+            last_seen_side = sys_state.last_seen_side
+            lane_res_snap = sys_state.lane_result
+            lane_status = lane_res_snap.status if lane_res_snap else "OFF"
+            lane_offset = round(lane_res_snap.lateral_offset_pct, 1) if lane_res_snap else 0.0
+            lane_steer = round(lane_res_snap.steer_angle_deg, 1) if lane_res_snap else 0.0
+            lane_color = sys_state.lane_color_mode
+        data = {
+            "sonar": sonar,
+            "state": state_str,
+            "port": port_name,
+            "connected": connected,
+            "motors_enabled": motors_enabled,
+            "invert_motors": invert_motors,
+            "action": action,
+            "pi_latched": pi_latched,
+            "mode": mode,
+            "control_mode": control_mode,
+            "manual_override_obstacles": manual_override_obstacles,
+            "manual_speed": manual_speed,
+            "manual_action": manual_action,
+            "awb": awb,
+            "swap_rb": swap_rb,
+            "fps": fps,
+            "follow_state": follow_state,
+            "target_bbox": target_bbox,
+            "target_similarity": target_similarity,
+            "calibration_progress": calibration_progress,
+            "last_seen_side": last_seen_side,
+            "lane_status": lane_status,
+            "lane_offset": lane_offset,
+            "lane_steer": lane_steer,
+            "lane_color": lane_color,
+        }
+        resp = json.dumps(data).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
+
+    def _handle_toggle_swap_rb(self):
+        sys_state: SystemState = self.server.sys_state
+        with sys_state.lock:
+            sys_state.swap_rb = not sys_state.swap_rb
+            swapped = sys_state.swap_rb
+        print(f"🎨 Camera color filter toggled: {'SWAP RGB<->BGR (ON)' if swapped else 'RAW RGB (OFF)'}")
+        resp = json.dumps({"status": "ok", "swap_rb": swapped}).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
+
+    def _handle_set_swap_rb(self, query):
+        sys_state: SystemState = self.server.sys_state
+        val_str = query.get('enabled', query.get('enable', ['true']))[0].lower().strip()
+        enabled = val_str in ('true', '1', 'yes', 'on')
+        with sys_state.lock:
+            sys_state.swap_rb = enabled
+            swapped = sys_state.swap_rb
+        print(f"🎨 Camera color filter set: {'SWAP RGB<->BGR (ON)' if swapped else 'RAW RGB (OFF)'}")
+        resp = json.dumps({"status": "ok", "swap_rb": swapped}).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -900,70 +1545,23 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(frame_bytes)
                     self.wfile.write(b'\r\n')
+                    try:
+                        self.wfile.flush()
+                    except Exception:
+                        pass
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
                 logging.warning("Stream client disconnected: %s", e)
 
         elif path == '/telemetry':
-            sonar = sys_state.motor.latest_sonar.copy() if sys_state.motor else {"left": 999.0, "right": 999.0}
-            state_str = sys_state.motor.latest_state if sys_state.motor else "UNKNOWN"
-            port_name = sys_state.motor.port if sys_state.motor else "DISCONNECTED"
-            connected = sys_state.motor.is_connected() if sys_state.motor else False
-            with sys_state.lock:
-                motors_enabled = sys_state.motors_enabled
-                invert_motors = sys_state.invert_motors
-                action = sys_state.active_action_label
-                pi_latched = sys_state.pi_latched
-                mode = sys_state.current_mode
-                control_mode = sys_state.control_mode
-                manual_override_obstacles = sys_state.manual_override_obstacles
-                manual_speed = sys_state.manual_speed
-                manual_action = sys_state.manual_action
-                awb = sys_state.current_awb
-                fps = round(sys_state.fps, 1)
-                follow_state = sys_state.follow_state
-                target_bbox = sys_state.target_bbox
-                target_similarity = round(sys_state.target_similarity, 2)
-                calibration_progress = round(sys_state.calibration_progress, 2)
-                last_seen_side = sys_state.last_seen_side
-                lane_res_snap = sys_state.lane_result
-                lane_status = lane_res_snap.status if lane_res_snap else "OFF"
-                lane_offset = round(lane_res_snap.lateral_offset_pct, 1) if lane_res_snap else 0.0
-                lane_steer = round(lane_res_snap.steer_angle_deg, 1) if lane_res_snap else 0.0
-                lane_color = sys_state.lane_color_mode
-            data = {
-                "sonar": sonar,
-                "state": state_str,
-                "port": port_name,
-                "connected": connected,
-                "motors_enabled": motors_enabled,
-                "invert_motors": invert_motors,
-                "action": action,
-                "pi_latched": pi_latched,
-                "mode": mode,
-                "control_mode": control_mode,
-                "manual_override_obstacles": manual_override_obstacles,
-                "manual_speed": manual_speed,
-                "manual_action": manual_action,
-                "awb": awb,
-                "fps": fps,
-                "follow_state": follow_state,
-                "target_bbox": target_bbox,
-                "target_similarity": target_similarity,
-                "calibration_progress": calibration_progress,
-                "last_seen_side": last_seen_side,
-                "lane_status": lane_status,
-                "lane_offset": lane_offset,
-                "lane_steer": lane_steer,
-                "lane_color": lane_color,
-            }
-            resp = json.dumps(data).encode('utf-8')
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(resp)))
-            self.end_headers()
-            self.wfile.write(resp)
+            self._handle_telemetry()
+
+        elif path == '/toggle_swap_rb':
+            self._handle_toggle_swap_rb()
+
+        elif path == '/set_swap_rb':
+            self._handle_set_swap_rb(query)
 
         elif path == '/toggle_override':
             with sys_state.lock:
@@ -981,6 +1579,8 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
             with sys_state.lock:
                 sys_state.motors_enabled = not sys_state.motors_enabled
                 enabled = sys_state.motors_enabled
+                if enabled:
+                    sys_state.emergency_stop = False
             if not enabled and sys_state.motor:
                 sys_state.motor.stop()
             print(f"🚗 Motors toggled: {'ENABLED' if enabled else 'BENCH SAFE (DISABLED)'}")
@@ -1008,12 +1608,13 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
         elif path == '/emergency_stop':
             with sys_state.lock:
                 sys_state.motors_enabled = False
+                sys_state.emergency_stop = True
                 sys_state.pi_latched = True
             if sys_state.motor:
                 sys_state.motor.stop()
                 sys_state.motor.pi_stop()
             print("🛑 Emergency Stop triggered via Web UI!")
-            resp = json.dumps({"status": "ok", "motors_enabled": False, "pi_latched": True}).encode('utf-8')
+            resp = json.dumps({"status": "ok", "motors_enabled": False, "pi_latched": True, "emergency_stop": True}).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(resp)))
@@ -1023,6 +1624,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
         elif path == '/release_latch':
             with sys_state.lock:
                 sys_state.pi_latched = False
+                sys_state.emergency_stop = False
             if sys_state.motor:
                 sys_state.motor.pi_go()
             print("✅ Latch release (PI_GO) triggered via Web UI!")
@@ -1056,7 +1658,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
             with sys_state.lock:
                 can_drive = sys_state.motors_enabled and not sys_state.pi_latched
             if can_drive and sys_state.motor:
-                sys_state.motor.turn(angle, speed=150)
+                sys_state.motor.turn(angle, speed=180)
                 executed = True
             resp = json.dumps({"status": "ok", "executed": executed, "angle": angle}).encode('utf-8')
             self.send_response(200)
@@ -1066,6 +1668,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(resp)
 
         elif path == '/toggle_control_mode':
+            send_pi_go = False
             with sys_state.lock:
                 # Cycle: autonomous -> lane -> follow -> manual -> autonomous
                 if sys_state.control_mode == "autonomous":
@@ -1078,11 +1681,17 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                         sys_state.follow_state = "WAIT_CALIBRATION"
                 elif sys_state.control_mode == "follow":
                     sys_state.control_mode = "manual"
+                    sys_state.current_mode = "manual"
+                    if not sys_state.emergency_stop:
+                        sys_state.pi_latched = False
+                        send_pi_go = True
                 else:
                     sys_state.control_mode = "autonomous"
                     sys_state.current_mode = "autonomous"
                 mode_now = sys_state.control_mode
             if mode_now == "manual" and sys_state.motor:
+                if send_pi_go:
+                    sys_state.motor.pi_go()
                 sys_state.motor.stop()
             print(f"🎮 Control mode toggled: {mode_now.upper()}")
             resp = json.dumps({"status": "ok", "control_mode": mode_now, "mode": mode_now}).encode('utf-8')
@@ -1094,9 +1703,14 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == '/set_mode':
             new_mode = query.get('mode', ['autonomous'])[0].lower().strip()
+            send_pi_go = False
             with sys_state.lock:
                 if new_mode == "manual":
                     sys_state.control_mode = "manual"
+                    sys_state.current_mode = "manual"
+                    if not sys_state.emergency_stop:
+                        sys_state.pi_latched = False
+                        send_pi_go = True
                 elif new_mode in ("autonomous", "lane", "follow"):
                     sys_state.control_mode = new_mode
                     sys_state.current_mode = new_mode
@@ -1104,6 +1718,8 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                         sys_state.follow_state = "WAIT_CALIBRATION"
                 mode_now = sys_state.control_mode
             if mode_now == "manual" and sys_state.motor:
+                if send_pi_go:
+                    sys_state.motor.pi_go()
                 sys_state.motor.stop()
             print(f"🔄 Mode switched to: {mode_now.upper()}")
             resp = json.dumps({"status": "ok", "mode": mode_now, "control_mode": mode_now}).encode('utf-8')
@@ -1114,19 +1730,27 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(resp)
 
         elif path == '/set_lane_color':
-            color = query.get('color', ['dark'])[0].lower().strip()
-            if color in ("dark", "yellow", "blue", "white"):
+            color = query.get('color', ['orange'])[0].lower().strip()
+            valid_colors = {"orange", "brown", "green", "pink", "dark", "yellow", "blue", "white"}
+            if color in valid_colors:
                 with sys_state.lock:
                     sys_state.lane_color_mode = color
                     if hasattr(self.server, "lane_detector") and self.server.lane_detector:
                         self.server.lane_detector.set_color_mode(color)
-            print(f"🎨 Lane color mode set to: {color.upper()}")
-            resp = json.dumps({"status": "ok", "color": color}).encode('utf-8')
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(resp)))
-            self.end_headers()
-            self.wfile.write(resp)
+                print(f"🎨 Lane color mode set to: {color.upper()}")
+                resp = json.dumps({"status": "ok", "color": color}).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+            else:
+                resp = json.dumps({"status": "error", "message": f"Invalid lane color mode '{color}'"}).encode('utf-8')
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
 
         elif path == '/select_target':
             try:
@@ -1182,7 +1806,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                 spd = int(query.get('speed', [185])[0])
             except (ValueError, TypeError):
                 spd = 185
-            spd = max(80, min(255, spd))
+            spd = max(180, min(255, spd))
             with sys_state.lock:
                 sys_state.manual_speed = spd
             resp = json.dumps({"status": "ok", "manual_speed": spd}).encode('utf-8')
@@ -1194,15 +1818,35 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == '/manual_drive':
             cmd = query.get('cmd', [''])[0].lower().strip()
-            spd = int(query.get('speed', [sys_state.manual_speed])[0]) if 'speed' in query else sys_state.manual_speed
+            try:
+                spd = int(query.get('speed', [sys_state.manual_speed])[0]) if 'speed' in query else sys_state.manual_speed
+            except (ValueError, TypeError):
+                spd = sys_state.manual_speed
+            if 0 < spd < 180:
+                spd = 180
+            spd = max(0, min(255, spd))
             executed = False
             blocked = False
             reason = "ok"
+            unlatch_needed = False
 
             with sys_state.lock:
-                override = sys_state.manual_override_obstacles
-                can_drive = sys_state.motors_enabled and (override or not sys_state.pi_latched)
                 sys_state.control_mode = "manual"
+                override = sys_state.manual_override_obstacles
+                if sys_state.emergency_stop:
+                    can_drive = False
+                    reason = "EMERGENCY_STOP"
+                elif not sys_state.motors_enabled:
+                    can_drive = False
+                    reason = "MOTORS_DISABLED"
+                else:
+                    can_drive = True
+                    if sys_state.pi_latched:
+                        sys_state.pi_latched = False
+                        unlatch_needed = True
+
+            if unlatch_needed and sys_state.motor:
+                sys_state.motor.pi_go()
 
             if can_drive and sys_state.motor:
                 sonar = sys_state.motor.latest_sonar
@@ -1227,10 +1871,10 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                         sys_state.motor.reverse(spd, 350)
                         executed = True
                 elif cmd in ("left", "turn_left"):
-                    sys_state.motor.turn(-40, speed=160)
+                    sys_state.motor.turn(-40, speed=spd)
                     executed = True
                 elif cmd in ("right", "turn_right"):
-                    sys_state.motor.turn(40, speed=160)
+                    sys_state.motor.turn(40, speed=spd)
                     executed = True
                 elif cmd in ("stop", "halt"):
                     sys_state.motor.stop()
@@ -1356,7 +2000,7 @@ def draw_hud(
     cv2.putText(annotated, "R", (max(10, w - 20), h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
 
     # ── 1b. Render Lane Corridor, Polylines & Target Reticle (Lane Mode) ─────
-    if lane_result is not None:
+    if mode == "lane" and lane_result is not None:
         if lane_result.corridor_pts is not None and len(lane_result.corridor_pts) >= 4:
             overlay = annotated.copy()
             cv2.fillPoly(overlay, [lane_result.corridor_pts], (40, 180, 50))
@@ -1412,7 +2056,7 @@ def draw_hud(
         cv2.putText(annotated, text, (max(0, x1), max(12, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, box_scale, color, thick)
 
     # ── 3. Render Target Lock Box with Corner Reticles ────────────────────────
-    if target_bbox is not None and follow_state in ("TRACKING", "CALIBRATING"):
+    if mode == "follow" and target_bbox is not None and follow_state in ("TRACKING", "CALIBRATING"):
         tx, ty, tw, th = [int(v) for v in target_bbox]
         tx2, ty2 = tx + tw, ty + th
         tgt_color = (0, 215, 255)  # Gold
@@ -1445,29 +2089,29 @@ def draw_hud(
 
     # ── 4. Diagnostic HUD Text Overlays ──────────────────────────────────────
     head_str = f"{fps:.1f} FPS | {mode.upper()} | {awb_mode.upper()} AWB"
-    cv2.putText(annotated, head_str, (10, 20 if is_hd else 15),
+    cv2.putText(annotated, head_str, (14, 24 if is_hd else 18),
                 cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 255, 255), thick)
 
     # Action line
     act_color = (0, 255, 0) if "CRUISING" in action_label or "LOCKED" in action_label else (0, 165, 255)
     if "STOP" in action_label or "BRAKE" in action_label or "BLOCKED" in action_label:
         act_color = (0, 0, 255)
-    cv2.putText(annotated, f"Action: {action_label}", (10, 42 if is_hd else 30),
+    cv2.putText(annotated, f"Action: {action_label}", (14, 48 if is_hd else 34),
                 cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, act_color, thick)
 
     # Directional Search Banner when in RE_ACQUIRE
-    if follow_state == "RE_ACQUIRE":
+    if mode == "follow" and follow_state == "RE_ACQUIRE":
         search_str = f"RE_ACQUIRE: SEARCHING {last_seen_side}"
-        cv2.putText(annotated, search_str, (10, 64 if is_hd else 48),
+        cv2.putText(annotated, search_str, (14, 70 if is_hd else 50),
                     cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 165, 255), thick)
-    elif lane_result is not None:
+    elif mode == "lane" and lane_result is not None:
         if lane_result.status != "LANE_LOST":
-            lane_str = f"LANE: {lane_result.status} | Off: {lane_result.lateral_offset_pct:+.1f}% | δ: {lane_result.steer_angle_deg:+.0f}°"
-            cv2.putText(annotated, lane_str, (10, 64 if is_hd else 48),
+            lane_str = f"LANE: {lane_result.status} | Off: {lane_result.lateral_offset_pct:+.1f}% | Str: {lane_result.steer_angle_deg:+.0f} deg"
+            cv2.putText(annotated, lane_str, (14, 70 if is_hd else 50),
                         cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 255, 200), thick)
         elif lane_result.center_coeffs is not None:
-            lane_str = f"LANE: COASTING ({lane_result.lost_frames}) | Off: {lane_result.lateral_offset_pct:+.1f}% | δ: {lane_result.steer_angle_deg:+.0f}°"
-            cv2.putText(annotated, lane_str, (10, 64 if is_hd else 48),
+            lane_str = f"LANE: COASTING ({lane_result.lost_frames}) | Off: {lane_result.lateral_offset_pct:+.1f}% | Str: {lane_result.steer_angle_deg:+.0f} deg"
+            cv2.putText(annotated, lane_str, (14, 70 if is_hd else 50),
                         cv2.FONT_HERSHEY_SIMPLEX, hud_scale1, (0, 165, 255), thick)
 
     # Ultrasonic telemetry display
@@ -1495,16 +2139,16 @@ def draw_hud(
         us_str += " [SLOW]"
 
     # Bottom status lines
-    cv2.putText(annotated, us_str, (10, h - (32 if is_hd else 24)),
+    cv2.putText(annotated, us_str, (14, h - (32 if is_hd else 24)),
                 cv2.FONT_HERSHEY_SIMPLEX, hud_scale2, us_color, thick)
 
-    motor_status = "ACTIVE ⚡" if motors_enabled else "BENCH SAFE ⏸️"
+    motor_status = "ACTIVE [ON]" if motors_enabled else "BENCH SAFE [OFF]"
     ard_str = f"Arduino: {port_name} [{latest_state}] | Motors: {motor_status} | Pol: {'INV' if invert_motors else 'NORM'}"
-    cv2.putText(annotated, ard_str, (10, h - (14 if is_hd else 10)),
+    cv2.putText(annotated, ard_str, (14, h - (14 if is_hd else 10)),
                 cv2.FONT_HERSHEY_SIMPLEX, hud_scale2, (200, 200, 200), 1)
 
     if pi_latched:
-        cv2.putText(annotated, "[PI_STOP LATCH ACTIVE]", (max(10, w - (230 if is_hd else 160)), 20 if is_hd else 15),
+        cv2.putText(annotated, "[PI_STOP LATCH ACTIVE]", (max(10, w - (230 if is_hd else 160)), 24 if is_hd else 18),
                     cv2.FONT_HERSHEY_SIMPLEX, hud_scale2, (0, 0, 255), thick)
 
     return annotated
@@ -1525,6 +2169,7 @@ def _run_lane(
     motors_enabled: bool,
     throttler: CommandThrottler,
     sys_state: Optional[SystemState] = None,
+    lane_steering: Optional[LaneSteeringStabilizer] = None,
 ) -> Tuple[bool, str, LaneDetectionResult]:
     """
     Executes one loop iteration of Chart-Paper Lane Following mode (Option A).
@@ -1558,6 +2203,7 @@ def _run_lane(
             motor.pi_stop()
             pi_latched = True
             throttler.record_other("PI_STOP")
+            throttler.latch_start_time = time.monotonic()
             return pi_latched, "🛑 PI_STOP: Obstacle/Pothole Ahead in Lane", lane_res
         else:
             throttler.record_other("PI_STOPPED")
@@ -1569,6 +2215,7 @@ def _run_lane(
             print("✅ PI_GO: Lane corridor clear, releasing camera latch.")
             motor.pi_go()
             pi_latched = False
+            throttler.latch_start_time = 0.0
             arduino_state = "IDLE"
         else:
             throttler.record_other("PI_STOPPED")
@@ -1649,11 +2296,41 @@ def _run_lane(
         throttler.record_other("STOP")
         return pi_latched, f"⚠️ LANE LOST ({lane_res.lost_frames}f): Holding Safe Stop", lane_res
 
+    # In production one stabilizer lives for the whole lane-follow run.  The
+    # optional fallback preserves the public helper API used by offline tests.
+    if lane_steering is None:
+        lane_steering = LaneSteeringStabilizer()
+
     # Either locked onto lane (DUAL_LOCKED, SINGLE_LEFT, SINGLE_RIGHT) or active coasting with valid trajectory
-    delta = lane_res.steer_angle_deg
     is_coasting = (lane_res.status == "LANE_LOST")
 
-    if abs(delta) <= lane_detector.steer_deadband_deg:
+    # The vision result is intentionally held for a few frames during a brief
+    # tape gap.  It is safe to coast straight through that gap, but issuing a
+    # stale skid-steer burst can turn the car into the missing boundary.
+    if is_coasting:
+        lane_steering.update(0.0, lane_detector.steer_deadband_deg)
+        target_speed = LANE_CRUISE_SPEED
+        if motors_enabled and throttler.should_send_drive(target_speed):
+            motor.drive(target_speed, throttler.drive_duration_ms)
+            throttler.record_drive(target_speed)
+        return (
+            pi_latched,
+            f"⚠️ LANE COASTING ({lane_res.lost_frames}/{lane_detector.lost_max_frames}): Straight",
+            lane_res,
+        )
+
+    # Never replace a live Arduino turn; wait for its telemetry (and retain a
+    # local settling guard for the serial round trip) before evaluating the
+    # next burst.  Camera safety and ultrasonic checks above still preempt it.
+    if arduino_state in ("TURNING", "STATE_TURNING") or lane_steering.is_settling():
+        return pi_latched, "🛣️ LANE TURN SETTLING: Awaiting Updated Camera Pose", lane_res
+
+    steer_cmd = lane_steering.update(
+        lane_res.steer_angle_deg,
+        lane_detector.steer_deadband_deg,
+    )
+
+    if steer_cmd == 0:
         target_speed = LANE_CRUISE_SPEED
         if motors_enabled:
             if throttler.should_send_drive(target_speed):
@@ -1661,22 +2338,16 @@ def _run_lane(
                 throttler.record_drive(target_speed)
         else:
             target_speed = 0
-        if is_coasting:
-            action_label = f"⚠️ LANE COASTING ({lane_res.lost_frames}/{lane_detector.lost_max_frames}): Straight"
-        else:
-            action_label = f"🛣️ LANE LOCKED ({lane_res.status}): Straight (PWM {LANE_CRUISE_SPEED})"
+        action_label = f"🛣️ LANE LOCKED ({lane_res.status}): Straight (PWM {LANE_CRUISE_SPEED})"
     else:
-        steer_cmd = int(round(delta))
         target_speed = LANE_CURVE_SPEED
         if motors_enabled:
             if throttler.should_send_turn(steer_cmd, target_speed):
                 motor.turn(steer_cmd, speed=target_speed)
                 throttler.record_turn(steer_cmd, target_speed)
+                lane_steering.mark_turn_sent()
         steer_dir = "RIGHT" if steer_cmd > 0 else "LEFT"
-        if is_coasting:
-            action_label = f"⚠️ LANE COASTING ({lane_res.lost_frames}/{lane_detector.lost_max_frames}): Steer {steer_dir} ({abs(steer_cmd)}°)"
-        else:
-            action_label = f"🛣️ LANE STEER {steer_dir} ({abs(steer_cmd)}° | PWM {LANE_CURVE_SPEED})"
+        action_label = f"🛣️ LANE STEER {steer_dir} ({abs(steer_cmd)}° | PWM {LANE_CURVE_SPEED})"
 
     return pi_latched, action_label, lane_res
 
@@ -1695,6 +2366,7 @@ def _run_autonomous(
     motors_enabled: bool,
     throttler: CommandThrottler,
     fresh_inference: bool = True,
+    corner_recovery: Optional[CornerRecoveryController] = None,
 ) -> Tuple[bool, str]:
     """
     One loop iteration of autonomous navigation.
@@ -1732,7 +2404,9 @@ def _run_autonomous(
         else:
             # Check if stationary obstacle allows auto-unstick / pivot escape
             now_m = time.monotonic()
-            latch_age = now_m - getattr(throttler, "latch_start_time", 0.0)
+            if getattr(throttler, "latch_start_time", 0.0) == 0.0:
+                throttler.latch_start_time = now_m
+            latch_age = now_m - throttler.latch_start_time
             if latch_age > 1.2 and valid_detections:
                 scores = compute_zone_scores(valid_detections, frame_w, frame_h, sonar=us)
                 decision = decide_avoidance(scores)
@@ -1746,8 +2420,8 @@ def _run_autonomous(
                     pi_latched = False
                     throttler.latch_start_time = 0.0
                     if motors_enabled:
-                        motor.turn(45, speed=165)
-                        throttler.record_turn(45, 165)
+                        motor.turn(45, speed=200)
+                        throttler.record_turn(45, 200)
                     return pi_latched, "🔀 ESCAPE: Pivoting RIGHT around obstacle"
                 elif (decision == "LEFT" or score_l < score_r) and (not is_valid_us(us_l) or us_l > 32.0):
                     print("🔀 Auto-Unstick: Left side clear, releasing latch and turning left")
@@ -1755,8 +2429,8 @@ def _run_autonomous(
                     pi_latched = False
                     throttler.latch_start_time = 0.0
                     if motors_enabled:
-                        motor.turn(-45, speed=165)
-                        throttler.record_turn(-45, 165)
+                        motor.turn(-45, speed=200)
+                        throttler.record_turn(-45, 200)
                     return pi_latched, "🔀 ESCAPE: Pivoting LEFT around obstacle"
 
             throttler.record_other("PI_STOPPED")
@@ -1800,10 +2474,26 @@ def _run_autonomous(
             pi_latched = True
             return pi_latched, "🛑 PI_STOPPED (Arduino Latched)"
 
-    # ── 5. Ultrasonic Critical Stop (< EMERGENCY_STOP_DISTANCE_CM) ───────────
+    # ── 5. Ultrasonic Critical Stop / Corner Recovery (< EMERGENCY_STOP_DISTANCE_CM) ──
+    us_l_val = us.get('left', 999.0)
+    us_r_val = us.get('right', 999.0)
+    if corner_recovery is not None:
+        if corner_recovery.is_recovering or corner_recovery.is_corner_collision(us_l_val, us_r_val):
+            recovering, recovery_action = corner_recovery.update(
+                us_left=us_l_val,
+                us_right=us_r_val,
+                motor=motor if motors_enabled else None
+            )
+            if recovering:
+                throttler.record_other("CORNER_RECOVERY")
+                if not motors_enabled:
+                    return pi_latched, f"⏸️ BENCH SAFE: {recovery_action} (Suppressed)"
+                return pi_latched, recovery_action
+
     if us_blocked:
         throttler.record_other("STOP")
-        motor.stop()
+        if motors_enabled:
+            motor.stop()
         return pi_latched, f"🛑 US AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)"
 
     # ── 6. Active Obstacle Avoidance & Steering ──────────────────────────────
@@ -1819,7 +2509,7 @@ def _run_autonomous(
 
         # Active skid-steer bypass turn when obstacle is detected ahead
         turn_angle = 35 if decision == "RIGHT" else -35
-        turn_speed = 160
+        turn_speed = 200
         if motors_enabled and throttler.should_send_turn(turn_angle, turn_speed):
             motor.turn(turn_angle, speed=turn_speed)
             throttler.record_turn(turn_angle, turn_speed)
@@ -1831,18 +2521,18 @@ def _run_autonomous(
         if throttler.should_send_avoid_hint("RIGHT"):
             motor.pi_avoid("RIGHT")
             throttler.record_avoid_hint("RIGHT")
-        if motors_enabled and throttler.should_send_turn(35, 160):
-            motor.turn(35, speed=160)
-            throttler.record_turn(35, 160)
+        if motors_enabled and throttler.should_send_turn(35, 200):
+            motor.turn(35, speed=200)
+            throttler.record_turn(35, 200)
             return pi_latched, f"🔀 US AVOID: Left Obs ({us_l:.0f}cm) -> Steering RIGHT"
 
     if is_valid_us(us_r) and us_r < 42.0 and (not is_valid_us(us_l) or us_r < us_l - 5.0):
         if throttler.should_send_avoid_hint("LEFT"):
             motor.pi_avoid("LEFT")
             throttler.record_avoid_hint("LEFT")
-        if motors_enabled and throttler.should_send_turn(-35, 160):
-            motor.turn(-35, speed=160)
-            throttler.record_turn(-35, 160)
+        if motors_enabled and throttler.should_send_turn(-35, 200):
+            motor.turn(-35, speed=200)
+            throttler.record_turn(-35, 200)
             return pi_latched, f"🔀 US AVOID: Right Obs ({us_r:.0f}cm) -> Steering LEFT"
 
     # ── 7. Forward Driving (Cruising or Cautionary) ───────────────────────────
@@ -1884,7 +2574,6 @@ def _run_follow(
     throttler: CommandThrottler,
     fresh_inference: bool = True,
     sys_state: Optional[SystemState] = None,
-    auto_lock: bool = True,
 ) -> Tuple[str, bool, str]:
     """
     One loop iteration of follow-me mode.
@@ -2008,28 +2697,10 @@ def _run_follow(
             if sys_state:
                 sys_state.follow_state = "TRACKING"
         else:
-            if auto_lock and persons:
-                # Auto-lock onto the most central / prominent person in view
-                best_p = min(
-                    persons,
-                    key=lambda p: abs((p["bbox"][0] + p["bbox"][2]) / 2.0 - frame_w / 2.0)
-                )
-                x1, y1, x2, y2 = [int(v) for v in best_p["bbox"]]
-                bbox = (x1, y1, x2 - x1, y2 - y1)
-                tracker.start_calibration(frame, bbox)
-                follow_state = "CALIBRATING"
-                if sys_state:
-                    sys_state.follow_state = follow_state
-                    sys_state.target_bbox = bbox
-                    sys_state.calibration_progress = getattr(tracker, "calibration_progress", 0.0)
-                if motors_enabled:
-                    motor.stop()
-                return follow_state, pi_latched, "🎯 AUTO-LOCK: Target Selected"
-            else:
-                if motors_enabled:
-                    motor.stop()
-                throttler.record_other("STOP")
-                return follow_state, pi_latched, "🎯 FOLLOW: Click Person or Calibrate"
+            if motors_enabled:
+                motor.stop()
+            throttler.record_other("STOP")
+            return follow_state, pi_latched, "🎯 FOLLOW: Click Person or Calibrate"
 
     # 2. CALIBRATING
     if follow_state == "CALIBRATING":
@@ -2170,16 +2841,14 @@ def _run_follow(
         # Critical Ultrasonic auto-brake
         if us_blocked:
             throttler.record_other("STOP")
-            motor.stop()
+            if motors_enabled:
+                motor.stop()
             return follow_state, pi_latched, "🛑 US AUTO-BRAKE (< 25cm)"
 
         # Steering & Follow Speed Modulation
         x, y, w, h = tgt_box
         center_x = x + w / 2.0
         bbox_h_frac = h / max(frame_h, 1)
-
-        if getattr(pid, 'SetPoint', 0.0) == 0.0:
-            pid.SetPoint = frame_w / 2.0
 
         pid.update(center_x)
         angle = -int(pid.output)
@@ -2213,50 +2882,48 @@ def _run_follow(
                 motor.stop()
             throttler.record_other("STOP")
             action_label = "🎯 TARGET TOO CLOSE (Holding)"
-        else:
-            if bbox_h_frac > FOLLOW_IDEAL_MIN:
-                spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_CRUISE_SPEED
-                range_label = "Cruise"
-            elif bbox_h_frac > FOLLOW_GETTING_FAR:
-                spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
-                range_label = "Fast"
-            else:
-                spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
-                range_label = "Catch-up"
-
-            action_label = f"{prefix} ({range_label} PWM {spd}, Steer {angle}°)"
-
+        elif bbox_h_frac > FOLLOW_IDEAL_MIN:
+            spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_CRUISE_SPEED
+            action_label = f"{prefix} (Cruise PWM {spd}, Steer {angle}°)"
             if motors_enabled:
-                now_mono = time.monotonic()
-                time_since_turn = now_mono - throttler.last_turn_time
-
-                # Steer-and-Pursue Decision:
-                # 1. Target in central corridor (|angle| <= FOLLOW_STEER_DEADBAND_DEG):
-                #    Command DRIVE forward directly towards target!
-                # 2. Target at moderate heading (12° < |angle| <= 26°):
-                #    Interleaved steer & pursue: after a turn correction, execute a
-                #    forward DRIVE pulse so the car actually moves forward towards the target.
-                # 3. Target sharply off-axis (|angle| > 26°):
-                #    Issue turn pulse to bring target into front corridor.
-                if abs(angle) <= FOLLOW_STEER_DEADBAND_DEG:
+                if abs(angle) < 5:
                     if throttler.should_send_drive(spd):
                         motor.drive(spd, throttler.drive_duration_ms)
                         throttler.record_drive(spd)
-                elif abs(angle) <= 26:
-                    if throttler.last_cmd == "TURN" and time_since_turn < 0.28:
-                        if throttler.should_send_drive(spd):
-                            motor.drive(spd, throttler.drive_duration_ms)
-                            throttler.record_drive(spd)
-                    else:
-                        if throttler.should_send_turn(angle, spd):
-                            motor.turn(angle, speed=spd)
-                            throttler.record_turn(angle, spd)
                 else:
                     if throttler.should_send_turn(angle, spd):
                         motor.turn(angle, speed=spd)
                         throttler.record_turn(angle, spd)
             else:
-                action_label = f"⏸️ BENCH SAFE: {prefix} {range_label} (Suppressed)"
+                action_label = f"⏸️ BENCH SAFE: {prefix} CRUISE (Suppressed)"
+        elif bbox_h_frac > FOLLOW_GETTING_FAR:
+            spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
+            action_label = f"{prefix} (Fast PWM {spd}, Steer {angle}°)"
+            if motors_enabled:
+                if abs(angle) < 5:
+                    if throttler.should_send_drive(spd):
+                        motor.drive(spd, throttler.drive_duration_ms)
+                        throttler.record_drive(spd)
+                else:
+                    if throttler.should_send_turn(angle, spd):
+                        motor.turn(angle, speed=spd)
+                        throttler.record_turn(angle, spd)
+            else:
+                action_label = f"⏸️ BENCH SAFE: {prefix} FAST (Suppressed)"
+        else:
+            spd = FOLLOW_SLOW_SPEED if obs_action == "SLOW" else FOLLOW_FAST_SPEED
+            action_label = f"{prefix} (PWM {spd}, Steer {angle}°)"
+            if motors_enabled:
+                if abs(angle) < 5:
+                    if throttler.should_send_drive(spd):
+                        motor.drive(spd, throttler.drive_duration_ms)
+                        throttler.record_drive(spd)
+                else:
+                    if throttler.should_send_turn(angle, spd):
+                        motor.turn(angle, speed=spd)
+                        throttler.record_turn(angle, spd)
+            else:
+                action_label = f"⏸️ BENCH SAFE: {prefix} FAR (Suppressed)"
 
         return follow_state, pi_latched, action_label
 
@@ -2333,10 +3000,6 @@ def run_pipeline(
     awb_mode: str = "daylight",
     enable_stream: bool = True,
     confidence_thresh: float = 0.4,
-    video_source: Optional[Union[str, int]] = None,
-    show_gui: bool = False,
-    auto_lock: bool = True,
-    lane_color: Optional[str] = None,
 ):
     print(f"🚀 Autonomous RC Car — mode: {mode.upper()}")
     if mode not in ("autonomous", "lane", "follow"):
@@ -2346,7 +3009,8 @@ def run_pipeline(
     system_state = SystemState()
     system_state.current_mode = mode
     system_state.control_mode = mode
-    system_state.motors_enabled = not bench_safe
+    # Requirement R2: Preserve disarmed startup state (motors remain disabled until explicit user command)
+    system_state.motors_enabled = False
     system_state.invert_motors = invert_motors
     system_state.current_awb = awb_mode
 
@@ -2382,6 +3046,16 @@ def run_pipeline(
     sensors = SensorManager(motor_controller=motor)
     nav = NavigationSystem(controller=motor, sensors=sensors)
     throttler = CommandThrottler()
+    corner_recovery = CornerRecoveryController(
+        collision_threshold=EMERGENCY_STOP_DISTANCE_CM,
+        safe_threshold=EMERGENCY_STOP_DISTANCE_CM,
+        backup_speed=200,
+        turn_speed=200,
+        backup_timeout_s=1.0,
+        turn_duration_s=0.5,
+        turn_angle_deg=45,
+        motor=motor,
+    )
 
     # ── 3. Follow-me Components ──────────────────────────────────────────────
     tracker = ObjectTracker()
@@ -2391,65 +3065,48 @@ def run_pipeline(
     steering_pid.setWindup(50)
     follow_state = "LOCK_ON"
 
-    # ── 3b. Lane Following Components (Ribbon / Tape Track) ───────────────────
-    if lane_color:
-        system_state.lane_color_mode = lane_color
+    # ── 3b. Chart-Paper Lane Following Components ────────────────────────────
     lane_detector = ChartLaneDetector(color_mode=system_state.lane_color_mode)
+    lane_steering = LaneSteeringStabilizer()
 
     # ── 4. Camera Setup ──────────────────────────────────────────────────────
     use_picam2 = False
     picam2     = None
     cap        = None
-    is_video_file = False
 
-    if video_source is not None:
-        source_val = int(video_source) if str(video_source).isdigit() else str(video_source)
-        if isinstance(source_val, str):
-            is_video_file = True
-        print(f"  📷 Opening custom video source: {source_val}")
-        cap = cv2.VideoCapture(source_val)
+    try:
+        from picamera2 import Picamera2
+        picam2 = Picamera2()
+        system_state.cam_instance = picam2
+
+        # Configure Picamera2 in BGR888 mode
+        cfg = None
+        if Transform is not None:
+            try:
+                cfg = picam2.create_video_configuration(
+                    main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "BGR888"},
+                    transform=Transform(hflip=1, vflip=1)
+                )
+            except Exception:
+                cfg = None
+        if cfg is None:
+            cfg = picam2.create_preview_configuration(
+                main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "BGR888"}
+            )
+        picam2.configure(cfg)
+        picam2.start()
+        set_awb_mode(picam2, awb_mode)
+        use_picam2 = True
+        print(f"  📷 CSI Camera initialised via Picamera2 ({CAMERA_WIDTH}x{CAMERA_HEIGHT}).")
+    except Exception:
+        print("  📷 Picamera2 unavailable; falling back to cv2.VideoCapture.")
+        cap = cv2.VideoCapture(0)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_WIDTH)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
             cap.set(cv2.CAP_PROP_FPS,          CAMERA_FPS)
         else:
-            print(f"⚠️ Could not open video source {source_val}; falling back to default.")
-            cap = None
-
-    if cap is None:
-        try:
-            from picamera2 import Picamera2
-            picam2 = Picamera2()
-            system_state.cam_instance = picam2
-
-            # Configure Picamera2 in BGR888 mode
-            cfg = None
-            if Transform is not None:
-                try:
-                    cfg = picam2.create_video_configuration(
-                        main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "BGR888"},
-                        transform=Transform(hflip=1, vflip=1)
-                    )
-                except Exception:
-                    pass
-            if cfg is None:
-                cfg = picam2.create_preview_configuration(
-                    main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"}
-                )
-            picam2.configure(cfg)
-            picam2.start()
-            set_awb_mode(picam2, awb_mode)
-            use_picam2 = True
-            print(f"  📷 CSI Camera initialised via Picamera2 ({CAMERA_WIDTH}x{CAMERA_HEIGHT}).")
-        except Exception:
-            print("  📷 Picamera2 unavailable (Laptop/PC dev mode); falling back to cv2.VideoCapture(0).")
-            cap = cv2.VideoCapture(0)
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_WIDTH)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-                cap.set(cv2.CAP_PROP_FPS,          CAMERA_FPS)
-            else:
-                print("  📷 No physical camera detected; generating synthetic frames.")
+            print("  📷 No physical camera detected; generating synthetic frames.")
 
     # ── 5. HTTP Streaming Server ─────────────────────────────────────────────
     server_thread = None
@@ -2476,20 +3133,6 @@ def run_pipeline(
             signal.signal(signal.SIGTERM, sig_handler)
         except (ValueError, AttributeError):
             pass
-
-    gui_window_name = "RC Car Capstone - Telemetry HUD"
-    if show_gui:
-        cv2.namedWindow(gui_window_name, cv2.WINDOW_AUTOSIZE)
-
-        def on_gui_mouse_click(event, x, y, flags, param):
-            if event == cv2.EVENT_LBUTTONDOWN:
-                nx = max(0.0, min(1.0, x / float(CAMERA_WIDTH)))
-                ny = max(0.0, min(1.0, y / float(CAMERA_HEIGHT)))
-                with system_state.lock:
-                    system_state.pending_select_point = (nx, ny)
-                print(f"🎯 Click on box at ({x}, {y}) -> Selected target at ({nx:.2f}, {ny:.2f})")
-
-        cv2.setMouseCallback(gui_window_name, on_gui_mouse_click)
 
     print("✅ System ready. Press Ctrl+C to terminate safely.\n")
 
@@ -2520,18 +3163,17 @@ def run_pipeline(
                 last_ping_time = now_mono
 
             # ── B. Frame Capture ──────────────────────────────────────────────
+            with system_state.lock:
+                do_swap_rb = system_state.swap_rb
+
             if use_picam2 and picam2:
                 frame_raw = picam2.capture_array()
                 if len(frame_raw.shape) == 3 and frame_raw.shape[2] == 3:
-                    frame = cv2.cvtColor(frame_raw, cv2.COLOR_RGB2BGR) if cfg.get("main", {}).get("format") != "BGR888" else frame_raw.copy()
+                    frame = cv2.cvtColor(frame_raw, cv2.COLOR_RGB2BGR) if do_swap_rb else frame_raw.copy()
                 else:
                     frame = frame_raw.copy()
             elif cap and cap.isOpened():
                 ret, frame = cap.read()
-                if not ret or frame is None:
-                    if is_video_file:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        ret, frame = cap.read()
                 if not ret or frame is None:
                     frame = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
             else:
@@ -2556,19 +3198,30 @@ def run_pipeline(
             # ── E. Decision Execution ────────────────────────────────────────
             with system_state.lock:
                 current_ctrl_mode = system_state.control_mode
+                override_obs = system_state.manual_override_obstacles
+                motors_en = system_state.motors_enabled
 
             if current_ctrl_mode == "manual":
+                # Ensure autonomous obstacle latch is cleared when operating in manual mode (unless in emergency stop)
+                with system_state.lock:
+                    e_stop = system_state.emergency_stop
+                if pi_latched and not e_stop:
+                    pi_latched = False
+                    if motor.latest_state in ("PI_STOPPED", "STATE_PI_STOPPED"):
+                        motor.pi_go()
+
                 # Manual control mode: vehicle is controlled via Web UI / D-Pad
-                # Safety auto-brake: if front US is blocked, stop immediately!
-                if us_blocked:
-                    motor.stop()
+                # Safety auto-brake: if front US is blocked and not overridden, stop!
+                if us_blocked and not override_obs:
+                    if motors_en:
+                        motor.stop()
                     action_label = f"🛑 MANUAL AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)"
                 else:
                     with system_state.lock:
                         man_act = system_state.manual_action
                         man_spd = system_state.manual_speed
                     action_label = f"🎮 MANUAL REMOTE: {man_act} (PWM {man_spd})"
-            elif current_ctrl_mode == "lane" or (current_ctrl_mode == "autonomous" and mode == "lane"):
+            elif current_ctrl_mode == "lane":
                 pi_latched, action_label, lane_res = _run_lane(
                     motor=motor,
                     sensors=sensors,
@@ -2577,11 +3230,12 @@ def run_pipeline(
                     us_blocked=us_blocked,
                     frame=frame,
                     pi_latched=pi_latched,
-                    motors_enabled=system_state.motors_enabled,
+                    motors_enabled=motors_en,
                     throttler=throttler,
                     sys_state=system_state,
+                    lane_steering=lane_steering,
                 )
-            elif current_ctrl_mode == "follow" or mode == "follow":
+            elif current_ctrl_mode == "follow":
                 follow_state, pi_latched, action_label = _run_follow(
                     motor=motor,
                     sensors=sensors,
@@ -2592,11 +3246,10 @@ def run_pipeline(
                     frame=frame,
                     follow_state=system_state.follow_state,
                     pi_latched=pi_latched,
-                    motors_enabled=system_state.motors_enabled,
+                    motors_enabled=motors_en,
                     throttler=throttler,
                     fresh_inference=fresh_inference,
                     sys_state=system_state,
-                    auto_lock=auto_lock,
                 )
                 system_state.follow_state = follow_state
             else:
@@ -2607,9 +3260,10 @@ def run_pipeline(
                     us_blocked=us_blocked,
                     frame=frame,
                     pi_latched=pi_latched,
-                    motors_enabled=system_state.motors_enabled,
+                    motors_enabled=motors_en,
                     throttler=throttler,
                     fresh_inference=fresh_inference,
+                    corner_recovery=corner_recovery,
                 )
 
             # Sync state with shared container
@@ -2623,7 +3277,7 @@ def run_pipeline(
             system_state.fps = fps
 
             # ── G. HUD Rendering & Streaming ─────────────────────────────────
-            if (enable_stream and system_state.streaming_output is not None) or show_gui:
+            if enable_stream and system_state.streaming_output is not None:
                 hud_frame = draw_hud(
                     frame=frame,
                     detections=cached_detections,
@@ -2633,7 +3287,7 @@ def run_pipeline(
                     port_name=motor.port,
                     fps=fps,
                     awb_mode=system_state.current_awb,
-                    mode=system_state.control_mode if system_state.control_mode in ("manual", "follow", "lane") else mode,
+                    mode=current_ctrl_mode,
                     motors_enabled=system_state.motors_enabled,
                     invert_motors=system_state.invert_motors,
                     pi_latched=pi_latched,
@@ -2645,35 +3299,9 @@ def run_pipeline(
                     non_target_persons=system_state.non_target_persons,
                     lane_result=system_state.lane_result,
                 )
-                if enable_stream and system_state.streaming_output is not None:
-                    ok, jpg = cv2.imencode(".jpg", hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    if ok:
-                        system_state.streaming_output.write(jpg.tobytes())
-                if show_gui:
-                    cv2.imshow("RC Car Capstone - Telemetry HUD", hud_frame)
-                    k = cv2.waitKey(1) & 0xFF
-                    if k in (ord('q'), 27):
-                        print("\n👋 'q' pressed in GUI window. Exiting...")
-                        system_state.running = False
-                    elif k == ord('c'):
-                        print("🎯 'c' pressed: Calibrating on center target.")
-                        with system_state.lock:
-                            system_state.pending_calibrate_center = True
-                    elif k == ord('r'):
-                        print("🔄 'r' pressed: Resetting target.")
-                        with system_state.lock:
-                            system_state.pending_reset_target = True
-                    elif k == ord('m'):
-                        with system_state.lock:
-                            modes = ["follow", "autonomous", "lane"]
-                            curr_idx = modes.index(system_state.control_mode) if system_state.control_mode in modes else 0
-                            system_state.control_mode = modes[(curr_idx + 1) % len(modes)]
-                            print(f"🔀 Switched mode to: {system_state.control_mode}")
-                    elif k == ord(' '):
-                        with system_state.lock:
-                            system_state.motors_enabled = not system_state.motors_enabled
-                            state_str = "ENABLED" if system_state.motors_enabled else "PAUSED (Bench-Safe)"
-                            print(f"⏸️ Motors: {state_str}")
+                ok, jpg = cv2.imencode(".jpg", hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if ok:
+                    system_state.streaming_output.write(jpg.tobytes())
 
             time.sleep(0.01)
 
@@ -2704,11 +3332,6 @@ def run_pipeline(
             try:
                 httpd.shutdown()
                 httpd.server_close()
-            except Exception:
-                pass
-        if show_gui:
-            try:
-                cv2.destroyAllWindows()
             except Exception:
                 pass
         print("👋 Shutdown complete. Hardware released safely.")
@@ -2774,29 +3397,6 @@ def main():
         default=0.40,
         help="YOLO detection confidence threshold (default: 0.40).",
     )
-    parser.add_argument(
-        "--video",
-        "--source",
-        dest="video_source",
-        default=None,
-        help="Video source: camera index ('0', '1'), video file path ('test.mp4'), or None for auto (Picamera2 on Pi, webcam on PC).",
-    )
-    parser.add_argument(
-        "--gui",
-        action="store_true",
-        help="Open local OpenCV GUI window with interactive HUD ('q' quit, 'c' lock-on, 'r' reset, 'm' switch mode, space pause). Click any person box to target!",
-    )
-    parser.add_argument(
-        "--no-auto-lock",
-        action="store_true",
-        help="Disable automatic person acquisition (requires clicking on a box or pressing 'c' to target).",
-    )
-    parser.add_argument(
-        "--lane-color",
-        choices=["dark", "yellow", "blue", "red", "white"],
-        default=None,
-        help="Color preset for lane ribbon/tape boundaries ('yellow', 'blue', 'red', 'white', 'dark').",
-    )
 
     args = parser.parse_args()
 
@@ -2810,10 +3410,6 @@ def main():
         awb_mode=args.awb,
         enable_stream=not args.no_stream,
         confidence_thresh=args.conf,
-        video_source=args.video_source,
-        show_gui=args.gui,
-        auto_lock=not args.no_auto_lock,
-        lane_color=args.lane_color,
     )
 
 

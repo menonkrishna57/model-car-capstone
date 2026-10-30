@@ -114,6 +114,7 @@ AvoidPhase    avoidPhase          = AVOID_PHASE_REVERSE;
 unsigned long avoidPhaseStart     = 0;
 int           avoidTurnDir        = 1;    // +1 = turn right, -1 = turn left
 int           savedDriveSpeed     = 0;
+bool          avoidDualObstacle   = false;
 
 // PI_AVOID directional hint: +1 = right, -1 = left, 0 = none
 int           piAvoidHint         = 0;
@@ -146,28 +147,35 @@ int           serialBufLen        = 0;
  * Range: -255 to +255.
  */
 void setMotors(int leftSpeed, int rightSpeed) {
-  // Invert polarity if chassis TT motors are wired in reverse (corrects backward drive)
+  // Invert polarity if configured in pins.h (default false with corrected native pin polarity)
   if (INVERT_MOTOR_POLARITY) {
     leftSpeed  = -leftSpeed;
     rightSpeed = -rightSpeed;
   }
 
+  // Minimum speed clamping: active non-zero driving speeds must overcome static friction (PWM >= 180)
+  if (leftSpeed > 0 && leftSpeed < 180) leftSpeed = 180;
+  if (leftSpeed < 0 && leftSpeed > -180) leftSpeed = -180;
+  if (rightSpeed > 0 && rightSpeed < 180) rightSpeed = 180;
+  if (rightSpeed < 0 && rightSpeed > -180) rightSpeed = -180;
+
   // Apply motor trim when driving forward (corrects chassis mechanical drift)
   if (leftSpeed > 0 && rightSpeed > 0 && tune.motorTrim != 0) {
     if (tune.motorTrim > 0) {
-      rightSpeed = constrain(rightSpeed + tune.motorTrim, 0, 255);
+      rightSpeed = constrain(rightSpeed + tune.motorTrim, 180, 255);
     } else {
-      leftSpeed = constrain(leftSpeed - tune.motorTrim, 0, 255);
+      leftSpeed = constrain(leftSpeed - tune.motorTrim, 180, 255);
     }
   }
 
   // Left channel (Channel B: ENB=6, IN3=10, IN4=11)
+  // Forward: IN3=LOW, IN4=HIGH; Reverse: IN3=HIGH, IN4=LOW; Stop: IN3=LOW, IN4=LOW
   if (leftSpeed > 0) {
-    digitalWrite(PIN_LEFT_IN1, HIGH);
-    digitalWrite(PIN_LEFT_IN2, LOW);
-  } else if (leftSpeed < 0) {
     digitalWrite(PIN_LEFT_IN1, LOW);
     digitalWrite(PIN_LEFT_IN2, HIGH);
+  } else if (leftSpeed < 0) {
+    digitalWrite(PIN_LEFT_IN1, HIGH);
+    digitalWrite(PIN_LEFT_IN2, LOW);
     leftSpeed = -leftSpeed;
   } else {
     digitalWrite(PIN_LEFT_IN1, LOW);
@@ -177,12 +185,13 @@ void setMotors(int leftSpeed, int rightSpeed) {
   analogWrite(PIN_LEFT_PWM, constrain(leftSpeed, 0, 255));
 
   // Right channel (Channel A: ENA=5, IN1=8, IN2=9)
+  // Forward: IN1=LOW, IN2=HIGH; Reverse: IN1=HIGH, IN2=LOW; Stop: IN1=LOW, IN2=LOW
   if (rightSpeed > 0) {
-    digitalWrite(PIN_RIGHT_IN1, HIGH);
-    digitalWrite(PIN_RIGHT_IN2, LOW);
-  } else if (rightSpeed < 0) {
     digitalWrite(PIN_RIGHT_IN1, LOW);
     digitalWrite(PIN_RIGHT_IN2, HIGH);
+  } else if (rightSpeed < 0) {
+    digitalWrite(PIN_RIGHT_IN1, HIGH);
+    digitalWrite(PIN_RIGHT_IN2, LOW);
     rightSpeed = -rightSpeed;
   } else {
     digitalWrite(PIN_RIGHT_IN1, LOW);
@@ -342,6 +351,9 @@ const char* stateToString(CarState st) {
 void startAvoidance() {
   stopMotors();
 
+  // Check if both sensors detect an obstacle (corner / dual collision)
+  avoidDualObstacle = (usLeftDistance < tune.usObstacleDist && usRightDistance < tune.usObstacleDist);
+
   // Direction: Pi hint takes precedence; otherwise steer away from closer obstacle
   if (piAvoidHint != 0) {
     avoidTurnDir = piAvoidHint;
@@ -365,11 +377,33 @@ void tickAvoidance() {
   unsigned long elapsed = millis() - avoidPhaseStart;
 
   switch (avoidPhase) {
-    case AVOID_PHASE_REVERSE:
-      if (elapsed >= tune.avoidRevMs) {
+    case AVOID_PHASE_REVERSE: {
+      if (usLeftDistance < tune.usObstacleDist && usRightDistance < tune.usObstacleDist) {
+        avoidDualObstacle = true;
+      }
+
+      bool reverseDone = false;
+      if (avoidDualObstacle) {
+        // Dual obstacle / corner: early exit if both sensors clear to safe distance,
+        // or after AVOID_CORNER_REV_MAX_MS (1000ms).
+        if ((usLeftDistance >= tune.usObstacleDist && usRightDistance >= tune.usObstacleDist) ||
+            (elapsed >= AVOID_CORNER_REV_MAX_MS)) {
+          reverseDone = true;
+        }
+      } else {
+        if (elapsed >= tune.avoidRevMs) {
+          reverseDone = true;
+        }
+      }
+
+      if (reverseDone) {
         avoidPhase      = AVOID_PHASE_TURN;
         avoidPhaseStart = millis();
-        // Phase 2: Skid-turn
+        if (avoidDualObstacle) {
+          // Steer away towards side with greater clearance
+          avoidTurnDir = (usRightDistance >= usLeftDistance) ? 1 : -1;
+        }
+        // Phase 2: Skid-turn using tune.avoidSpeed (200 PWM)
         if (avoidTurnDir > 0) {
           setMotors(tune.avoidSpeed, -tune.avoidSpeed);  // Turn Right
         } else {
@@ -377,6 +411,7 @@ void tickAvoidance() {
         }
       }
       break;
+    }
 
     case AVOID_PHASE_TURN:
       if (elapsed >= tune.avoidTurnMs) {
@@ -391,6 +426,7 @@ void tickAvoidance() {
     case AVOID_PHASE_RESUME:
       if (elapsed >= tune.avoidResumeMs) {
         stopMotors();
+        avoidDualObstacle = false;
         avoidCooldownEnd = millis() + tune.avoidCooldownMs;
         Serial.println(F("[TELEM] DONE AVOID"));
         transitionTo(STATE_IDLE);
@@ -524,6 +560,7 @@ void handleDrive(char* args) {
   }
 
   int speed = constrain(atoi(speedStr), 0, 255);
+  if (speed > 0 && speed < 180) speed = 180;
   unsigned long duration = (unsigned long)atol(durStr);
 
   savedDriveSpeed = speed;
@@ -561,6 +598,7 @@ void handleReverse(char* args) {
   }
 
   int speed = constrain(atoi(speedStr), 0, 255);
+  if (speed > 0 && speed < 180) speed = 180;
   unsigned long duration = (unsigned long)atol(durStr);
 
   savedDriveSpeed = 0;
@@ -599,6 +637,7 @@ void handleTurn(char* args) {
 
   int angle = atoi(angleStr);
   int speed = constrain(atoi(speedStr), 0, 255);
+  if (speed > 0 && speed < 180) speed = 180;
   unsigned long duration = (unsigned long)abs(angle) * (unsigned long)tune.turnMsPerDeg;
 
   savedDriveSpeed = 0;
@@ -836,11 +875,15 @@ void handleTune(char* args) {
     } else if (strcmp(param, "CLIFF_REV_MS") == 0) {
       tune.cliffRevMs = (unsigned long)atol(val);
     } else if (strcmp(param, "CLIFF_REV_SPD") == 0) {
-      tune.cliffRevSpeed = constrain(atoi(val), 0, 255);
+      int s = constrain(atoi(val), 0, 255);
+      if (s > 0 && s < 180) s = 180;
+      tune.cliffRevSpeed = s;
     } else if (strcmp(param, "CLIFF_CONFIRM") == 0) {
       tune.cliffConfirmCount = max(1, atoi(val));
     } else if (strcmp(param, "AVOID_SPD") == 0) {
-      tune.avoidSpeed = constrain(atoi(val), 0, 255);
+      int s = constrain(atoi(val), 0, 255);
+      if (s > 0 && s < 180) s = 180;
+      tune.avoidSpeed = s;
     } else if (strcmp(param, "AVOID_REV_MS") == 0) {
       tune.avoidRevMs = (unsigned long)atol(val);
     } else if (strcmp(param, "AVOID_TURN_MS") == 0) {
@@ -1045,8 +1088,9 @@ void setup() {
   pinMode(PIN_US_RIGHT_TRIG, OUTPUT);
   pinMode(PIN_US_RIGHT_ECHO, INPUT);
 
-  // Announce ready
-  Serial.println(F("[TELEM] READY Uno-ATmega328P v2.1"));
+  // Announce ready & disarmed startup state
+  Serial.println(F("[TELEM] READY Uno-ATmega328P v2.1 MOTORS=DISARMED"));
+  Serial.println(F("[NOTICE] Physical HW Test: Wheels elevated. Forward: Right(IN1=L,IN2=H), Left(IN3=L,IN4=H)"));
 
   // Check and load persistent calibration from EEPROM if present
   bool loadedEEPROM = loadTuneParamsFromEEPROM();

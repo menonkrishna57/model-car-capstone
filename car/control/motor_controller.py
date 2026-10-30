@@ -212,24 +212,33 @@ class MotorController:
         """
         Drive forward at PWM speed (0–255) for duration_ms.
         A new DRIVE replaces any in-progress timed action (no queue).
+        Active speeds between 1 and 179 are clamped to 180 to overcome motor friction.
         """
+        if 0 < speed < 180:
+            speed = 180
         speed = max(0, min(255, speed))
         cmd = f"REV {speed} {duration_ms}" if self.invert_motors else f"DRIVE {speed} {duration_ms}"
         return self._send(cmd)
 
     def reverse(self, speed: int, duration_ms: int) -> bool:
         """Drive reverse at PWM speed (0–255) for duration_ms."""
+        if 0 < speed < 180:
+            speed = 180
         speed = max(0, min(255, speed))
         cmd = f"DRIVE {speed} {duration_ms}" if self.invert_motors else f"REV {speed} {duration_ms}"
         return self._send(cmd)
 
-    def turn(self, angle_deg: int, speed: int = 150) -> bool:
+    def turn(self, angle_deg: int, speed: int = 200) -> bool:
         """
         Skid-steer turn by angle_deg.
         Positive = right, negative = left. Range: -180 to +180.
         Duration is computed on the Arduino from TURN_MS_PER_DEGREE.
+        Active speeds between 1 and 199 are clamped to 200 to overcome
+        vehicle weight and friction during skid-steer turns.
         """
         angle_deg = max(-180, min(180, angle_deg))
+        if 0 < speed < 200:
+            speed = 200
         speed = max(0, min(255, speed))
         eff_angle = -angle_deg if self.invert_motors else angle_deg
         return self._send(f"TURN {eff_angle} {speed}")

@@ -45,23 +45,13 @@ IMU_I2C_ADDRESS = 0x68
 
 # ── Follow-Me & Person Re-Identification ─────────────────────────────────────
 FOLLOW_CALIBRATION_FRAMES = 8          # Multi-frame samples to build target signature
-FOLLOW_SIMILARITY_THRESHOLD = 0.45     # Min combined score (clothing + figure) to match target (real-world tuned)
-FOLLOW_TRACK_VERIFY_THRESHOLD = 0.38   # Min score during active tracking before dropping to RE_ACQUIRE
+FOLLOW_SIMILARITY_THRESHOLD = 0.58     # Min combined score (clothing + figure) to match target
+FOLLOW_TRACK_VERIFY_THRESHOLD = 0.50   # Min score during active tracking before dropping to RE_ACQUIRE
 FOLLOW_ANTI_CONFUSION_MARGIN = 0.08    # Required margin over overlapping distractor person
-FOLLOW_COAST_MAX_FRAMES = 12           # Max frames to coast during momentary drop / motion blur (~400ms)
 FOLLOW_SEARCH_STEP_DEG = 28            # Degrees per stepped turn toward last_seen_side
-FOLLOW_SEARCH_TURN_SPEED = 165         # PWM speed for search turns during RE_ACQUIRE
+FOLLOW_SEARCH_TURN_SPEED = 200         # PWM speed for search turns during RE_ACQUIRE (>= 200)
 FOLLOW_SEARCH_MAX_STEPS = 4            # Max directional search turns before holding stationary
 FOLLOW_SEARCH_INTERVAL_S = 0.85        # Delay (s) between search turns to stabilize camera & scan
-
-# Follow-Me Speed & Pursuit Modulation
-FOLLOW_TOO_CLOSE = 0.65                # > 65% frame height -> stop / hold (~1.0m away)
-FOLLOW_IDEAL_MIN = 0.28                # 28%–65% frame height -> cruise (~1.0m - 2.5m away)
-FOLLOW_GETTING_FAR = 0.12              # < 28% frame height -> speed up (> 2.5m away)
-FOLLOW_CRUISE_SPEED = 180              # Cruise forward PWM speed
-FOLLOW_FAST_SPEED = 210                # Fast pursuit forward PWM speed
-FOLLOW_SLOW_SPEED = 150                # Minimum forward PWM speed under obstacle caution (prevents TT motor stall)
-FOLLOW_STEER_DEADBAND_DEG = 12         # Deadband (deg) within which car commands forward drive
 
 # ── Chart-Paper Lane Detection & Following (Option A) ────────────────────────
 LANE_ROI_Y_MIN_FRAC = 0.45             # Scan lower 55% of frame for chart paper lines
@@ -70,8 +60,17 @@ LANE_DEFAULT_WIDTH_FRAC = 0.52         # Expected normalized spacing between lef
 LANE_EMA_ALPHA = 0.45                  # Temporal smoothing factor for polynomial coefficients
 LANE_MAX_JUMP_FRAC = 0.15              # Max frame-to-frame lateral jump before rejecting outlier
 LANE_LOST_MAX_FRAMES = 8               # Coast frames allowed before stopping when both lines disappear
-LANE_CRUISE_SPEED = 165                # Forward PWM speed when centered in lane
-LANE_CURVE_SPEED = 145                 # PWM speed when executing corrective lane turns
+LANE_CRUISE_SPEED = 185                # Forward PWM speed when centered in lane (>= 180)
+LANE_CURVE_SPEED = 200                 # PWM speed when executing corrective lane turns (>= 200)
 LANE_STEER_DEADBAND_DEG = 6            # Deadband (deg) within which car drives straight
 LANE_MAX_STEER_DEG = 38                # Maximum skid-steer correction angle for sharp paper curves
-LANE_COLOR_MODE = "dark"               # "dark" (black lines on white chart paper), "yellow", "blue", "white"
+LANE_COLOR_MODE = "orange"             # Default ribbon color: "orange", "brown", "green", "pink" (legacy presets: "dark", "yellow", "blue", "white")
+
+# Satin Ribbon HSV Color Boundaries [H: 0-179, S: 0-255, V: 0-255]
+LANE_HSV_RANGES = {
+    "orange": {"lower": [5, 120, 80], "upper": [22, 255, 255]},
+    "brown": {"lower": [5, 60, 30], "upper": [20, 200, 160]},
+    "green": {"lower": [38, 70, 50], "upper": [88, 255, 255]},
+    "pink": {"lower": [140, 50, 100], "upper": [179, 255, 255]},
+}
+

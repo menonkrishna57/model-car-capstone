@@ -45,15 +45,19 @@ const int PIN_RIGHT_IN1 = 8;   // L298N IN1 (Dir bit 1)
 const int PIN_RIGHT_IN2 = 9;   // L298N IN2 (Dir bit 2)
 
 // Helper functions for motor control
+// Native forward polarity: Left (IN3=LOW, IN4=HIGH), Right (IN1=LOW, IN2=HIGH)
+// Native reverse polarity: Left (IN3=HIGH, IN4=LOW), Right (IN1=HIGH, IN2=LOW)
 void setLeftMotor(int speed) {
   speed = constrain(speed, -255, 255);
+  if (speed > 0 && speed < 180) speed = 180;
+  if (speed < 0 && speed > -180) speed = -180;
   if (speed > 0) {
-    digitalWrite(PIN_LEFT_IN1, HIGH);
-    digitalWrite(PIN_LEFT_IN2, LOW);
-    analogWrite(PIN_LEFT_PWM, speed);
-  } else if (speed < 0) {
     digitalWrite(PIN_LEFT_IN1, LOW);
     digitalWrite(PIN_LEFT_IN2, HIGH);
+    analogWrite(PIN_LEFT_PWM, speed);
+  } else if (speed < 0) {
+    digitalWrite(PIN_LEFT_IN1, HIGH);
+    digitalWrite(PIN_LEFT_IN2, LOW);
     analogWrite(PIN_LEFT_PWM, -speed);
   } else {
     digitalWrite(PIN_LEFT_IN1, LOW);
@@ -64,13 +68,15 @@ void setLeftMotor(int speed) {
 
 void setRightMotor(int speed) {
   speed = constrain(speed, -255, 255);
+  if (speed > 0 && speed < 180) speed = 180;
+  if (speed < 0 && speed > -180) speed = -180;
   if (speed > 0) {
-    digitalWrite(PIN_RIGHT_IN1, HIGH);
-    digitalWrite(PIN_RIGHT_IN2, LOW);
-    analogWrite(PIN_RIGHT_PWM, speed);
-  } else if (speed < 0) {
     digitalWrite(PIN_RIGHT_IN1, LOW);
     digitalWrite(PIN_RIGHT_IN2, HIGH);
+    analogWrite(PIN_RIGHT_PWM, speed);
+  } else if (speed < 0) {
+    digitalWrite(PIN_RIGHT_IN1, HIGH);
+    digitalWrite(PIN_RIGHT_IN2, LOW);
     analogWrite(PIN_RIGHT_PWM, -speed);
   } else {
     digitalWrite(PIN_RIGHT_IN1, LOW);
@@ -90,9 +96,12 @@ void printBanner() {
   Serial.println(F("=================================================="));
   Serial.println(F("Pins: Left Motor  [Ch.B] (PWM=6, IN3=10, IN4=11)"));
   Serial.println(F("      Right Motor [Ch.A] (PWM=5, IN1=8,  IN2=9)"));
+  Serial.println(F("Polarity: Forward is Left(IN3=L, IN4=H), Right(IN1=L, IN2=H)"));
+  Serial.println(F("STATUS: DISARMED at startup (motors stopped at 0 PWM)"));
+  Serial.println(F("NOTICE FOR KRISHNA: Elevate wheels before testing!"));
   Serial.println(F("Commands (Serial Monitor at 115200 baud):"));
   Serial.println(F("  TEST         - Run automated test cycle"));
-  Serial.println(F("  RAMP         - Run PWM speed ramp sweep (0-255)"));
+  Serial.println(F("  RAMP         - Run PWM speed ramp sweep"));
   Serial.println(F("  L <speed>    - Set left motor speed (-255 to 255)"));
   Serial.println(F("  R <speed>    - Set right motor speed (-255 to 255)"));
   Serial.println(F("  BOTH <speed> - Set both motors speed (-255 to 255)"));
@@ -108,8 +117,8 @@ void runAutomatedTest() {
   // Test 1: Left Motor Solo
   // -------------------------------------------------------------
   Serial.println(F("[1/5] Testing LEFT MOTOR:"));
-  Serial.println(F("  -> Left Forward @ PWM 130 (Medium)"));
-  setLeftMotor(130);
+  Serial.println(F("  -> Left Forward @ PWM 180 (Medium)"));
+  setLeftMotor(180);
   setRightMotor(0);
   delay(1500);
 
@@ -121,8 +130,8 @@ void runAutomatedTest() {
   stopMotors();
   delay(800);
 
-  Serial.println(F("  -> Left Reverse @ PWM 150"));
-  setLeftMotor(-150);
+  Serial.println(F("  -> Left Reverse @ PWM 185"));
+  setLeftMotor(-185);
   delay(1500);
 
   Serial.println(F("  -> Left STOP"));
@@ -133,9 +142,9 @@ void runAutomatedTest() {
   // Test 2: Right Motor Solo
   // -------------------------------------------------------------
   Serial.println(F("\n[2/5] Testing RIGHT MOTOR:"));
-  Serial.println(F("  -> Right Forward @ PWM 130 (Medium)"));
+  Serial.println(F("  -> Right Forward @ PWM 180 (Medium)"));
   setLeftMotor(0);
-  setRightMotor(130);
+  setRightMotor(180);
   delay(1500);
 
   Serial.println(F("  -> Right Forward @ PWM 220 (High)"));
@@ -146,8 +155,8 @@ void runAutomatedTest() {
   stopMotors();
   delay(800);
 
-  Serial.println(F("  -> Right Reverse @ PWM 150"));
-  setRightMotor(-150);
+  Serial.println(F("  -> Right Reverse @ PWM 185"));
+  setRightMotor(-185);
   delay(1500);
 
   Serial.println(F("  -> Right STOP"));
@@ -158,9 +167,9 @@ void runAutomatedTest() {
   // Test 3: Both Motors Synchronized
   // -------------------------------------------------------------
   Serial.println(F("\n[3/5] Testing BOTH MOTORS:"));
-  Serial.println(F("  -> Both Forward @ PWM 140"));
-  setLeftMotor(140);
-  setRightMotor(140);
+  Serial.println(F("  -> Both Forward @ PWM 180"));
+  setLeftMotor(180);
+  setRightMotor(180);
   delay(2000);
 
   Serial.println(F("  -> Both Forward @ PWM 240 (Fast)"));
@@ -172,9 +181,9 @@ void runAutomatedTest() {
   stopMotors();
   delay(1000);
 
-  Serial.println(F("  -> Both Reverse @ PWM 140"));
-  setLeftMotor(-140);
-  setRightMotor(-140);
+  Serial.println(F("  -> Both Reverse @ PWM 185"));
+  setLeftMotor(-185);
+  setRightMotor(-185);
   delay(2000);
 
   Serial.println(F("  -> Both STOP"));
@@ -185,18 +194,18 @@ void runAutomatedTest() {
   // Test 4: Differential Turn (Skid Steer)
   // -------------------------------------------------------------
   Serial.println(F("\n[4/5] Testing DIFFERENTIAL TURNS:"));
-  Serial.println(F("  -> Turn RIGHT in place (Left FWD 150, Right REV 150)"));
-  setLeftMotor(150);
-  setRightMotor(-150);
+  Serial.println(F("  -> Turn RIGHT in place (Left FWD 190, Right REV 190)"));
+  setLeftMotor(190);
+  setRightMotor(-190);
   delay(1500);
 
   Serial.println(F("  -> STOP"));
   stopMotors();
   delay(800);
 
-  Serial.println(F("  -> Turn LEFT in place (Left REV 150, Right FWD 150)"));
-  setLeftMotor(-150);
-  setRightMotor(150);
+  Serial.println(F("  -> Turn LEFT in place (Left REV 190, Right FWD 190)"));
+  setLeftMotor(-190);
+  setRightMotor(190);
   delay(1500);
 
   Serial.println(F("  -> STOP"));
@@ -284,13 +293,11 @@ void setup() {
   pinMode(PIN_RIGHT_IN1, OUTPUT);
   pinMode(PIN_RIGHT_IN2, OUTPUT);
 
-  // Ensure all motors are off initially
+  // Ensure all motors are off initially (disarmed startup per R2)
   stopMotors();
 
   printBanner();
-
-  // Run the test cycle once on startup
-  runAutomatedTest();
+  Serial.println(F("[DISARMED] Motors safe and stationary. Send 'TEST' to run diagnostic cycle."));
 }
 
 void loop() {

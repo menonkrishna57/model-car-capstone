@@ -13,8 +13,12 @@ Tests:
      - Lost lane (> 8 frames) -> safe STOP.
   5. Color mode presets (dark, yellow, blue, white).
   6. Web UI mode switching and HUD corridor rendering.
+  7. Deep edge cases and robustness.
+  8. Satin ribbon lane following (orange, brown, green, pink HSV segmentation,
+     morphological dilation, mode switching, fallback, and obstacle overrides).
 """
 
+import io
 import json
 from typing import Tuple, List, Optional, Dict, Any
 import numpy as np
@@ -37,6 +41,7 @@ from car.perception.lane_detector import (
 )
 from car.main import (
     CommandThrottler,
+    LaneSteeringStabilizer,
     SystemState,
     DiagnosticHandler,
     StreamingServer,
@@ -174,6 +179,48 @@ def test_curved_track_steering():
     res_left = detector.detect(frame_left)
     assert res_left.status == "DUAL_LOCKED"
     assert res_left.steer_angle_deg < -4.0
+
+
+def test_one_frame_pair_jump_coasts_instead_of_reversing_steering():
+    """A false pair in the next frame must not replace an established lane lock."""
+    detector = ChartLaneDetector(color_mode="dark")
+    centered = create_synthetic_chart_paper_frame(width=640, height=480)
+    first = detector.detect(centered)
+    assert first.status == "DUAL_LOCKED"
+
+    # Both false lines are geometrically plausible, but have moved almost a
+    # third of the image in one camera frame.  This models the common case
+    # where a reflection or an adjacent tape segment wins the histogram.
+    false_pair = create_synthetic_chart_paper_frame(
+        width=640, height=480, left_x_frac=0.54, right_x_frac=0.91
+    )
+    rejected = detector.detect(false_pair)
+
+    assert rejected.status == "LANE_LOST"
+    assert rejected.center_coeffs is not None
+    assert abs(rejected.steer_angle_deg - first.steer_angle_deg) <= 1.0
+
+
+def test_single_line_side_handoff_jump_coasts_instead_of_reversing():
+    """A newly classified opposite boundary also needs centreline continuity."""
+    detector = ChartLaneDetector(color_mode="dark")
+    left_only = create_synthetic_chart_paper_frame(
+        width=640, height=480, left_x_frac=0.25, draw_right=False
+    )
+    first = detector.detect(left_only)
+    assert first.status == "SINGLE_LEFT"
+
+    # The sole peak is far enough right to be classified as SINGLE_RIGHT, so
+    # it has no same-side history.  Its reconstructed centre is implausibly
+    # far from the preceding SINGLE_LEFT centre and must be treated as noise.
+    false_right = create_synthetic_chart_paper_frame(
+        width=640, height=480, right_x_frac=0.95, draw_left=False
+    )
+    rejected = detector.detect(false_right)
+
+    assert rejected.status == "LANE_LOST"
+    assert rejected.center_coeffs is not None
+    assert abs(rejected.steer_angle_deg - first.steer_angle_deg) <= 1.0
 
 
 # =============================================================================
@@ -319,6 +366,20 @@ def test_run_lane_curved_steer():
     assert res.status == "DUAL_LOCKED"
     assert "LANE STEER RIGHT" in action
     assert any("TURN" in c and str(LANE_CURVE_SPEED) in c for c in serial_dev.written_commands)
+
+
+def test_lane_steering_stabilizer_rejects_one_frame_reversal_and_limits_burst():
+    """A noisy opposite estimate must not interrupt a timed skid-steer turn."""
+    stabilizer = LaneSteeringStabilizer(
+        ema_alpha=1.0,
+        max_turn_deg=18,
+        reversal_confirm_frames=3,
+    )
+
+    assert stabilizer.update(40.0, deadband_deg=6.0) == 18
+    assert stabilizer.update(-20.0, deadband_deg=6.0) == 0
+    assert stabilizer.update(-20.0, deadband_deg=6.0) == 0
+    assert stabilizer.update(-20.0, deadband_deg=6.0) == -18
 
 
 def test_run_lane_in_lane_hazard_bypass():
@@ -608,4 +669,338 @@ def test_bbox_exclusion_out_of_bounds_and_negative():
 
     res = detector.detect(frame, exclude_boxes=exclude_boxes)
     assert res.status == "DUAL_LOCKED"
+
+
+# =============================================================================
+# 8. Satin Ribbon Lane Following (Requirements R1, R2, R3)
+# =============================================================================
+
+@pytest.mark.parametrize("color,bgr_color", [
+    ("orange", (45, 98, 167)),
+    ("brown", (47, 66, 95)),
+    ("green", (65, 152, 55)),
+    ("pink", (145, 71, 177)),
+])
+def test_ribbon_color_modes_dual_locked(color: str, bgr_color: Tuple[int, int, int]):
+    """
+    Verify that all four satin ribbon color modes ('orange', 'brown', 'green', 'pink')
+    detect straight lines on synthetic chart paper frames, achieving DUAL_LOCKED status,
+    a plausible lane width (~0.40 - 0.65), and reasonable steering angle (|steer| <= 3.0 deg).
+    """
+    detector = ChartLaneDetector(color_mode=color)
+    frame = create_synthetic_chart_paper_frame(
+        width=640,
+        height=480,
+        left_x_frac=0.25,
+        right_x_frac=0.75,
+        line_color=bgr_color,
+        bg_color=(245, 245, 245),
+        line_thickness=8,
+    )
+
+    result = detector.detect(frame)
+
+    assert result.status == "DUAL_LOCKED"
+    assert result.left_line is not None
+    assert result.right_line is not None
+    assert result.center_coeffs is not None
+    # Lane width should be plausible (~0.40 to 0.65)
+    assert 0.40 <= result.lane_width_frac <= 0.65
+    # Straight lines centered in frame: steering angle should be near 0 deg
+    assert abs(result.steer_angle_deg) <= 3.0
+    # Center lookahead point X near image center
+    assert abs(result.lookahead_point[0] - 320) <= 10
+
+
+def test_ribbon_morphological_dilation_effect():
+    """
+    Verify that 5x5 elliptical dilation (2 iterations) applied in ribbon modes:
+    1. Substantially increases active ribbon mask pixels compared to the undilated mask.
+    2. Bridges discontinuous gaps in ribbon lines (e.g. caused by specular reflection / texture voids).
+    """
+    # Create frame with orange ribbon lines having a 4-pixel discontinuous gap at y=350:354
+    frame = create_synthetic_chart_paper_frame(
+        width=640,
+        height=480,
+        left_x_frac=0.25,
+        right_x_frac=0.75,
+        line_color=(45, 98, 167),
+        bg_color=(245, 245, 245),
+        line_thickness=4,
+    )
+    # Introduce gap across both lines at y = 350 to 354
+    frame[350:354, :] = (245, 245, 245)
+
+    detector = ChartLaneDetector(color_mode="orange")
+    dilated_mask, roi_y = detector._extract_binary_mask(frame)
+
+    gap_roi_y = 352 - roi_y
+    left_x = int(640 * 0.25)
+    right_x = int(640 * 0.75)
+
+    # 1. Verify gap bridging: in dilated mask, the gap row contains active ribbon pixels
+    assert dilated_mask[gap_roi_y, left_x] == 255
+    assert dilated_mask[gap_roi_y, right_x] == 255
+
+    # 2. Compute undilated mask (raw inRange + MORPH_OPEN without dilation) for comparison
+    roi = frame[roi_y:, :]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    lower = np.array([5, 120, 80], dtype=np.uint8)
+    upper = np.array([22, 255, 255], dtype=np.uint8)
+    raw_mask = cv2.inRange(hsv, lower, upper)
+    clean_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    raw_opened_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, clean_kernel)
+
+    # In undilated mask, gap is completely unbridged (0)
+    assert raw_opened_mask[gap_roi_y, left_x] == 0
+    assert raw_opened_mask[gap_roi_y, right_x] == 0
+
+    # Dilation with 5x5 ellipse (2 iterations) significantly increases active pixel count
+    raw_active_pixels = int(np.count_nonzero(raw_opened_mask))
+    dilated_active_pixels = int(np.count_nonzero(dilated_mask))
+    assert dilated_active_pixels > 1.8 * raw_active_pixels
+
+    # Full detection across the bridged gap must succeed and achieve DUAL_LOCKED
+    result = detector.detect(frame)
+    assert result.status == "DUAL_LOCKED"
+    assert result.left_line is not None
+    assert result.right_line is not None
+
+
+def test_set_color_mode_validation():
+    """
+    Verify set_color_mode() accepts all 8 valid modes (case-insensitive, trimmed):
+    {"dark", "yellow", "blue", "white", "orange", "brown", "green", "pink"},
+    and ignores/rejects invalid mode strings without state corruption.
+    """
+    detector = ChartLaneDetector()
+    valid_modes = ["dark", "yellow", "blue", "white", "orange", "brown", "green", "pink"]
+
+    # Verify all 8 valid modes are accepted (with whitespace & case variations)
+    for mode in valid_modes:
+        detector.set_color_mode(f"  {mode.upper()}  ")
+        assert detector.color_mode == mode.lower()
+
+    # Anchor to 'orange' and test invalid modes
+    detector.set_color_mode("orange")
+    assert detector.color_mode == "orange"
+
+    invalid_modes = ["purple", "neon", "invalid", "", "red", "cyan", "RGB", "123", "magenta"]
+    for inv in invalid_modes:
+        detector.set_color_mode(inv)
+        assert detector.color_mode == "orange", f"Mode '{inv}' should have been rejected"
+
+
+def test_ribbon_single_line_fallback():
+    """
+    Verify single-line fallback recovery when only one ribbon line is visible
+    for both SINGLE_LEFT and SINGLE_RIGHT tracking on satin ribbons.
+    """
+    # 1. Left line only (orange ribbon) -> SINGLE_LEFT
+    det_left = ChartLaneDetector(color_mode="orange")
+    frame_left = create_synthetic_chart_paper_frame(
+        width=640,
+        height=480,
+        left_x_frac=0.25,
+        line_color=(45, 98, 167),
+        draw_right=False,
+    )
+    res_left = det_left.detect(frame_left)
+
+    assert res_left.status == "SINGLE_LEFT"
+    assert res_left.left_line is not None
+    assert res_left.right_line is None
+    assert res_left.center_coeffs is not None
+    # Reconstructed centerline shifted right by ~half lane width (lookahead X ~ 326)
+    assert abs(res_left.lookahead_point[0] - 326) <= 20
+
+    # 2. Right line only (green ribbon) -> SINGLE_RIGHT
+    det_right = ChartLaneDetector(color_mode="green")
+    frame_right = create_synthetic_chart_paper_frame(
+        width=640,
+        height=480,
+        right_x_frac=0.75,
+        line_color=(65, 152, 55),
+        draw_left=False,
+    )
+    res_right = det_right.detect(frame_right)
+
+    assert res_right.status == "SINGLE_RIGHT"
+    assert res_right.left_line is None
+    assert res_right.right_line is not None
+    assert res_right.center_coeffs is not None
+    # Reconstructed centerline shifted left by ~half lane width (lookahead X ~ 314)
+    assert abs(res_right.lookahead_point[0] - 314) <= 20
+
+
+def test_ribbon_obstacle_stop_and_exclusion():
+    """
+    Verify that:
+    1. Obstacle and pothole bounding boxes exclude ribbon pixels from the binary mask.
+    2. Obstacle overrides in multi-model priority stack (_run_lane) take precedence
+       over ribbon lane following (triggering PI_STOP for imminent hazards and PI_AVOID for corridor hazards).
+    """
+    detector = ChartLaneDetector(color_mode="orange")
+    frame = create_synthetic_chart_paper_frame(
+        width=640,
+        height=480,
+        line_color=(45, 98, 167),
+    )
+
+    # 1. Test BBox exclusion: an obstacle over the left ribbon line (x: 140-180, y: 350-400)
+    obstacle_bbox = [140, 350, 180, 400]
+    exclude_boxes = [{
+        "bbox": obstacle_bbox,
+        "class_name": "obstacle",
+        "type": "positive",
+        "confidence": 0.90,
+    }]
+
+    res_excluded = detector.detect(frame, exclude_boxes=exclude_boxes)
+    roi_y_start = int(480 * detector.roi_y_min_frac)
+    mask = res_excluded.binary_mask
+    assert mask is not None
+    # Center of excluded bbox in ROI:
+    bx_center = 160
+    by_center_roi = 375 - roi_y_start
+    assert mask[by_center_roi, bx_center] == 0
+
+    # 2. Test Multi-Model priority stack: Tier 1 imminent obstacle override takes precedence
+    motor, serial_dev = create_mock_motor()
+    sensors = SensorManager(motor_controller=motor)
+    throttler = CommandThrottler()
+    state = SystemState()
+
+    imminent_det = [{
+        "class_name": "obstacle",
+        "bbox": [200, 100, 440, 360],  # Height = 260 / 480 = 54% (> 40% threshold)
+        "confidence": 0.85,
+        "type": "positive",
+    }]
+
+    pi_latched, action, res_lane = _run_lane(
+        motor=motor,
+        sensors=sensors,
+        lane_detector=detector,
+        detections=imminent_det,
+        us_blocked=False,
+        frame=frame,
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+        sys_state=state,
+    )
+
+    # Even with clean orange ribbons, obstacle override must engage PI_STOP
+    assert pi_latched is True
+    assert "PI_STOP" in action
+    assert "PI_STOP" in serial_dev.written_commands
+
+    # 3. Test corridor hazard bypass priority: left-zone obstacle commands PI_AVOID RIGHT
+    serial_dev.written_commands.clear()
+    state_bypass = SystemState()
+    corridor_det = [{
+        "class_name": "obstacle",
+        "bbox": [60, 220, 160, 340],  # Left zone -> bypass right
+        "confidence": 0.75,
+        "type": "positive",
+    }]
+
+    pi_latched2, action2, res_lane2 = _run_lane(
+        motor=motor,
+        sensors=sensors,
+        lane_detector=detector,
+        detections=corridor_det,
+        us_blocked=False,
+        frame=frame,
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+        sys_state=state_bypass,
+    )
+
+    assert "LANE BYPASS" in action2
+    assert "RIGHT" in action2
+    assert any("PI_AVOID RIGHT" in c for c in serial_dev.written_commands)
+
+
+def test_default_lane_color_mode_is_orange():
+    """
+    Verify that LANE_COLOR_MODE defaults to 'orange' in car/perception/config.py,
+    ChartLaneDetector() defaults to 'orange', and LANE_HSV_RANGES contains exact bounds
+    for all 4 ribbon colors.
+    """
+    import car.perception.config as cfg
+
+    # Requirement R2: LANE_COLOR_MODE = "orange"
+    assert cfg.LANE_COLOR_MODE == "orange"
+
+    # Detector default initialization matches config
+    detector = ChartLaneDetector()
+    assert detector.color_mode == "orange"
+
+    # Verify all four ribbon colors exist in LANE_HSV_RANGES with specified bounds
+    assert "orange" in cfg.LANE_HSV_RANGES
+    assert cfg.LANE_HSV_RANGES["orange"]["lower"] == [5, 120, 80]
+    assert cfg.LANE_HSV_RANGES["orange"]["upper"] == [22, 255, 255]
+
+    assert "brown" in cfg.LANE_HSV_RANGES
+    assert cfg.LANE_HSV_RANGES["brown"]["lower"] == [5, 60, 30]
+    assert cfg.LANE_HSV_RANGES["brown"]["upper"] == [20, 200, 160]
+
+    assert "green" in cfg.LANE_HSV_RANGES
+    assert cfg.LANE_HSV_RANGES["green"]["lower"] == [38, 70, 50]
+    assert cfg.LANE_HSV_RANGES["green"]["upper"] == [88, 255, 255]
+
+    assert "pink" in cfg.LANE_HSV_RANGES
+    assert cfg.LANE_HSV_RANGES["pink"]["lower"] == [140, 50, 100]
+    assert cfg.LANE_HSV_RANGES["pink"]["upper"] == [179, 255, 255]
+
+
+def test_web_api_set_lane_color_ribbons():
+    """
+    Verify DiagnosticHandler /set_lane_color endpoint accepts and applies
+    all 4 ribbon colors ('orange', 'brown', 'green', 'pink'), updates both SystemState
+    and ChartLaneDetector, and rejects invalid color modes with HTTP 400.
+    """
+    motor, _ = create_mock_motor()
+    sys_state = SystemState()
+    sys_state.motor = motor
+    detector = ChartLaneDetector(color_mode="dark")
+
+    class MockServer:
+        def __init__(self):
+            self.sys_state = sys_state
+            self.lane_detector = detector
+
+    server = MockServer()
+
+    # Verify switching to each of the 4 ribbon colors via GET request
+    for col in ["orange", "brown", "green", "pink"]:
+        handler = DiagnosticHandler.__new__(DiagnosticHandler)
+        handler.server = server
+        handler.wfile = io.BytesIO()
+        handler.send_response = lambda code: None
+        handler.send_header = lambda k, v: None
+        handler.end_headers = lambda: None
+        handler.path = f"/set_lane_color?color={col}"
+        handler.do_GET()
+
+        assert sys_state.lane_color_mode == col
+        assert detector.color_mode == col
+
+    # Verify invalid color mode rejection
+    status_codes = []
+    handler = DiagnosticHandler.__new__(DiagnosticHandler)
+    handler.server = server
+    handler.wfile = io.BytesIO()
+    handler.send_response = lambda code: status_codes.append(code)
+    handler.send_header = lambda k, v: None
+    handler.end_headers = lambda: None
+    handler.path = "/set_lane_color?color=purple"
+    handler.do_GET()
+
+    assert 400 in status_codes
+    assert detector.color_mode == "pink"  # State preserved
+
 

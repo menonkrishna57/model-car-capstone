@@ -33,6 +33,7 @@ from car.perception.config import (
     LANE_MAX_STEER_DEG,
     LANE_STEER_DEADBAND_DEG,
     LANE_COLOR_MODE,
+    LANE_HSV_RANGES,
 )
 
 
@@ -79,11 +80,13 @@ class LaneDetectionResult:
 def fit_poly_mad(y_norm: np.ndarray, x_norm: np.ndarray, frame_w: int) -> Optional[Tuple[np.ndarray, float, float, float]]:
     """
     Fits x = a*y^2 + b*y + c with iterative Median Absolute Deviation (MAD) outlier pruning.
-    Adapted from Capstone geometry pipeline.
+    Enforces curvature bound |a| <= 0.65 or falls back to robust 1st-order linear fit to prevent
+    parabolic boomerang curves on flat-floor tracks.
     """
     if len(x_norm) < 8 or not np.isfinite(x_norm).all() or not np.isfinite(y_norm).all():
         return None
-    if np.ptp(y_norm) < 0.12:  # Must span at least 12% vertical frame height
+    span_y = float(np.ptp(y_norm))
+    if span_y < 0.10:  # Must span at least 10% vertical frame height
         return None
 
     keep = np.ones(len(x_norm), dtype=bool)
@@ -106,8 +109,18 @@ def fit_poly_mad(y_norm: np.ndarray, x_norm: np.ndarray, frame_w: int) -> Option
     except (np.linalg.LinAlgError, ValueError):
         return None
 
+    # Curvature bounding: on ground ribbons, an unconstrained parabola can create
+    # unrealistic U-turns (|a| > 0.65) or diverge when vertical span is short.
+    # Fall back to 1st-order linear fit [0, m, k] if curvature exceeds physical turning limits.
+    if abs(c[0]) > 0.65 or span_y < 0.22:
+        try:
+            c1 = np.polyfit(y_norm[keep], x_norm[keep], 1)
+            c = np.array([0.0, c1[0], c1[1]])
+        except (np.linalg.LinAlgError, ValueError):
+            pass
+
     rms = float(np.sqrt(np.mean(((np.polyval(c, y_norm[keep]) - x_norm[keep]) * frame_w) ** 2)))
-    if rms > 0.06 * frame_w:  # Reject overly noisy fits
+    if rms > 0.08 * frame_w:  # Reject overly noisy fits
         return None
 
     return c, float(y_norm[keep].min()), float(y_norm[keep].max()), rms
@@ -152,6 +165,16 @@ class ChartLaneDetector:
         self.prev_center_coeffs: Optional[np.ndarray] = None
         self.lost_frames: int = 0
 
+        # A line fit can jump to a patch of floor/tape in one video frame.  It
+        # must not be allowed to reverse the drive command before the next
+        # frame corrects it.  These rows are deliberately in the visible road
+        # area rather than at y=1.0, where a quadratic fit may extrapolate.
+        self._history_y = np.array([
+            self.roi_y_min_frac + 0.08,
+            self.lookahead_y_frac,
+            0.88,
+        ])
+
     def reset(self):
         """Resets tracking memory and temporal filters."""
         self.prev_left_line = None
@@ -161,11 +184,40 @@ class ChartLaneDetector:
         self.lost_frames = 0
 
     def set_color_mode(self, mode: str):
-        """Switches lane line color preset (dark, yellow, blue, white)."""
-        valid = {"dark", "yellow", "blue", "white", "red"}
+        """Switches lane line color preset (ribbons: orange, brown, green, pink; legacy: dark, yellow, blue, white)."""
+        valid = {"dark", "yellow", "blue", "white", "orange", "brown", "green", "pink"}
         m = mode.lower().strip()
         if m in valid:
             self.color_mode = m
+
+    def _curve_jump(self, candidate: LaneCurve, previous: Optional[LaneCurve]) -> bool:
+        """Return True when a boundary moves implausibly far in one frame.
+
+        The camera runs substantially faster than the chassis can translate.
+        A displacement larger than ``max_jump_frac`` at several road rows is
+        therefore a detection outlier, not a turn the vehicle can have made.
+        This gate is especially important when the histogram briefly chooses
+        the opposite ribbon or a reflected patch of tape.
+        """
+        if previous is None:
+            return False
+        ys = self._history_y
+        displacement = np.abs(np.polyval(candidate.coefficients, ys) - np.polyval(previous.coefficients, ys))
+        return float(np.median(displacement)) > self.max_jump_frac
+
+    def _center_jump(self, candidate_coeffs: np.ndarray) -> bool:
+        """Return True when a new centreline would cause a control reversal."""
+        if self.prev_center_coeffs is None:
+            return False
+        ys = self._history_y
+        displacement = np.abs(np.polyval(candidate_coeffs, ys) - np.polyval(self.prev_center_coeffs, ys))
+        return float(np.median(displacement)) > self.max_jump_frac
+
+    def _valid_pair_geometry(self, left: LaneCurve, right: LaneCurve) -> bool:
+        """Validate ordering across the road, not only at one lookahead row."""
+        ys = np.linspace(self.roi_y_min_frac + 0.04, 0.94, 5)
+        widths = np.polyval(right.coefficients, ys) - np.polyval(left.coefficients, ys)
+        return bool(np.all(widths > 0.10) and np.all(widths < 0.95))
 
     def _extract_binary_mask(
         self,
@@ -216,11 +268,29 @@ class ChartLaneDetector:
             blur = cv2.GaussianBlur(gray, (5, 5), 0)
             _, mask = cv2.threshold(blur, 195, 255, cv2.THRESH_BINARY)
 
-        elif self.color_mode == "red":
+        elif self.color_mode == "orange":
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            mask1 = cv2.inRange(hsv, np.array([0, 70, 60]), np.array([10, 255, 255]))
-            mask2 = cv2.inRange(hsv, np.array([170, 70, 60]), np.array([180, 255, 255]))
-            mask = cv2.bitwise_or(mask1, mask2)
+            lower = np.array(LANE_HSV_RANGES.get("orange", {}).get("lower", [5, 120, 80]), dtype=np.uint8)
+            upper = np.array(LANE_HSV_RANGES.get("orange", {}).get("upper", [22, 255, 255]), dtype=np.uint8)
+            mask = cv2.inRange(hsv, lower, upper)
+
+        elif self.color_mode == "brown":
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            lower = np.array(LANE_HSV_RANGES.get("brown", {}).get("lower", [5, 60, 30]), dtype=np.uint8)
+            upper = np.array(LANE_HSV_RANGES.get("brown", {}).get("upper", [20, 200, 160]), dtype=np.uint8)
+            mask = cv2.inRange(hsv, lower, upper)
+
+        elif self.color_mode == "green":
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            lower = np.array(LANE_HSV_RANGES.get("green", {}).get("lower", [38, 70, 50]), dtype=np.uint8)
+            upper = np.array(LANE_HSV_RANGES.get("green", {}).get("upper", [88, 255, 255]), dtype=np.uint8)
+            mask = cv2.inRange(hsv, lower, upper)
+
+        elif self.color_mode == "pink":
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            lower = np.array(LANE_HSV_RANGES.get("pink", {}).get("lower", [140, 50, 100]), dtype=np.uint8)
+            upper = np.array(LANE_HSV_RANGES.get("pink", {}).get("upper", [179, 255, 255]), dtype=np.uint8)
+            mask = cv2.inRange(hsv, lower, upper)
 
         else:
             # Fallback to dark
@@ -230,6 +300,11 @@ class ChartLaneDetector:
         # Morphological opening removes small specks
         clean_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, clean_kernel)
+
+        # Morphological dilation for satin ribbons bridges specular voids & thickens tracks
+        if self.color_mode in ("orange", "brown", "green", "pink"):
+            dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask = cv2.dilate(mask, dilate_kernel, iterations=2)
 
         # ── Zero out active obstacle and pothole printout bounding boxes ────────
         if exclude_boxes:
@@ -290,8 +365,11 @@ class ChartLaneDetector:
         pruned_peaks.sort()
 
         expected_lane_w = int(self.learned_lane_width * frame_w)
-        prev_l = int(self.prev_left_line.x(1.0) * frame_w) if self.prev_left_line else None
-        prev_r = int(self.prev_right_line.x(1.0) * frame_w) if self.prev_right_line else None
+        # Use a measured road row for temporal matching.  Sampling at 1.0
+        # extrapolates beyond the fitted ribbon and is noticeably unstable on
+        # tight curves.
+        prev_l = int(self.prev_left_line.x(0.94) * frame_w) if self.prev_left_line else None
+        prev_r = int(self.prev_right_line.x(0.94) * frame_w) if self.prev_right_line else None
 
         left_base: Optional[int] = None
         right_base: Optional[int] = None
@@ -447,7 +525,9 @@ class ChartLaneDetector:
         if right_base is not None:
             right_line = self._sliding_window_tracking(mask, right_base, frame_w, frame_h, roi_y_start)
 
-        # Validate geometry if both lines are present
+        # Validate geometry if both lines are present.  A pair that crosses
+        # anywhere in the visible road is a bad association even if it happens
+        # to look plausible at the single lookahead row.
         if left_line is not None and right_line is not None:
             y_ref = self.lookahead_y_frac
             x_l = left_line.x(y_ref)
@@ -458,12 +538,22 @@ class ChartLaneDetector:
 
             w_meas = x_r - x_l
             # Check for sanity: right must be right of left, and separation reasonable
-            if w_meas <= 0.12 or w_meas >= 0.95:
+            if w_meas <= 0.12 or w_meas >= 0.95 or not self._valid_pair_geometry(left_line, right_line):
                 # One of the lines is invalid; keep the one with lower residual
                 if left_line.residual_px <= right_line.residual_px:
                     right_line = None
                 else:
                     left_line = None
+
+        # Reject one-frame boundary jumps before they can be used to construct
+        # a centreline.  Previously ``max_jump_frac`` was only used while
+        # assigning a *single* histogram peak, leaving the normal two-line
+        # path free to jump between ribbons and make the vehicle alternate
+        # left/right commands.
+        if left_line is not None and self._curve_jump(left_line, self.prev_left_line):
+            left_line = None
+        if right_line is not None and self._curve_jump(right_line, self.prev_right_line):
+            right_line = None
 
         # Disambiguate single-line identification on cold start via perspective convergence
         y_bot = 0.95
@@ -484,16 +574,41 @@ class ChartLaneDetector:
         center_coeffs = None
         y_look = self.lookahead_y_frac
 
+        # A side handoff has no same-side history for the newly visible line.
+        # Validate its reconstructed centreline against the last reliable
+        # centre before publishing it; otherwise a false SINGLE_RIGHT after a
+        # SINGLE_LEFT lock can still create a large opposite steering command.
+        if left_line is not None and right_line is None:
+            candidate_center = left_line.coefficients.copy()
+            candidate_center[2] += 0.5 * self.learned_lane_width
+            if self._center_jump(candidate_center):
+                left_line = None
+        elif right_line is not None and left_line is None:
+            candidate_center = right_line.coefficients.copy()
+            candidate_center[2] -= 0.5 * self.learned_lane_width
+            if self._center_jump(candidate_center):
+                right_line = None
+
+        if left_line is not None and right_line is not None:
+            # A rejected pair should fall through to the ordinary lost-frame
+            # coasting policy below, rather than publishing an abrupt target.
+            c_mid = 0.5 * (left_line.coefficients + right_line.coefficients)
+            if self._center_jump(c_mid):
+                left_line = None
+                right_line = None
+
         if left_line is not None and right_line is not None:
             status = "DUAL_LOCKED"
-            # Midpoint polynomial
             c_mid = 0.5 * (left_line.coefficients + right_line.coefficients)
             w_meas = right_line.x(y_look) - left_line.x(y_look)
             if 0.15 < w_meas < 0.85:
-                # Update learned lane width via EMA
+                # Update learned lane width only from a temporally valid
+                # dual-line lock, never from an inferred single line.
                 self.learned_lane_width = (1.0 - 0.20) * self.learned_lane_width + 0.20 * w_meas
 
-            # Smooth centerline coeffs with EMA
+            # Smooth centreline coefficients once association is known to
+            # be valid.  This filters camera quantisation without hiding
+            # the genuine gradual bend of the ribbon.
             if self.prev_center_coeffs is not None:
                 center_coeffs = self.ema_alpha * c_mid + (1.0 - self.ema_alpha) * self.prev_center_coeffs
             else:

@@ -55,7 +55,7 @@
 #define CLIFF_CAL_MAX_CM           60.0f  // Sanity check: maximum plausible ground baseline (cm)
 #define CLIFF_CAL_DELAY_MS         50     // Delay between calibration readings (ms)
 #define CLIFF_REVERSE_MS           400    // Reverse burst before latching (ms)
-#define CLIFF_REVERSE_SPEED        150    // PWM speed for cliff reverse burst (0–255)
+#define CLIFF_REVERSE_SPEED        185    // PWM speed for cliff reverse burst (0–255, calibrated >= 180)
 #define CLIFF_CONFIRM_COUNT        2      // Consecutive readings above threshold to confirm cliff
 #define CLIFF_ENABLE_DEFAULT       1      // 1 = cliff reflex enabled (table/drop-offs), 0 = disabled (floor driving)
 
@@ -65,9 +65,10 @@
 // Phase sequence: Reverse → Skid-turn → Resume forward
 // =============================================================================
 #define AVOID_REVERSE_MS         400     // Phase 1: Back away from obstacle (ms)
+#define AVOID_CORNER_REV_MAX_MS  1000    // Max reverse duration during dual obstacle / corner backup (ms)
 #define AVOID_TURN_MS            500     // Phase 2: Skid-steer turn away from obstacle (ms)
 #define AVOID_RESUME_MS          2000    // Phase 3: Drive forward on new heading (ms)
-#define AVOID_SPEED              150     // PWM speed used for phases 1 & 2 (0–255)
+#define AVOID_SPEED              200     // PWM speed used for phases 1 & 2 (0–255, calibrated >= 200)
 
 // =============================================================================
 // Avoidance Cooldown (prevents re-trigger during Phase 3 resume)

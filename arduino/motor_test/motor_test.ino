@@ -1,4 +1,4 @@
-﻿// --- Motor Pins (L298N) ---
+// --- Motor Pins (L298N) ---
 const int IN1 = 8;
 const int IN2 = 9;
 const int IN3 = 10;
@@ -10,7 +10,7 @@ const int ENB = 6;
 const int TRIG_PIN = 2; // Front Ultrasonic Trigger
 const int ECHO_PIN = 3; // Front Ultrasonic Echo
 
-bool isStopped = false; // Flag for manual stop from Serial Monitor
+bool isStopped = true; // Initialized in disarmed state at startup per Requirement R2
 
 void setup() {
   Serial.begin(115200);
@@ -23,19 +23,25 @@ void setup() {
   pinMode(ENA, OUTPUT);
   pinMode(ENB, OUTPUT);
 
+  // Initialize motors stopped with zero PWM
+  stopMotors();
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+
   // Ultrasonic pin modes
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
-  // Set motor speed (0-255)
-  analogWrite(ENA, 180);
-  analogWrite(ENB, 180);
-
-  Serial.println("==========================================");
-  Serial.println("Motor + Ultrasonic Safety Test Ready!");
-  Serial.println("Type 's' in Serial Monitor to STOP.");
-  Serial.println("Type 'g' in Serial Monitor to GO again.");
-  Serial.println("==========================================");
+  Serial.println(F("=========================================="));
+  Serial.println(F("Motor + Ultrasonic Safety Test Ready (DISARMED at startup)"));
+  Serial.println(F("Direction Inversion Applied:"));
+  Serial.println(F("  Forward: Right (IN1=LOW, IN2=HIGH), Left (IN3=LOW, IN4=HIGH)"));
+  Serial.println(F("  Reverse: Right (IN1=HIGH, IN2=LOW), Left (IN3=HIGH, IN4=LOW)"));
+  Serial.println(F("NOTICE FOR KRISHNA: Test on physical hardware with wheels elevated!"));
+  Serial.println(F("Type 'g' in Serial Monitor to ARM and DRIVE FORWARD (180 PWM)."));
+  Serial.println(F("Type 'r' in Serial Monitor to DRIVE REVERSE (180 PWM)."));
+  Serial.println(F("Type 's' in Serial Monitor to STOP / DISARM."));
+  Serial.println(F("=========================================="));
 }
 
 void loop() {
@@ -45,15 +51,26 @@ void loop() {
     if (cmd == 's' || cmd == 'S') {
       isStopped = true;
       stopMotors();
-      Serial.println("[MANUAL OVERRIDE] Motors STOPPED by user.");
+      analogWrite(ENA, 0);
+      analogWrite(ENB, 0);
+      Serial.println(F("[MANUAL OVERRIDE] Motors STOPPED / DISARMED by user."));
     } else if (cmd == 'g' || cmd == 'G') {
       isStopped = false;
-      Serial.println("[RESUME] Motors re-enabled.");
+      analogWrite(ENA, 180);
+      analogWrite(ENB, 180);
+      Serial.println(F("[RESUME] Motors ARMED / enabled at 180 PWM."));
+    } else if (cmd == 'r' || cmd == 'R') {
+      isStopped = false;
+      analogWrite(ENA, 180);
+      analogWrite(ENB, 180);
+      driveReverse();
+      Serial.println(F("[REVERSE] Driving REVERSE at 180 PWM."));
     }
   }
 
-  // If user manually stopped the car, do not spin motors
+  // If user manually stopped the car or car is disarmed, do not spin motors
   if (isStopped) {
+    stopMotors();
     delay(50);
     return;
   }
@@ -73,9 +90,9 @@ void loop() {
   if (distance > 0 && distance < 25) {
     // Obstacle detected! Auto-Brake
     stopMotors();
-    Serial.print("[OBSTACLE BLOCKED] Distance: ");
+    Serial.print(F("[OBSTACLE BLOCKED] Distance: "));
     Serial.print(distance);
-    Serial.println(" cm -> MOTORS STOPPED!");
+    Serial.println(F(" cm -> MOTORS STOPPED!"));
   } else {
     // Clear path: Drive forward
     driveForward();
@@ -85,6 +102,13 @@ void loop() {
 }
 
 void driveForward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void driveReverse() {
   digitalWrite(IN1, HIGH);
   digitalWrite(IN2, LOW);
   digitalWrite(IN3, HIGH);
