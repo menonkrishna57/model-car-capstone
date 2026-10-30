@@ -79,6 +79,7 @@ from car.perception.lane_detector import ChartLaneDetector, LaneCurve, LaneDetec
 from car.control.motor_controller import MotorController
 from car.control.navigation import NavigationSystem
 from car.control.pid import PID
+from car.control.corner_recovery import CornerRecoveryController
 
 # ── Architecture §6 Rule 2 — Bounding-box height thresholds ──────────────────
 BBOX_STOP_THRESHOLD = 0.40   # > 40% of frame height → PI_STOP
@@ -2253,6 +2254,7 @@ def _run_autonomous(
     motors_enabled: bool,
     throttler: CommandThrottler,
     fresh_inference: bool = True,
+    corner_recovery: Optional[CornerRecoveryController] = None,
 ) -> Tuple[bool, str]:
     """
     One loop iteration of autonomous navigation.
@@ -2306,8 +2308,8 @@ def _run_autonomous(
                     pi_latched = False
                     throttler.latch_start_time = 0.0
                     if motors_enabled:
-                        motor.turn(45, speed=165)
-                        throttler.record_turn(45, 165)
+                        motor.turn(45, speed=200)
+                        throttler.record_turn(45, 200)
                     return pi_latched, "🔀 ESCAPE: Pivoting RIGHT around obstacle"
                 elif (decision == "LEFT" or score_l < score_r) and (not is_valid_us(us_l) or us_l > 32.0):
                     print("🔀 Auto-Unstick: Left side clear, releasing latch and turning left")
@@ -2315,8 +2317,8 @@ def _run_autonomous(
                     pi_latched = False
                     throttler.latch_start_time = 0.0
                     if motors_enabled:
-                        motor.turn(-45, speed=165)
-                        throttler.record_turn(-45, 165)
+                        motor.turn(-45, speed=200)
+                        throttler.record_turn(-45, 200)
                     return pi_latched, "🔀 ESCAPE: Pivoting LEFT around obstacle"
 
             throttler.record_other("PI_STOPPED")
@@ -2360,7 +2362,22 @@ def _run_autonomous(
             pi_latched = True
             return pi_latched, "🛑 PI_STOPPED (Arduino Latched)"
 
-    # ── 5. Ultrasonic Critical Stop (< EMERGENCY_STOP_DISTANCE_CM) ───────────
+    # ── 5. Ultrasonic Critical Stop / Corner Recovery (< EMERGENCY_STOP_DISTANCE_CM) ──
+    us_l_val = us.get('left', 999.0)
+    us_r_val = us.get('right', 999.0)
+    if corner_recovery is not None:
+        if corner_recovery.is_recovering or corner_recovery.is_corner_collision(us_l_val, us_r_val):
+            recovering, recovery_action = corner_recovery.update(
+                us_left=us_l_val,
+                us_right=us_r_val,
+                motor=motor if motors_enabled else None
+            )
+            if recovering:
+                throttler.record_other("CORNER_RECOVERY")
+                if not motors_enabled:
+                    return pi_latched, f"⏸️ BENCH SAFE: {recovery_action} (Suppressed)"
+                return pi_latched, recovery_action
+
     if us_blocked:
         throttler.record_other("STOP")
         if motors_enabled:
@@ -2380,7 +2397,7 @@ def _run_autonomous(
 
         # Active skid-steer bypass turn when obstacle is detected ahead
         turn_angle = 35 if decision == "RIGHT" else -35
-        turn_speed = 160
+        turn_speed = 200
         if motors_enabled and throttler.should_send_turn(turn_angle, turn_speed):
             motor.turn(turn_angle, speed=turn_speed)
             throttler.record_turn(turn_angle, turn_speed)
@@ -2392,18 +2409,18 @@ def _run_autonomous(
         if throttler.should_send_avoid_hint("RIGHT"):
             motor.pi_avoid("RIGHT")
             throttler.record_avoid_hint("RIGHT")
-        if motors_enabled and throttler.should_send_turn(35, 160):
-            motor.turn(35, speed=160)
-            throttler.record_turn(35, 160)
+        if motors_enabled and throttler.should_send_turn(35, 200):
+            motor.turn(35, speed=200)
+            throttler.record_turn(35, 200)
             return pi_latched, f"🔀 US AVOID: Left Obs ({us_l:.0f}cm) -> Steering RIGHT"
 
     if is_valid_us(us_r) and us_r < 42.0 and (not is_valid_us(us_l) or us_r < us_l - 5.0):
         if throttler.should_send_avoid_hint("LEFT"):
             motor.pi_avoid("LEFT")
             throttler.record_avoid_hint("LEFT")
-        if motors_enabled and throttler.should_send_turn(-35, 160):
-            motor.turn(-35, speed=160)
-            throttler.record_turn(-35, 160)
+        if motors_enabled and throttler.should_send_turn(-35, 200):
+            motor.turn(-35, speed=200)
+            throttler.record_turn(-35, 200)
             return pi_latched, f"🔀 US AVOID: Right Obs ({us_r:.0f}cm) -> Steering LEFT"
 
     # ── 7. Forward Driving (Cruising or Cautionary) ───────────────────────────
@@ -2917,6 +2934,16 @@ def run_pipeline(
     sensors = SensorManager(motor_controller=motor)
     nav = NavigationSystem(controller=motor, sensors=sensors)
     throttler = CommandThrottler()
+    corner_recovery = CornerRecoveryController(
+        collision_threshold=EMERGENCY_STOP_DISTANCE_CM,
+        safe_threshold=EMERGENCY_STOP_DISTANCE_CM,
+        backup_speed=200,
+        turn_speed=200,
+        backup_timeout_s=1.0,
+        turn_duration_s=0.5,
+        turn_angle_deg=45,
+        motor=motor,
+    )
 
     # ── 3. Follow-me Components ──────────────────────────────────────────────
     tracker = ObjectTracker()
@@ -3122,6 +3149,7 @@ def run_pipeline(
                     motors_enabled=motors_en,
                     throttler=throttler,
                     fresh_inference=fresh_inference,
+                    corner_recovery=corner_recovery,
                 )
 
             # Sync state with shared container

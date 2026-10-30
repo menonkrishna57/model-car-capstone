@@ -114,6 +114,7 @@ AvoidPhase    avoidPhase          = AVOID_PHASE_REVERSE;
 unsigned long avoidPhaseStart     = 0;
 int           avoidTurnDir        = 1;    // +1 = turn right, -1 = turn left
 int           savedDriveSpeed     = 0;
+bool          avoidDualObstacle   = false;
 
 // PI_AVOID directional hint: +1 = right, -1 = left, 0 = none
 int           piAvoidHint         = 0;
@@ -350,6 +351,9 @@ const char* stateToString(CarState st) {
 void startAvoidance() {
   stopMotors();
 
+  // Check if both sensors detect an obstacle (corner / dual collision)
+  avoidDualObstacle = (usLeftDistance < tune.usObstacleDist && usRightDistance < tune.usObstacleDist);
+
   // Direction: Pi hint takes precedence; otherwise steer away from closer obstacle
   if (piAvoidHint != 0) {
     avoidTurnDir = piAvoidHint;
@@ -373,11 +377,33 @@ void tickAvoidance() {
   unsigned long elapsed = millis() - avoidPhaseStart;
 
   switch (avoidPhase) {
-    case AVOID_PHASE_REVERSE:
-      if (elapsed >= tune.avoidRevMs) {
+    case AVOID_PHASE_REVERSE: {
+      if (usLeftDistance < tune.usObstacleDist && usRightDistance < tune.usObstacleDist) {
+        avoidDualObstacle = true;
+      }
+
+      bool reverseDone = false;
+      if (avoidDualObstacle) {
+        // Dual obstacle / corner: early exit if both sensors clear to safe distance,
+        // or after AVOID_CORNER_REV_MAX_MS (1000ms).
+        if ((usLeftDistance >= tune.usObstacleDist && usRightDistance >= tune.usObstacleDist) ||
+            (elapsed >= AVOID_CORNER_REV_MAX_MS)) {
+          reverseDone = true;
+        }
+      } else {
+        if (elapsed >= tune.avoidRevMs) {
+          reverseDone = true;
+        }
+      }
+
+      if (reverseDone) {
         avoidPhase      = AVOID_PHASE_TURN;
         avoidPhaseStart = millis();
-        // Phase 2: Skid-turn
+        if (avoidDualObstacle) {
+          // Steer away towards side with greater clearance
+          avoidTurnDir = (usRightDistance >= usLeftDistance) ? 1 : -1;
+        }
+        // Phase 2: Skid-turn using tune.avoidSpeed (200 PWM)
         if (avoidTurnDir > 0) {
           setMotors(tune.avoidSpeed, -tune.avoidSpeed);  // Turn Right
         } else {
@@ -385,6 +411,7 @@ void tickAvoidance() {
         }
       }
       break;
+    }
 
     case AVOID_PHASE_TURN:
       if (elapsed >= tune.avoidTurnMs) {
@@ -399,6 +426,7 @@ void tickAvoidance() {
     case AVOID_PHASE_RESUME:
       if (elapsed >= tune.avoidResumeMs) {
         stopMotors();
+        avoidDualObstacle = false;
         avoidCooldownEnd = millis() + tune.avoidCooldownMs;
         Serial.println(F("[TELEM] DONE AVOID"));
         transitionTo(STATE_IDLE);
