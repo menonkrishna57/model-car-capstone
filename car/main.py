@@ -2277,6 +2277,9 @@ def _run_lane(
             return pi_latched, "🛑 PI_STOPPED (Arduino Latched)", lane_res
 
     # ── 4. Ultrasonic Critical Stop (< EMERGENCY_STOP_DISTANCE_CM) ───────────
+    us_l_val = us.get("left", 999.0)
+    us_r_val = us.get("right", 999.0)
+
     if us_blocked:
         # Check if one side has clear escape corridor
         valid_l = is_valid_us(us_l_val)
@@ -2290,14 +2293,14 @@ def _run_lane(
             if motors_enabled and throttler.should_send_turn(-35, 200):
                 motor.turn(-35, speed=200)
                 throttler.record_turn(-35, 200)
-            return pi_latched, f"🔀 US CRITICAL ESCAPE: Right Obs ({us_r_val:.0f}cm) -> Steering LEFT"
+            return pi_latched, f"🔀 US CRITICAL ESCAPE: Right Obs ({us_r_val:.0f}cm) -> Steering LEFT", lane_res
         elif right_clear and not left_clear:
             # Left side blocked (<25cm), Right side clear: steer RIGHT away from obstacle!
             throttler.record_avoid_hint("RIGHT")
             if motors_enabled and throttler.should_send_turn(35, 200):
                 motor.turn(35, speed=200)
                 throttler.record_turn(35, 200)
-            return pi_latched, f"🔀 US CRITICAL ESCAPE: Left Obs ({us_l_val:.0f}cm) -> Steering RIGHT"
+            return pi_latched, f"🔀 US CRITICAL ESCAPE: Left Obs ({us_l_val:.0f}cm) -> Steering RIGHT", lane_res
         else:
             throttler.record_other("STOP")
             if motors_enabled:
@@ -2308,7 +2311,7 @@ def _run_lane(
     # Check if there are active obstacles or potholes inside the driving corridor
     scores = compute_zone_scores(valid_detections, frame_w, frame_h, sonar=us)
     avoid_decision = decide_avoidance(scores)
-    us_l, us_r = us.get("left", 999.0), us.get("right", 999.0)
+    us_l, us_r = us_l_val, us_r_val
 
     if avoid_decision in ("LEFT", "RIGHT"):
         hint = avoid_decision
