@@ -379,7 +379,7 @@ class SystemState:
         self.lock = threading.Lock()
         self.motors_enabled: bool = False    # Requirement R2: Initialize disarmed by default
         self.emergency_stop: bool = False    # True = Operator safety emergency stop active
-        self.invert_motors: bool = False     # True = TT motor polarity inversion fix
+        self.invert_motors: bool = True      # True = TT motor polarity inversion fix (default: Inverted)
         self.active_action_label: str = "IDLE (Safety Hold)"
         self.current_awb: str = "daylight"
         self.swap_rb: bool = True            # Requirement R2: True = BGR color swap for Pi 5 CSI camera
@@ -730,9 +730,9 @@ PAGE = """<!DOCTYPE html>
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
         <span id="motors-badge-text">MOTORS: BENCH SAFE [OFF]</span>
       </div>
-      <div class="badge badge-invert-off" id="invert-badge" onclick="toggleInvertMotors()" style="cursor:pointer" title="Toggle Motor Polarity (I)">
+      <div class="badge badge-invert-on" id="invert-badge" onclick="toggleInvertMotors()" style="cursor:pointer" title="Toggle Motor Polarity (I)">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m17 2 4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3"/></svg>
-        <span id="invert-badge-text">POLARITY: NORMAL</span>
+        <span id="invert-badge-text">POLARITY: INVERTED (FWD FIX)</span>
       </div>
       <div class="badge badge-us" id="sonar-badge">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M2 12h4M18 12h4M8 8a6 6 0 0 1 8 0M6 5a10 10 0 0 1 12 0"/></svg>
@@ -785,9 +785,9 @@ PAGE = """<!DOCTYPE html>
 
     <div class="dock-divider"></div>
 
-    <button id="btn-invert" onclick="toggleInvertMotors()">
+    <button id="btn-invert" class="btn-active" onclick="toggleInvertMotors()">
       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m17 2 4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3"/></svg>
-      <span>Polarity: Normal (I)</span>
+      <span>Polarity: Inverted (I)</span>
     </button>
     <button id="btn-swap-rb" class="btn-active" onclick="toggleSwapRb()">
       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>
@@ -3039,7 +3039,7 @@ def run_pipeline(
     baud: int = 115200,
     web_port: int = 8080,
     bench_safe: bool = False,
-    invert_motors: bool = False,
+    invert_motors: bool = True,
     awb_mode: str = "daylight",
     enable_stream: bool = True,
     confidence_thresh: float = 0.4,
@@ -3423,9 +3423,17 @@ def main():
         help="Run in Safe Bench-Test mode (perception & stream active, motor commands suppressed).",
     )
     parser.add_argument(
+        "--no-invert-motors",
+        dest="invert_motors",
+        action="store_false",
+        default=True,
+        help="Disable inverted motor drive polarity (defaults to True for inverted chassis wiring).",
+    )
+    parser.add_argument(
         "--invert-motors",
+        dest="invert_motors",
         action="store_true",
-        help="Invert motor drive polarity (corrects reversed chassis TT motor wiring).",
+        help="Invert motor drive polarity (default: True).",
     )
     parser.add_argument(
         "--awb",
