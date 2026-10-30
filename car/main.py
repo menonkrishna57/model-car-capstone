@@ -1845,7 +1845,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                         sys_state.pi_latched = False
                         unlatch_needed = True
 
-            if unlatch_needed and sys_state.motor:
+            if can_drive and (unlatch_needed or (sys_state.motor and sys_state.motor.latest_state in ("PI_STOPPED", "STATE_PI_STOPPED", "CLIFF_STOPPED", "STATE_CLIFF_STOPPED"))) and sys_state.motor:
                 sys_state.motor.pi_go()
 
             if can_drive and sys_state.motor:
@@ -2246,10 +2246,31 @@ def _run_lane(
 
     # ── 4. Ultrasonic Critical Stop (< EMERGENCY_STOP_DISTANCE_CM) ───────────
     if us_blocked:
-        throttler.record_other("STOP")
-        if motors_enabled:
-            motor.stop()
-        return pi_latched, f"🛑 US AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)", lane_res
+        # Check if one side has clear escape corridor
+        valid_l = is_valid_us(us_l_val)
+        valid_r = is_valid_us(us_r_val)
+        left_clear = not valid_l or us_l_val >= EMERGENCY_STOP_DISTANCE_CM
+        right_clear = not valid_r or us_r_val >= EMERGENCY_STOP_DISTANCE_CM
+
+        if left_clear and not right_clear:
+            # Right side blocked (<25cm), Left side clear: steer LEFT away from obstacle!
+            throttler.record_avoid_hint("LEFT")
+            if motors_enabled and throttler.should_send_turn(-35, 200):
+                motor.turn(-35, speed=200)
+                throttler.record_turn(-35, 200)
+            return pi_latched, f"🔀 US CRITICAL ESCAPE: Right Obs ({us_r_val:.0f}cm) -> Steering LEFT"
+        elif right_clear and not left_clear:
+            # Left side blocked (<25cm), Right side clear: steer RIGHT away from obstacle!
+            throttler.record_avoid_hint("RIGHT")
+            if motors_enabled and throttler.should_send_turn(35, 200):
+                motor.turn(35, speed=200)
+                throttler.record_turn(35, 200)
+            return pi_latched, f"🔀 US CRITICAL ESCAPE: Left Obs ({us_l_val:.0f}cm) -> Steering RIGHT"
+        else:
+            throttler.record_other("STOP")
+            if motors_enabled:
+                motor.stop()
+            return pi_latched, f"🛑 US AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)", lane_res
 
     # ── 5. Tier 2.5: In-Lane Active Obstacle / Pothole Bypass ────────────────
     # Check if there are active obstacles or potholes inside the driving corridor
@@ -2414,7 +2435,7 @@ def _run_autonomous(
                 score_l, score_r = scores.get("left", 0.0), scores.get("right", 0.0)
 
                 # Prefer side with substantially lower danger / better clearance
-                if (decision == "RIGHT" or score_r < score_l) and (not is_valid_us(us_r) or us_r > 32.0):
+                if (decision == "RIGHT" or score_r < score_l) and (not is_valid_us(us_r) or us_r > us_l + 3.0 or us_r > 25.0):
                     print("🔀 Auto-Unstick: Right side clear, releasing latch and turning right")
                     motor.pi_go()
                     pi_latched = False
@@ -2423,7 +2444,7 @@ def _run_autonomous(
                         motor.turn(45, speed=200)
                         throttler.record_turn(45, 200)
                     return pi_latched, "🔀 ESCAPE: Pivoting RIGHT around obstacle"
-                elif (decision == "LEFT" or score_l < score_r) and (not is_valid_us(us_l) or us_l > 32.0):
+                elif (decision == "LEFT" or score_l < score_r) and (not is_valid_us(us_l) or us_l > us_r + 3.0 or us_l > 25.0):
                     print("🔀 Auto-Unstick: Left side clear, releasing latch and turning left")
                     motor.pi_go()
                     pi_latched = False
@@ -2482,7 +2503,8 @@ def _run_autonomous(
             recovering, recovery_action = corner_recovery.update(
                 us_left=us_l_val,
                 us_right=us_r_val,
-                motor=motor if motors_enabled else None
+                motor=motor,
+                enabled=motors_enabled,
             )
             if recovering:
                 throttler.record_other("CORNER_RECOVERY")
@@ -2491,10 +2513,31 @@ def _run_autonomous(
                 return pi_latched, recovery_action
 
     if us_blocked:
-        throttler.record_other("STOP")
-        if motors_enabled:
-            motor.stop()
-        return pi_latched, f"🛑 US AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)"
+        # Check if one side has clear escape corridor
+        valid_l = is_valid_us(us_l_val)
+        valid_r = is_valid_us(us_r_val)
+        left_clear = not valid_l or us_l_val >= EMERGENCY_STOP_DISTANCE_CM
+        right_clear = not valid_r or us_r_val >= EMERGENCY_STOP_DISTANCE_CM
+
+        if left_clear and not right_clear:
+            # Right side blocked (<25cm), Left side clear: steer LEFT away from obstacle!
+            throttler.record_avoid_hint("LEFT")
+            if motors_enabled and throttler.should_send_turn(-35, 200):
+                motor.turn(-35, speed=200)
+                throttler.record_turn(-35, 200)
+            return pi_latched, f"🔀 US CRITICAL ESCAPE: Right Obstacle ({us_r_val:.0f}cm) -> Steering LEFT"
+        elif right_clear and not left_clear:
+            # Left side blocked (<25cm), Right side clear: steer RIGHT away from obstacle!
+            throttler.record_avoid_hint("RIGHT")
+            if motors_enabled and throttler.should_send_turn(35, 200):
+                motor.turn(35, speed=200)
+                throttler.record_turn(35, 200)
+            return pi_latched, f"🔀 US CRITICAL ESCAPE: Left Obstacle ({us_l_val:.0f}cm) -> Steering RIGHT"
+        else:
+            throttler.record_other("STOP")
+            if motors_enabled:
+                motor.stop()
+            return pi_latched, f"🛑 US AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)"
 
     # ── 6. Active Obstacle Avoidance & Steering ──────────────────────────────
     scores = compute_zone_scores(valid_detections, frame_w, frame_h, sonar=us)
@@ -3040,6 +3083,7 @@ def run_pipeline(
             time.sleep(0.05)
         # Configure Arduino runtime defaults per PROTOCOL.md
         motor._send("TUNE SET TELEM_STREAM 1")
+        motor._send("TUNE SET CLIFF_ENABLE 0")
         motor.pi_go()
         motor.status()
 
@@ -3054,6 +3098,7 @@ def run_pipeline(
         backup_timeout_s=1.0,
         turn_duration_s=0.5,
         turn_angle_deg=45,
+        confirm_count=2,
         motor=motor,
     )
 
@@ -3205,21 +3250,22 @@ def run_pipeline(
                 # Ensure autonomous obstacle latch is cleared when operating in manual mode (unless in emergency stop)
                 with system_state.lock:
                     e_stop = system_state.emergency_stop
-                if pi_latched and not e_stop:
-                    pi_latched = False
-                    if motor.latest_state in ("PI_STOPPED", "STATE_PI_STOPPED"):
+                    man_act = system_state.manual_action
+                    man_spd = system_state.manual_speed
+                if not e_stop:
+                    if pi_latched:
+                        pi_latched = False
+                    if motor.latest_state in ("PI_STOPPED", "STATE_PI_STOPPED", "CLIFF_STOPPED", "STATE_CLIFF_STOPPED"):
                         motor.pi_go()
 
                 # Manual control mode: vehicle is controlled via Web UI / D-Pad
-                # Safety auto-brake: if front US is blocked and not overridden, stop!
-                if us_blocked and not override_obs:
+                # Safety auto-brake: ONLY if vehicle is driving FORWARD into an obstacle!
+                # Reversing away or turning away from an obstacle must NEVER be auto-braked!
+                if us_blocked and not override_obs and man_act in ("FORWARD", "FWD"):
                     if motors_en:
                         motor.stop()
                     action_label = f"🛑 MANUAL AUTO-BRAKE (L:{us.get('left', 999):.0f}cm R:{us.get('right', 999):.0f}cm)"
                 else:
-                    with system_state.lock:
-                        man_act = system_state.manual_action
-                        man_spd = system_state.manual_speed
                     action_label = f"🎮 MANUAL REMOTE: {man_act} (PWM {man_spd})"
             elif current_ctrl_mode == "lane":
                 pi_latched, action_label, lane_res = _run_lane(

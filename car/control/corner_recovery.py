@@ -5,12 +5,15 @@ Implements Requirement 2:
 When both ultrasonic sensors report an obstacle collision (such as when trapped in a corner),
 the car reverses until both sensors report that it is safe or 1.0s has elapsed, and then
 performs a turn maneuver away from the corner before resuming forward navigation.
+Includes multi-ping confirmation to suppress spurious ultrasonic noise spikes.
 """
 
 from enum import Enum
 import math
 import time
 from typing import Any, Optional, Tuple
+
+_SENTINEL = object()
 
 
 class RecoveryState(str, Enum):
@@ -52,6 +55,7 @@ class CornerRecoveryController:
         backup_timeout_s: float = 1.0,
         turn_duration_s: float = 0.5,
         turn_angle_deg: int = 45,
+        confirm_count: int = 1,
         motor: Any = None,
     ):
         self.collision_threshold = float(collision_threshold)
@@ -61,9 +65,11 @@ class CornerRecoveryController:
         self.backup_timeout_s = float(backup_timeout_s)
         self.turn_duration_s = float(turn_duration_s)
         self.turn_angle_deg = int(turn_angle_deg)
+        self.confirm_count = max(1, int(confirm_count))
         self.motor = motor
 
         self._state: RecoveryState = RecoveryState.IDLE
+        self._collision_counter: int = 0
         self.start_time: Optional[float] = None
         self.turn_start_time: Optional[float] = None
         self.last_turn_angle: int = 0
@@ -90,8 +96,9 @@ class CornerRecoveryController:
         return us_left <= self.collision_threshold and us_right <= self.collision_threshold
 
     def reset(self) -> None:
-        """Resets controller state to IDLE and clears timers."""
+        """Resets controller state to IDLE and clears timers and collision counter."""
         self._state = RecoveryState.IDLE
+        self._collision_counter = 0
         self.start_time = None
         self.turn_start_time = None
 
@@ -104,7 +111,8 @@ class CornerRecoveryController:
         self,
         us_left: Any,
         us_right: Any,
-        motor: Any = None,
+        motor: Any = _SENTINEL,
+        enabled: bool = True,
         current_time: Optional[float] = None,
     ) -> Tuple[bool, str]:
         """
@@ -114,6 +122,7 @@ class CornerRecoveryController:
             us_left: Distance reading from front-left ultrasonic sensor (cm).
             us_right: Distance reading from front-right ultrasonic sensor (cm).
             motor: Optional MotorController instance (defaults to self.motor).
+            enabled: If False, suppresses motor actuation (bench-safe).
             current_time: Optional monotonic timestamp (defaults to time.monotonic()).
 
         Returns:
@@ -122,8 +131,10 @@ class CornerRecoveryController:
         """
         if current_time is None:
             current_time = time.monotonic()
-        if motor is None:
+        if motor is _SENTINEL:
             motor = self.motor
+        if not enabled:
+            motor = None
 
         valid_l = is_valid_us(us_left)
         valid_r = is_valid_us(us_right)
@@ -135,13 +146,19 @@ class CornerRecoveryController:
         # ── State 1: IDLE ────────────────────────────────────────────────────
         if self._state == RecoveryState.IDLE:
             if self.is_corner_collision(us_left, us_right):
-                # Dual obstacle collision detected! Initiate reverse backup.
-                self._state = RecoveryState.BACKUP
-                self.start_time = current_time
-                if motor is not None and hasattr(motor, "reverse"):
-                    motor.reverse(speed=self.backup_speed, duration_ms=int(self.backup_timeout_s * 1000))
-                return True, f"🔄 CORNER BACKUP (L:{float(us_left):.1f}cm R:{float(us_right):.1f}cm)"
-            return False, "IDLE"
+                self._collision_counter += 1
+                if self._collision_counter >= self.confirm_count:
+                    # Confirmed dual obstacle collision detected! Initiate reverse backup.
+                    self._collision_counter = 0
+                    self._state = RecoveryState.BACKUP
+                    self.start_time = current_time
+                    if enabled and motor is not None and hasattr(motor, "reverse"):
+                        motor.reverse(speed=self.backup_speed, duration_ms=int(self.backup_timeout_s * 1000))
+                    return True, f"🔄 CORNER BACKUP (L:{float(us_left):.1f}cm R:{float(us_right):.1f}cm)"
+                return False, f"IDLE (Corner confirming {self._collision_counter}/{self.confirm_count})"
+            else:
+                self._collision_counter = 0
+                return False, "IDLE"
 
         # ── State 2: BACKUP ──────────────────────────────────────────────────
         if self._state == RecoveryState.BACKUP:
@@ -170,7 +187,7 @@ class CornerRecoveryController:
                 turn_angle = self.turn_angle_deg if clear_r >= clear_l else -self.turn_angle_deg
                 self.last_turn_angle = turn_angle
 
-                if motor is not None and hasattr(motor, "turn"):
+                if enabled and motor is not None and hasattr(motor, "turn"):
                     motor.turn(turn_angle, speed=self.turn_speed)
 
                 reason = "CLEARED" if both_cleared else f"TIMEOUT {elapsed:.2f}s"

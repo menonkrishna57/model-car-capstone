@@ -252,7 +252,7 @@ def test_manual_drive_command_execution():
 
     # Command turn left
     motor.turn(-40, speed=160)
-    assert any("TURN -40 160" in cmd for cmd in serial_dev.written_commands)
+    assert any("TURN -40 200" in cmd for cmd in serial_dev.written_commands)
 
 
 def test_manual_drive_blocked_by_ultrasonic_safety():

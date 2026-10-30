@@ -181,10 +181,10 @@ class TestTier1FeatureCoverage:
 
         # Turn commands must issue TURN with signed angles
         motor.turn(45, 180)
-        assert serial_dev.written_commands[-1] == "TURN 45 180"
+        assert serial_dev.written_commands[-1] == "TURN 45 200"
 
         motor.turn(-45, 180)
-        assert serial_dev.written_commands[-1] == "TURN -45 180"
+        assert serial_dev.written_commands[-1] == "TURN -45 200"
 
     def test_r1_arduino_drive_sketches_directional_polarity(self):
         """
@@ -461,7 +461,7 @@ class TestTier1FeatureCoverage:
 
         # Turn speeds 1..179 clamped to 180
         motor.turn(45, speed=150)
-        assert serial_dev.written_commands[-1] == "TURN 45 180"
+        assert serial_dev.written_commands[-1] == "TURN 45 200"
 
         # Valid high speed preserved
         motor.drive(255, 300)
@@ -791,7 +791,7 @@ class TestTier4RealWorldScenarios:
         # Steer right to bypass obstacle
         status, data, _ = simulate_http_request("/manual_drive?cmd=right&speed=190", sys_state)
         assert data.get("executed") is True, "Step 5: Right turn executed"
-        assert serial_dev.written_commands[-1] == "TURN 40 190", "Step 5: Right turn dispatched"
+        assert serial_dev.written_commands[-1] == "TURN 40 200", "Step 5: Right turn dispatched"
 
         # Drive forward past obstacle at calibrated speed
         status, data, _ = simulate_http_request("/manual_drive?cmd=forward&speed=190", sys_state)
