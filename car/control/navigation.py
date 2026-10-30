@@ -64,7 +64,7 @@ class NavigationSystem:
 
         # ── Step 1: Turn to target heading ────────────────────────────────────
         if abs(target_heading_deg) > 5.0:
-            self.controller.turn(int(target_heading_deg), speed=160)
+            self.controller.turn(int(target_heading_deg), speed=180)
             # Wait for the Arduino to complete the turn
             # Duration estimate: TURN_MS_PER_DEGREE is 10ms on the Arduino (uncalibrated)
             turn_wait_s = abs(target_heading_deg) * 0.012 + 0.2  # small margin

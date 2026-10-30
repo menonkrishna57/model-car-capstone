@@ -1,4 +1,4 @@
-﻿// =============================================================================
+// =============================================================================
 // 4WD SKID-STEER OBSTACLE AVOIDANCE (VERIFIED HARDWARE CONFIG)
 // - Left Sensor : Trig = Pin 7,  Echo = Pin 13
 // - Right Sensor: Trig = Pin 12, Echo = Pin 4
@@ -22,12 +22,12 @@
 #define IN4 11
 
 // ---------- Tuning ----------
-const bool          INVERT_DIR      = true;   // Corrects reversed motor wiring
+const bool          INVERT_DIR      = false;  // Corrected native motor wiring
 const bool          SWAP_SIDES      = false;  // true if left/right sides swapped
 const unsigned int  OBSTACLE_CM     = 25;     // Detection threshold (cm)
-const uint8_t       SPEED_FORWARD   = 200;    // Forward torque
-const uint8_t       SPEED_TURN      = 210;    // Pivot turn torque
-const uint8_t       SPEED_REVERSE   = 190;    // Backing up torque
+const uint8_t       SPEED_FORWARD   = 200;    // Forward torque (>= 180)
+const uint8_t       SPEED_TURN      = 210;    // Pivot turn torque (>= 180)
+const uint8_t       SPEED_REVERSE   = 190;    // Backing up torque (>= 180)
 const unsigned long LOOP_MS         = 60;     // Sensor loop interval
 const unsigned long REVERSE_MS      = 400;    // Backup duration (ms)
 const unsigned long BOTH_TURN_MS    = 450;    // Turn duration after backup (ms)
@@ -35,31 +35,49 @@ const unsigned long SENSOR_TIMEOUT  = 25000;  // 25ms timeout (~4m)
 const uint8_t       CONFIRM_READS   = 2;      // Debounce noisy readings
 
 uint8_t leftHits = 0, rightHits = 0;
-bool isStopped = false;
+bool isStopped = true; // Initialized in disarmed state at startup per Requirement R2
 
 // ---------- Low-level motor control ----------
+// Channel A: Right Motor (ENA=5, IN1=8, IN2=9). Forward: IN1=LOW, IN2=HIGH; Reverse: IN1=HIGH, IN2=LOW
 void driveA(int s) {
   if (INVERT_DIR) s = -s;
-  digitalWrite(IN1, s > 0 ? HIGH : LOW);
-  digitalWrite(IN2, s < 0 ? HIGH : LOW);
+  if (s > 0) {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+  } else if (s < 0) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+  } else {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+  }
   analogWrite(ENA, abs(s));
 }
 
+// Channel B: Left Motor (ENB=6, IN3=10, IN4=11). Forward: IN3=LOW, IN4=HIGH; Reverse: IN3=HIGH, IN4=LOW
 void driveB(int s) {
   if (INVERT_DIR) s = -s;
-  digitalWrite(IN3, s > 0 ? HIGH : LOW);
-  digitalWrite(IN4, s < 0 ? HIGH : LOW);
+  if (s > 0) {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+  } else if (s < 0) {
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+  } else {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+  }
   analogWrite(ENB, abs(s));
 }
 
 void setLeft(int speed) {
   int s = constrain(speed, -255, 255);
-  if (SWAP_SIDES) { driveB(s); } else { driveA(s); }
+  if (SWAP_SIDES) { driveA(s); } else { driveB(s); }
 }
 
 void setRight(int speed) {
   int s = constrain(speed, -255, 255);
-  if (SWAP_SIDES) { driveA(s); } else { driveB(s); }
+  if (SWAP_SIDES) { driveB(s); } else { driveA(s); }
 }
 
 // ---------- Movements ----------
@@ -95,8 +113,10 @@ void setup() {
   delay(500);
 
   Serial.println("\n=======================================================");
-  Serial.println("  OBSTACLE AVOIDANCE SYSTEM READY");
-  Serial.println("  Type 's' to STOP, 'g' to GO");
+  Serial.println("  OBSTACLE AVOIDANCE SYSTEM READY (DISARMED at startup)");
+  Serial.println("  Polarity: Forward is Left(IN3=L, IN4=H), Right(IN1=L, IN2=H)");
+  Serial.println("  NOTICE FOR KRISHNA: Elevate wheels before testing!");
+  Serial.println("  Type 'g' to ARM and GO, 's' to STOP / DISARM");
   Serial.println("=======================================================");
 }
 

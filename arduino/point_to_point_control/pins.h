@@ -10,7 +10,7 @@
  *   - Left US:  Trig=D7,  Echo=D13 (LED flicker cosmetic)
  *   - Right US: Trig=D12, Echo=D4
  *   - D2, D3: Physically empty / reserved for encoders/interrupts
- *   - INVERT_MOTOR_POLARITY = true (corrects TT motor chassis wiring)
+ *   - Native forward polarity: Right (IN1=LOW, IN2=HIGH), Left (IN3=LOW, IN4=HIGH)
  */
 
 #ifndef CAR_PINS_H
@@ -37,7 +37,8 @@ const int PIN_IN3 = PIN_LEFT_IN1;
 const int PIN_IN4 = PIN_LEFT_IN2;
 
 // Motor Polarity Configuration
-const bool INVERT_MOTOR_POLARITY = true;
+// Set to false: forward native polarity is Right (IN1=LOW, IN2=HIGH), Left (IN3=LOW, IN4=HIGH)
+const bool INVERT_MOTOR_POLARITY = false;
 
 // =============================================================================
 // Ultrasonic Sensors — 2× HC-SR04P, both front-facing

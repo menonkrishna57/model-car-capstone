@@ -1,4 +1,4 @@
-﻿#ifndef PINS_H
+#ifndef PINS_H
 #define PINS_H
 
 // --- Verified Working Hardware Pinout (October 2026) ---
@@ -21,6 +21,7 @@
 #define PIN_MOTOR_IN4       11
 
 // Motor Polarity Configuration
-#define INVERT_MOTOR_POLARITY true
+// Set to false: forward native polarity is Right (IN1=LOW, IN2=HIGH), Left (IN3=LOW, IN4=HIGH)
+#define INVERT_MOTOR_POLARITY false
 
 #endif // PINS_H

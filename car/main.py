@@ -86,15 +86,15 @@ BBOX_SLOW_THRESHOLD = 0.15   # 15–40% → caution / reduce PWM
 
 # Cruise and slow PWM values (0–255)
 CRUISE_SPEED = 180
-SLOW_SPEED   = 120
+SLOW_SPEED   = 180
 
 # ── Follow-me speed modulation (bbox height vs frame height) ─────────────────
 FOLLOW_TOO_CLOSE    = 0.50   # > 50% → stop / hold
 FOLLOW_IDEAL_MIN    = 0.25   # 25–50% → cruise
 FOLLOW_GETTING_FAR  = 0.10   # 10–25% → speed up
-FOLLOW_CRUISE_SPEED = 160
+FOLLOW_CRUISE_SPEED = 185
 FOLLOW_FAST_SPEED   = 200
-FOLLOW_SLOW_SPEED   = 80
+FOLLOW_SLOW_SPEED   = 180
 
 # ── Command Throttling & Cadence ─────────────────────────────────────────────
 # Prevents flooding the ATmega328P 115200 baud serial rx buffer.
@@ -297,7 +297,8 @@ class SystemState:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.motors_enabled: bool = True     # False = Bench-test safe mode (no physical drive)
+        self.motors_enabled: bool = False    # Requirement R2: Initialize disarmed by default
+        self.emergency_stop: bool = False    # True = Operator safety emergency stop active
         self.invert_motors: bool = False     # True = TT motor polarity inversion fix
         self.active_action_label: str = "IDLE (Safety Hold)"
         self.current_awb: str = "daylight"
@@ -305,7 +306,7 @@ class SystemState:
         self.current_mode: str = "autonomous"
         self.control_mode: str = "autonomous"  # "autonomous" or "manual"
         self.manual_override_obstacles: bool = False  # True = Ignore camera/ultrasonic obstacle stops in manual mode
-        self.manual_speed: int = 185           # Manual drive PWM (130, 185, 235)
+        self.manual_speed: int = 185           # Manual drive PWM (180, 205, 235)
         self.manual_action: str = "IDLE"       # Current manual remote action
         self.pi_latched: bool = False
         self.fps: float = 0.0
@@ -645,9 +646,9 @@ PAGE = """<!DOCTYPE html>
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
         <span id="awb-badge-text">AWB: DAYLIGHT</span>
       </div>
-      <div class="badge badge-motors-on" id="motors-badge" onclick="toggleMotors()" style="cursor:pointer" title="Toggle Motor Power (M)">
+      <div class="badge badge-motors-off" id="motors-badge" onclick="toggleMotors()" style="cursor:pointer" title="Toggle Motor Power (M)">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-        <span id="motors-badge-text">MOTORS: ACTIVE [ON]</span>
+        <span id="motors-badge-text">MOTORS: BENCH SAFE [OFF]</span>
       </div>
       <div class="badge badge-invert-off" id="invert-badge" onclick="toggleInvertMotors()" style="cursor:pointer" title="Toggle Motor Polarity (I)">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m17 2 4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3"/></svg>
@@ -665,9 +666,9 @@ PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="controls-dock" id="dock">
-    <button id="btn-motors" class="btn-success" onclick="toggleMotors()">
+    <button id="btn-motors" class="btn-danger" onclick="toggleMotors()">
       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-      <span>Disable Motors (M)</span>
+      <span>Enable Motors (M)</span>
     </button>
     <button id="btn-mode" onclick="toggleControlMode()">
       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 15h3M1 9h3M1 15h3"/></svg>
@@ -770,8 +771,8 @@ PAGE = """<!DOCTYPE html>
         Remote Control
       </span>
       <div class="speed-pills">
-        <button class="btn-speed" onclick="setSpeed(130)" id="spd-130">130</button>
-        <button class="btn-speed active" onclick="setSpeed(185)" id="spd-185">185</button>
+        <button class="btn-speed active" onclick="setSpeed(180)" id="spd-180">180</button>
+        <button class="btn-speed" onclick="setSpeed(205)" id="spd-205">205</button>
         <button class="btn-speed" onclick="setSpeed(235)" id="spd-235">235</button>
       </div>
     </div>
@@ -979,7 +980,7 @@ PAGE = """<!DOCTYPE html>
     function setSpeed(spd) {
       fetch('/set_speed?speed=' + spd).then(r => r.json()).then(d => {
         currentSpeed = d.manual_speed;
-        [130, 185, 235].forEach(s => {
+        [180, 205, 235].forEach(s => {
           const b = document.getElementById('spd-' + s);
           if (b) b.className = (s === currentSpeed) ? 'btn-speed active' : 'btn-speed';
         });
@@ -1284,8 +1285,8 @@ PAGE = """<!DOCTYPE html>
 
       const isManual = (currentControlMode === 'manual' || typeof currentControlMode === 'undefined');
       if (isManual) {
-        if (k === '1') setSpeed(130);
-        if (k === '2') setSpeed(185);
+        if (k === '1') setSpeed(180);
+        if (k === '2') setSpeed(205);
         if (k === '3') setSpeed(235);
 
         const moveKey = getMovementKey(e);
@@ -1498,6 +1499,8 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
             with sys_state.lock:
                 sys_state.motors_enabled = not sys_state.motors_enabled
                 enabled = sys_state.motors_enabled
+                if enabled:
+                    sys_state.emergency_stop = False
             if not enabled and sys_state.motor:
                 sys_state.motor.stop()
             print(f"🚗 Motors toggled: {'ENABLED' if enabled else 'BENCH SAFE (DISABLED)'}")
@@ -1525,12 +1528,13 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
         elif path == '/emergency_stop':
             with sys_state.lock:
                 sys_state.motors_enabled = False
+                sys_state.emergency_stop = True
                 sys_state.pi_latched = True
             if sys_state.motor:
                 sys_state.motor.stop()
                 sys_state.motor.pi_stop()
             print("🛑 Emergency Stop triggered via Web UI!")
-            resp = json.dumps({"status": "ok", "motors_enabled": False, "pi_latched": True}).encode('utf-8')
+            resp = json.dumps({"status": "ok", "motors_enabled": False, "pi_latched": True, "emergency_stop": True}).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(resp)))
@@ -1540,6 +1544,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
         elif path == '/release_latch':
             with sys_state.lock:
                 sys_state.pi_latched = False
+                sys_state.emergency_stop = False
             if sys_state.motor:
                 sys_state.motor.pi_go()
             print("✅ Latch release (PI_GO) triggered via Web UI!")
@@ -1573,7 +1578,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
             with sys_state.lock:
                 can_drive = sys_state.motors_enabled and not sys_state.pi_latched
             if can_drive and sys_state.motor:
-                sys_state.motor.turn(angle, speed=150)
+                sys_state.motor.turn(angle, speed=180)
                 executed = True
             resp = json.dumps({"status": "ok", "executed": executed, "angle": angle}).encode('utf-8')
             self.send_response(200)
@@ -1583,6 +1588,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(resp)
 
         elif path == '/toggle_control_mode':
+            send_pi_go = False
             with sys_state.lock:
                 # Cycle: autonomous -> lane -> follow -> manual -> autonomous
                 if sys_state.control_mode == "autonomous":
@@ -1596,11 +1602,16 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                 elif sys_state.control_mode == "follow":
                     sys_state.control_mode = "manual"
                     sys_state.current_mode = "manual"
+                    if not sys_state.emergency_stop:
+                        sys_state.pi_latched = False
+                        send_pi_go = True
                 else:
                     sys_state.control_mode = "autonomous"
                     sys_state.current_mode = "autonomous"
                 mode_now = sys_state.control_mode
             if mode_now == "manual" and sys_state.motor:
+                if send_pi_go:
+                    sys_state.motor.pi_go()
                 sys_state.motor.stop()
             print(f"🎮 Control mode toggled: {mode_now.upper()}")
             resp = json.dumps({"status": "ok", "control_mode": mode_now, "mode": mode_now}).encode('utf-8')
@@ -1612,10 +1623,14 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == '/set_mode':
             new_mode = query.get('mode', ['autonomous'])[0].lower().strip()
+            send_pi_go = False
             with sys_state.lock:
                 if new_mode == "manual":
                     sys_state.control_mode = "manual"
                     sys_state.current_mode = "manual"
+                    if not sys_state.emergency_stop:
+                        sys_state.pi_latched = False
+                        send_pi_go = True
                 elif new_mode in ("autonomous", "lane", "follow"):
                     sys_state.control_mode = new_mode
                     sys_state.current_mode = new_mode
@@ -1623,6 +1638,8 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                         sys_state.follow_state = "WAIT_CALIBRATION"
                 mode_now = sys_state.control_mode
             if mode_now == "manual" and sys_state.motor:
+                if send_pi_go:
+                    sys_state.motor.pi_go()
                 sys_state.motor.stop()
             print(f"🔄 Mode switched to: {mode_now.upper()}")
             resp = json.dumps({"status": "ok", "mode": mode_now, "control_mode": mode_now}).encode('utf-8')
@@ -1701,7 +1718,7 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                 spd = int(query.get('speed', [185])[0])
             except (ValueError, TypeError):
                 spd = 185
-            spd = max(80, min(255, spd))
+            spd = max(180, min(255, spd))
             with sys_state.lock:
                 sys_state.manual_speed = spd
             resp = json.dumps({"status": "ok", "manual_speed": spd}).encode('utf-8')
@@ -1717,15 +1734,31 @@ class DiagnosticHandler(http.server.BaseHTTPRequestHandler):
                 spd = int(query.get('speed', [sys_state.manual_speed])[0]) if 'speed' in query else sys_state.manual_speed
             except (ValueError, TypeError):
                 spd = sys_state.manual_speed
+            if 0 < spd < 180:
+                spd = 180
             spd = max(0, min(255, spd))
             executed = False
             blocked = False
             reason = "ok"
+            unlatch_needed = False
 
             with sys_state.lock:
-                override = sys_state.manual_override_obstacles
-                can_drive = sys_state.motors_enabled and (override or not sys_state.pi_latched)
                 sys_state.control_mode = "manual"
+                override = sys_state.manual_override_obstacles
+                if sys_state.emergency_stop:
+                    can_drive = False
+                    reason = "EMERGENCY_STOP"
+                elif not sys_state.motors_enabled:
+                    can_drive = False
+                    reason = "MOTORS_DISABLED"
+                else:
+                    can_drive = True
+                    if sys_state.pi_latched:
+                        sys_state.pi_latched = False
+                        unlatch_needed = True
+
+            if unlatch_needed and sys_state.motor:
+                sys_state.motor.pi_go()
 
             if can_drive and sys_state.motor:
                 sonar = sys_state.motor.latest_sonar
@@ -2847,7 +2880,8 @@ def run_pipeline(
     system_state = SystemState()
     system_state.current_mode = mode
     system_state.control_mode = mode
-    system_state.motors_enabled = not bench_safe
+    # Requirement R2: Preserve disarmed startup state (motors remain disabled until explicit user command)
+    system_state.motors_enabled = False
     system_state.invert_motors = invert_motors
     system_state.current_awb = awb_mode
 
@@ -3028,6 +3062,14 @@ def run_pipeline(
                 motors_en = system_state.motors_enabled
 
             if current_ctrl_mode == "manual":
+                # Ensure autonomous obstacle latch is cleared when operating in manual mode (unless in emergency stop)
+                with system_state.lock:
+                    e_stop = system_state.emergency_stop
+                if pi_latched and not e_stop:
+                    pi_latched = False
+                    if motor.latest_state in ("PI_STOPPED", "STATE_PI_STOPPED"):
+                        motor.pi_go()
+
                 # Manual control mode: vehicle is controlled via Web UI / D-Pad
                 # Safety auto-brake: if front US is blocked and not overridden, stop!
                 if us_blocked and not override_obs:
