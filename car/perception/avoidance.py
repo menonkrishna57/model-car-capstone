@@ -29,6 +29,7 @@ HUMAN_WEIGHT = 1.15
 # Danger threshold for avoidance triggers
 DANGER_THRESHOLD = 0.30
 CRITICAL_DANGER_THRESHOLD = 0.85
+EMERGENCY_STOP_DISTANCE_CM = 25.0
 
 
 def compute_zone_scores(
@@ -91,8 +92,10 @@ def compute_zone_scores(
         y2_frac = y2 / max(frame_h, 1)
         bottom_prox = max(0.0, (y2_frac - 0.25) / 0.75)  # 0.0 at top/horizon, 1.0 at bumper
 
-        # Danger score combines confidence, area, and bottom-edge proximity
-        danger = conf * wt * (0.35 + 0.35 * area_score + 0.50 * (bottom_prox ** 1.3))
+        # Danger score combines confidence, area, and bottom-edge proximity.
+        # Proximity-scaled: distant detections (low bottom_prox, low area_score)
+        # remain below DANGER_THRESHOLD (0.30) and scale smoothly as object approaches.
+        danger = conf * wt * (0.15 * area_score + 0.85 * (bottom_prox ** 1.3))
 
         # Horizontal corridor assignment
         cx_frac = cx / frame_w
@@ -127,24 +130,26 @@ def compute_zone_scores(
 
         # Left ultrasonic distance fusion
         if is_valid(us_l):
-            if us_l < 22.0:
-                scores["left"] += 1.8  # Critical proximity
+            if us_l < EMERGENCY_STOP_DISTANCE_CM:
+                scores["left"] += 1.8  # Critical danger (> 0.85) within emergency boundary
             elif us_l < 42.0:
-                scores["left"] += (42.0 - us_l) / 20.0 * 0.9
+                # Cautionary proximity (scales up to 0.50, <= 0.85)
+                scores["left"] += (42.0 - us_l) / (42.0 - EMERGENCY_STOP_DISTANCE_CM) * 0.50
             elif us_l < 60.0:
-                scores["left"] += (60.0 - us_l) / 18.0 * 0.35
+                scores["left"] += (60.0 - us_l) / 18.0 * 0.25
 
         # Right ultrasonic distance fusion
         if is_valid(us_r):
-            if us_r < 22.0:
-                scores["right"] += 1.8  # Critical proximity
+            if us_r < EMERGENCY_STOP_DISTANCE_CM:
+                scores["right"] += 1.8  # Critical danger (> 0.85) within emergency boundary
             elif us_r < 42.0:
-                scores["right"] += (42.0 - us_r) / 20.0 * 0.9
+                # Cautionary proximity (scales up to 0.50, <= 0.85)
+                scores["right"] += (42.0 - us_r) / (42.0 - EMERGENCY_STOP_DISTANCE_CM) * 0.50
             elif us_r < 60.0:
-                scores["right"] += (60.0 - us_r) / 18.0 * 0.35
+                scores["right"] += (60.0 - us_r) / 18.0 * 0.25
 
         # If both front sensors detect close obstacle, center path is impassable
-        if is_valid(us_l) and is_valid(us_r) and us_l < 25.0 and us_r < 25.0:
+        if is_valid(us_l) and is_valid(us_r) and us_l < EMERGENCY_STOP_DISTANCE_CM and us_r < EMERGENCY_STOP_DISTANCE_CM:
             scores["center"] += 2.0
 
     return scores
@@ -182,7 +187,9 @@ def decide_avoidance(scores: Dict[str, float]) -> str:
     if R >= T and L < T:
         return "LEFT"
     if L >= T and R >= T:
-        return "STOP"
+        if L >= CRITICAL_DANGER_THRESHOLD and R >= CRITICAL_DANGER_THRESHOLD:
+            return "STOP"
+        return "CLEAR"
 
     return "CLEAR"
 

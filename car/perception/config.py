@@ -49,7 +49,7 @@ FOLLOW_SIMILARITY_THRESHOLD = 0.58     # Min combined score (clothing + figure) 
 FOLLOW_TRACK_VERIFY_THRESHOLD = 0.50   # Min score during active tracking before dropping to RE_ACQUIRE
 FOLLOW_ANTI_CONFUSION_MARGIN = 0.08    # Required margin over overlapping distractor person
 FOLLOW_SEARCH_STEP_DEG = 28            # Degrees per stepped turn toward last_seen_side
-FOLLOW_SEARCH_TURN_SPEED = 180         # PWM speed for search turns during RE_ACQUIRE (>= 180)
+FOLLOW_SEARCH_TURN_SPEED = 200         # PWM speed for search turns during RE_ACQUIRE (>= 200)
 FOLLOW_SEARCH_MAX_STEPS = 4            # Max directional search turns before holding stationary
 FOLLOW_SEARCH_INTERVAL_S = 0.85        # Delay (s) between search turns to stabilize camera & scan
 
@@ -61,7 +61,7 @@ LANE_EMA_ALPHA = 0.45                  # Temporal smoothing factor for polynomia
 LANE_MAX_JUMP_FRAC = 0.15              # Max frame-to-frame lateral jump before rejecting outlier
 LANE_LOST_MAX_FRAMES = 8               # Coast frames allowed before stopping when both lines disappear
 LANE_CRUISE_SPEED = 185                # Forward PWM speed when centered in lane (>= 180)
-LANE_CURVE_SPEED = 180                 # PWM speed when executing corrective lane turns (>= 180)
+LANE_CURVE_SPEED = 200                 # PWM speed when executing corrective lane turns (>= 200)
 LANE_STEER_DEADBAND_DEG = 6            # Deadband (deg) within which car drives straight
 LANE_MAX_STEER_DEG = 38                # Maximum skid-steer correction angle for sharp paper curves
 LANE_COLOR_MODE = "orange"             # Default ribbon color: "orange", "brown", "green", "pink" (legacy presets: "dark", "yellow", "blue", "white")

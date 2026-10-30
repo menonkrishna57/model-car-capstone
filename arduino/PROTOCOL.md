@@ -39,12 +39,12 @@ Commands are sent as ASCII strings terminated with `\n`.
 |---|---|---|---|
 | **DRIVE** | `DRIVE <speed> <duration_ms>` | `DRIVE 180 1500` | Drive forward at PWM `<speed>` (180–255, 0 = stop) for `<duration_ms>` ms. Active speeds below 180 are clamped to 180 floor. |
 | **REVERSE** | `REV <speed> <duration_ms>` | `REV 180 1000` | Drive reverse at PWM `<speed>` (180–255, 0 = stop) for `<duration_ms>` ms. Active speeds below 180 are clamped to 180 floor. |
-| **TURN** | `TURN <angle_deg> <speed>` | `TURN 45 180` | Skid-steer turn by `<angle_deg>` (-180 to +180; positive = right, negative = left) at PWM `<speed>` (180–255; clamped to 180 floor). |
+| **TURN** | `TURN <angle_deg> <speed>` | `TURN 45 200` | Skid-steer turn by `<angle_deg>` (-180 to +180; positive = right, negative = left) at PWM `<speed>` (200–255; clamped to 200 floor, 0 = stop). All turn commands enforce a minimum motor PWM floor of 200 to overcome vehicle weight and friction during turns. |
 | **STOP** | `STOP` | `STOP` | Immediate non-latched stop (goes to `IDLE`; does NOT lock out further commands). Blocked if in `PI_STOPPED` or `CLIFF_STOPPED`. |
 | **PING** | `PING` | `PING` | Liveness check (responds with `[ACK] PONG`). |
 | **STATUS** | `STATUS` | `STATUS` | Queries current state and ultrasonic readings. |
 
-> **Note**: All Tier 3 commands are blocked while `PI_STOPPED` or `CLIFF_STOPPED` is active. Arduino responds with `[ACK] BLOCKED (PI_STOPPED)` or `[ACK] BLOCKED (CLIFF_STOPPED)`. The minimum driving speed floor is 180 PWM for all active movement commands (DRIVE, REV, TURN) to overcome TT motor static friction under vehicle payload; speed 0 is reserved for stop.
+> **Note**: All Tier 3 commands are blocked while `PI_STOPPED` or `CLIFF_STOPPED` is active. Arduino responds with `[ACK] BLOCKED (PI_STOPPED)` or `[ACK] BLOCKED (CLIFF_STOPPED)`. The minimum driving speed floor is 180 PWM for straight movement commands (DRIVE, REV) to overcome TT motor static friction under vehicle payload; all turn commands (TURN) enforce a minimum motor PWM floor of 200 to overcome vehicle weight and tire friction during skid-steer turns; speed 0 is reserved for stop.
 
 ### Meta — Runtime Parameter Tuning (`TUNE`)
 
@@ -156,7 +156,7 @@ Transitions:
   - Forward: Right motor Channel A (`IN1=LOW, IN2=HIGH`), Left motor Channel B (`IN3=LOW, IN4=HIGH`).
   - Reverse: Right motor Channel A (`IN1=HIGH, IN2=LOW`), Left motor Channel B (`IN3=HIGH, IN4=LOW`).
 - **Startup State**: Motors initialize disarmed and stopped (PWM 0, all IN pins LOW) upon MCU boot/reset; no autonomous movement occurs until explicit user command is received.
-- **Minimum Speed Floor**: All active driving PWM speeds are clamped to $\ge 180$ PWM to overcome TT motor static friction under chassis payload (speed 0 reserved for stop).
+- **Minimum Speed Floor**: All active driving PWM speeds are clamped to $\ge 180$ PWM for straight drive (DRIVE, REV), while all skid-steer turn commands (TURN) enforce a minimum motor PWM floor of $\ge 200$ to overcome vehicle weight and friction during turns (speed 0 is reserved for stop).
 - Pin mappings are centralized in `arduino/lib/pins.h`.
 - Ultrasonic, cliff detection, and avoidance timing constants are in `arduino/lib/protocol.h`.
 - Any modification to this protocol must originate from `firmware-agent` and be mirrored in `car/control/motor_controller.py`.
