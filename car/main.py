@@ -75,6 +75,8 @@ from car.perception.config import (
     LANE_STEER_DEADBAND_DEG,
     LANE_MAX_STEER_DEG,
     LANE_COLOR_MODE,
+    POTHOLE_LOWER_Y_MIN_FRAC,
+    POTHOLE_CONFIDENCE_THRESHOLD,
 )
 from car.perception.detector import Detector
 from car.perception.sensors import SensorManager
@@ -210,6 +212,13 @@ def _check_obstacle_ahead(detections: list, frame_w: int, frame_h: int) -> Tuple
             cx = _bbox_center_x(bbox)
         except (TypeError, ValueError, ZeroDivisionError):
             continue
+
+        is_pot = det.get("type") == "negative" or "pothole" in str(det.get("class_name", "")).lower()
+        if is_pot:
+            x1, y1, x2, y2 = bbox
+            yc = (y1 + y2) / 2.0
+            if yc < frame_h * POTHOLE_LOWER_Y_MIN_FRAC or y2 < frame_h * 0.45:
+                continue
 
         valid_dets.append(det)
         in_center_corridor = 0.20 * frame_w <= cx <= 0.80 * frame_w
@@ -2031,6 +2040,10 @@ def draw_hud(
     cv2.putText(annotated, "C", (int(w * 0.48), h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
     cv2.putText(annotated, "R", (max(10, w - 20), h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
 
+    # ── 1c. Pothole Scan Horizon Marker (Lower Camera Section ROI) ───────────
+    roi_line_y = int(h * POTHOLE_LOWER_Y_MIN_FRAC)
+    cv2.line(annotated, (0, roi_line_y), (w, roi_line_y), (75, 75, 75), 1)
+
     # ── 1b. Render Lane Corridor, Polylines & Target Reticle (Lane Mode) ─────
     if mode == "lane" and lane_result is not None:
         if lane_result.corridor_pts is not None and len(lane_result.corridor_pts) >= 4:
@@ -2070,6 +2083,12 @@ def draw_hud(
         except (ValueError, TypeError):
             continue
         is_pothole = det.get("type") == "negative" or "pothole" in det.get("class_name", "").lower()
+        if is_pothole:
+            # Enforce lower camera section constraint on rendering (matching live_detect.py)
+            yc = (y1 + y2) / 2.0
+            if yc < h * POTHOLE_LOWER_Y_MIN_FRAC or y2 < h * 0.45:
+                continue
+
         is_bystander = tuple(bbox) in non_target_set or (det.get("class_name") == "person" and non_target_persons and det in non_target_persons)
 
         if is_bystander:
@@ -3304,7 +3323,47 @@ def run_pipeline(
             fresh_inference = False
             if frame_count % 3 == 1:
                 raw_dets = detector.detect(frame)
-                cached_detections = [d for d in raw_dets if d.get("confidence", 0) >= confidence_thresh]
+                filtered_dets = []
+                frame_h, frame_w = frame.shape[:2]
+                frame_area = float(frame_h * frame_w)
+                for d in raw_dets:
+                    if not isinstance(d, dict):
+                        continue
+                    conf_val = float(d.get("confidence", 0.0))
+                    name = str(d.get("class_name", "")).lower()
+                    is_pot = d.get("type") == "negative" or "pothole" in name or "d40" in name
+                    if is_pot:
+                        if conf_val < POTHOLE_CONFIDENCE_THRESHOLD:
+                            continue
+                        bbox = d.get("bbox")
+                        if not bbox or len(bbox) != 4:
+                            continue
+                        try:
+                            x1, y1, x2, y2 = [float(v) for v in bbox]
+                        except (ValueError, TypeError):
+                            continue
+                        bw = x2 - x1
+                        bh = y2 - y1
+                        yc = (y1 + y2) / 2.0
+                        box_area = float(bw * bh)
+                        # Lower camera section & geometry sanity filter matching live_detect.py
+                        if yc < frame_h * POTHOLE_LOWER_Y_MIN_FRAC or y2 < frame_h * 0.45:
+                            continue
+                        if bw > frame_w * 0.62 or bh > frame_h * 0.48 or box_area > frame_area * 0.22:
+                            continue
+                        if bw < frame_w * 0.025 or bh < frame_h * 0.02 or box_area < frame_area * 0.0015:
+                            continue
+                        aspect = bw / max(bh, 1.0)
+                        if not (0.25 <= aspect <= 4.5):
+                            continue
+                        d["type"] = "negative"
+                        if "class_name" not in d or d["class_name"] != "pothole":
+                            d["class_name"] = "pothole"
+                        filtered_dets.append(d)
+                    else:
+                        if conf_val >= confidence_thresh:
+                            filtered_dets.append(d)
+                cached_detections = filtered_dets
                 fresh_inference = True
 
             # ── E. Decision Execution ────────────────────────────────────────
