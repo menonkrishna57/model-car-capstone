@@ -241,15 +241,42 @@ class Detector:
             cls_id = int(box.cls[0])
             name = results[0].names.get(cls_id, str(cls_id))
             conf = float(box.conf[0])
-            coords = box.xyxy[0].tolist()
+            coords = box.xyxy[0].tolist() if hasattr(box.xyxy[0], 'tolist') else list(box.xyxy[0])
 
-            detections.append({
-                "class_id": cls_id,
-                "class_name": name,
-                "confidence": conf,
-                "bbox": coords,
-                "type": "positive",
-            })
+            is_pot = "pothole" in str(name).lower() or "d40" in str(name).lower()
+            if is_pot:
+                # If primary model detects a pothole, enforce lower camera section constraint
+                gx1, gy1, gx2, gy2 = coords
+                bw = gx2 - gx1
+                bh = gy2 - gy1
+                gyc = (gy1 + gy2) / 2.0
+                box_area = bw * bh
+                h, w = frame.shape[:2]
+                frame_area = float(h * w)
+                if gyc < h * POTHOLE_LOWER_Y_MIN_FRAC or gy2 < h * 0.45:
+                    continue
+                if bw > w * 0.62 or bh > h * 0.48 or box_area > frame_area * 0.22:
+                    continue
+                if bw < w * 0.025 or bh < h * 0.02 or box_area < frame_area * 0.0015:
+                    continue
+                aspect = bw / max(bh, 1.0)
+                if not (0.25 <= aspect <= 4.5):
+                    continue
+                detections.append({
+                    "class_id": -1,
+                    "class_name": "pothole",
+                    "confidence": conf,
+                    "bbox": coords,
+                    "type": "negative",
+                })
+            else:
+                detections.append({
+                    "class_id": cls_id,
+                    "class_name": name,
+                    "confidence": conf,
+                    "bbox": coords,
+                    "type": "positive",
+                })
 
         # 2. GPU fine-tuned YOLO pothole model detections (lower camera section)
         yolo_potholes = self._detect_yolo_potholes(frame)
