@@ -48,6 +48,7 @@ FOLLOW_CALIBRATION_FRAMES = 8          # Multi-frame samples to build target sig
 FOLLOW_SIMILARITY_THRESHOLD = 0.58     # Min combined score (clothing + figure) to match target
 FOLLOW_TRACK_VERIFY_THRESHOLD = 0.50   # Min score during active tracking before dropping to RE_ACQUIRE
 FOLLOW_ANTI_CONFUSION_MARGIN = 0.08    # Required margin over overlapping distractor person
+FOLLOW_COAST_MAX_FRAMES = 12           # Max frames to coast during momentary drop / motion blur (~400ms)
 FOLLOW_SEARCH_STEP_DEG = 28            # Degrees per stepped turn toward last_seen_side
 FOLLOW_SEARCH_TURN_SPEED = 200         # PWM speed for search turns during RE_ACQUIRE (>= 200)
 FOLLOW_SEARCH_MAX_STEPS = 4            # Max directional search turns before holding stationary

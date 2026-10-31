@@ -28,6 +28,7 @@ class PID:
         self.DTerm = 0.0
         self.last_error = 0.0
         self.initialized = False
+        self._first_update = True
 
         # Windup Guard
         self.int_error = 0.0
@@ -42,10 +43,11 @@ class PID:
         self.current_time = time.time()
         delta_time = self.current_time - self.last_time
 
-        if not getattr(self, "initialized", False):
+        if not getattr(self, "initialized", False) or getattr(self, "_first_update", True):
             self.last_error = error
             self.last_time = self.current_time
             self.initialized = True
+            self._first_update = False
             delta_error = 0.0
         else:
             delta_error = error - self.last_error
