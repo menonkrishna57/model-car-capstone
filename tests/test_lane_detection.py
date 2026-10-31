@@ -485,6 +485,72 @@ def test_run_lane_lost_holding_stop():
     assert "STOP" in serial_dev.written_commands
 
 
+def test_run_lane_ultrasonic_blocked_and_escape():
+    """Verify that when ultrasonic is blocked in lane mode, escape steering works without NameError or unpacking error."""
+    motor, serial_dev = create_mock_motor()
+    sensors = SensorManager(motor_controller=motor)
+    throttler = CommandThrottler()
+    detector = ChartLaneDetector(color_mode="dark")
+    state = SystemState()
+    frame = create_synthetic_chart_paper_frame(width=640, height=480)
+
+    # 1. Right side blocked (15cm), Left side clear (60cm) -> Escape LEFT
+    sensors.read_ultrasonic = lambda: {"left": 60.0, "right": 15.0}
+    pi_latched, action, res = _run_lane(
+        motor=motor,
+        sensors=sensors,
+        lane_detector=detector,
+        detections=[],
+        us_blocked=True,
+        frame=frame,
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+        sys_state=state,
+    )
+    assert "US CRITICAL ESCAPE" in action
+    assert "LEFT" in action
+    assert any("TURN -35" in c for c in serial_dev.written_commands)
+
+    # 2. Left side blocked (15cm), Right side clear (60cm) -> Escape RIGHT
+    serial_dev.written_commands.clear()
+    sensors.read_ultrasonic = lambda: {"left": 15.0, "right": 60.0}
+    pi_latched, action, res = _run_lane(
+        motor=motor,
+        sensors=sensors,
+        lane_detector=detector,
+        detections=[],
+        us_blocked=True,
+        frame=frame,
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+        sys_state=state,
+    )
+    assert "US CRITICAL ESCAPE" in action
+    assert "RIGHT" in action
+    assert any("TURN 35" in c for c in serial_dev.written_commands)
+
+    # 3. Both sides blocked (15cm, 15cm) -> Stop / Auto-brake
+    serial_dev.written_commands.clear()
+    sensors.read_ultrasonic = lambda: {"left": 15.0, "right": 15.0}
+    pi_latched, action, res = _run_lane(
+        motor=motor,
+        sensors=sensors,
+        lane_detector=detector,
+        detections=[],
+        us_blocked=True,
+        frame=frame,
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+        sys_state=state,
+    )
+    assert "US AUTO-BRAKE" in action
+    assert "STOP" in serial_dev.written_commands
+
+
+
 # =============================================================================
 # 5. Color Mode Presets
 # =============================================================================

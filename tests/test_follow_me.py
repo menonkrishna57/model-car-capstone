@@ -600,3 +600,160 @@ def test_stale_inference_does_not_reanchor_kcf():
     assert is_tracking is True
     assert bbox == (220, 100, 100, 300)
 
+
+
+# =============================================================================
+
+# 6. Steer-and-Pursue Forward Pursuit & Deadband Tests
+# =============================================================================
+
+def test_follow_me_pursues_forward_in_deadband():
+    """Verify target slightly off-center (within FOLLOW_STEER_DEADBAND_DEG) drives forward."""
+    motor, serial_dev = create_mock_motor()
+    sensors = SensorManager(motor_controller=motor)
+    tracker = ObjectTracker()
+    pid = PID(P=0.3, I=0.01, D=0.05)
+    pid.SetPoint = 320.0
+    throttler = CommandThrottler()
+
+    # Target centered at x = 340 (20px off-center, angle = +6 deg)
+    # Height = 200 (200/480 = 0.41 -> Cruise distance)
+    frame = make_synthetic_person([255, 0, 0], [0, 0, 180], bbox=(300, 140, 80, 200))
+    tracker.lock_on(frame, (300, 140, 80, 200))
+
+    det_target = {
+        'class_name': 'person',
+        'confidence': 0.92,
+        'bbox': [300, 140, 380, 340],
+        'type': 'positive',
+    }
+
+    follow_state, pi_latched, action = _run_follow(
+        motor=motor,
+        sensors=sensors,
+        tracker=tracker,
+        pid=pid,
+        detections=[det_target],
+        us_blocked=False,
+        frame=frame,
+        follow_state='TRACKING',
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+    )
+
+    assert pi_latched is False
+    assert 'FOLLOWING' in action
+    assert any(mode in action for mode in ('Cruise', 'Fast'))
+    # Crucial check: car must issue DRIVE command, NOT in-place TURN!
+    drive_cmds = [cmd for cmd in serial_dev.written_commands if cmd.startswith('DRIVE')]
+    assert len(drive_cmds) >= 1, f'Expected DRIVE command, got: {serial_dev.written_commands}'
+
+
+def test_follow_me_interleaved_steer_and_pursue():
+    """Verify moderate angle executes turn correction and then forward drive pulse."""
+    motor, serial_dev = create_mock_motor()
+    sensors = SensorManager(motor_controller=motor)
+    tracker = ObjectTracker()
+    pid = PID(P=0.3, I=0.01, D=0.05)
+    pid.SetPoint = 320.0
+    throttler = CommandThrottler()
+
+    # Target at x = 350 (center_x = 390 -> error = -70 -> angle ~ +21 deg with Kp=0.3)
+    frame = make_synthetic_person([255, 0, 0], [0, 0, 180], bbox=(350, 140, 80, 200))
+    tracker.lock_on(frame, (350, 140, 80, 200))
+
+    det_target = {
+        'class_name': 'person',
+        'confidence': 0.90,
+        'bbox': [350, 140, 430, 340],
+        'type': 'positive',
+    }
+
+    # Step 1: Initial call -> issues TURN command
+    follow_state, pi_latched, action = _run_follow(
+        motor=motor,
+        sensors=sensors,
+        tracker=tracker,
+        pid=pid,
+        detections=[det_target],
+        us_blocked=False,
+        frame=frame,
+        follow_state='TRACKING',
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+    )
+    assert any(cmd.startswith('TURN') for cmd in serial_dev.written_commands)
+
+    # Step 2: Next step after turn completes & target is brought into corridor -> executes forward DRIVE pulse (pursuit)
+    serial_dev.written_commands.clear()
+    import time
+    time.sleep(0.30)  # Wait for turn settling
+    frame_aligned = make_synthetic_person([255, 0, 0], [0, 0, 180], bbox=(300, 140, 80, 200))
+    det_target_aligned = {
+        'class_name': 'person',
+        'confidence': 0.90,
+        'bbox': [300, 140, 380, 340],
+        'type': 'positive',
+    }
+    follow_state, pi_latched, action = _run_follow(
+        motor=motor,
+        sensors=sensors,
+        tracker=tracker,
+        pid=pid,
+        detections=[det_target_aligned],
+        us_blocked=False,
+        frame=frame_aligned,
+        follow_state='TRACKING',
+        pi_latched=False,
+        motors_enabled=True,
+        throttler=throttler,
+    )
+    assert any(cmd.startswith('DRIVE') for cmd in serial_dev.written_commands), (
+        f'Expected DRIVE pulse after turn, got: {serial_dev.written_commands}'
+    )
+
+
+def test_tracking_coasts_through_momentary_kcf_loss():
+    """Verify tracker coasts for several frames during momentary blur/occlusion without dropping to RE_ACQUIRE."""
+    tracker = ObjectTracker()
+    frame = make_synthetic_person([255, 0, 0], [0, 0, 180], bbox=(200, 100, 100, 300))
+    tracker.lock_on(frame, (200, 100, 100, 300))
+    assert tracker.is_tracking is True
+
+    # Simulate KCF failure (e.g. motion blur) with empty detections for 4 frames
+    class FailingTracker:
+        def update(self, f):
+            return False, None
+    tracker.tracker = FailingTracker()
+
+    for lost_step in range(1, 5):
+        is_tracking, bbox, tgt_det, non_tgt, score = tracker.update_with_detections(
+            frame, [], fresh_inference=False
+        )
+        assert is_tracking is True, f"Tracker prematurely dropped at frame {lost_step}"
+        assert bbox is not None
+        assert tracker.lost_frames == lost_step
+
+
+def test_tracking_persists_under_lighting_change():
+    """Verify that a 20% brightness change does not drop active tracking."""
+    tracker = ObjectTracker()
+    frame = make_synthetic_person([255, 0, 0], [0, 0, 180], bbox=(200, 100, 100, 300))
+    tracker.lock_on(frame, (200, 100, 100, 300))
+
+    # Brightened frame (+20%)
+    bright_frame = np.clip(frame.astype(np.float32) * 1.20, 0, 255).astype(np.uint8)
+    det = {
+        "class_name": "person",
+        "bbox": [200, 100, 300, 400],
+        "confidence": 0.90,
+    }
+
+    is_tracking, bbox, tgt_det, non_tgt, score = tracker.update_with_detections(
+        bright_frame, [det], fresh_inference=True
+    )
+    assert is_tracking is True
+    assert bbox is not None
+    assert score >= 0.45
