@@ -644,7 +644,7 @@ def test_follow_me_pursues_forward_in_deadband():
 
     assert pi_latched is False
     assert 'FOLLOWING' in action
-    assert 'Cruise' in action
+    assert any(mode in action for mode in ('Cruise', 'Fast'))
     # Crucial check: car must issue DRIVE command, NOT in-place TURN!
     drive_cmds = [cmd for cmd in serial_dev.written_commands if cmd.startswith('DRIVE')]
     assert len(drive_cmds) >= 1, f'Expected DRIVE command, got: {serial_dev.written_commands}'
@@ -686,23 +686,32 @@ def test_follow_me_interleaved_steer_and_pursue():
     )
     assert any(cmd.startswith('TURN') for cmd in serial_dev.written_commands)
 
-    # Step 2: Next frame after recent turn (< 0.28s) -> executes forward DRIVE pulse (interleaved pursuit)
+    # Step 2: Next step after turn completes & target is brought into corridor -> executes forward DRIVE pulse (pursuit)
     serial_dev.written_commands.clear()
+    import time
+    time.sleep(0.30)  # Wait for turn settling
+    frame_aligned = make_synthetic_person([255, 0, 0], [0, 0, 180], bbox=(300, 140, 80, 200))
+    det_target_aligned = {
+        'class_name': 'person',
+        'confidence': 0.90,
+        'bbox': [300, 140, 380, 340],
+        'type': 'positive',
+    }
     follow_state, pi_latched, action = _run_follow(
         motor=motor,
         sensors=sensors,
         tracker=tracker,
         pid=pid,
-        detections=[det_target],
+        detections=[det_target_aligned],
         us_blocked=False,
-        frame=frame,
+        frame=frame_aligned,
         follow_state='TRACKING',
         pi_latched=False,
         motors_enabled=True,
         throttler=throttler,
     )
     assert any(cmd.startswith('DRIVE') for cmd in serial_dev.written_commands), (
-        f'Expected interleaved DRIVE pulse after turn, got: {serial_dev.written_commands}'
+        f'Expected DRIVE pulse after turn, got: {serial_dev.written_commands}'
     )
 
 

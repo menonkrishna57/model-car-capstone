@@ -668,6 +668,17 @@ class ObjectTracker:
             cx_p = best_p["_box_xywh"][0] + best_p["_box_xywh"][2] / 2.0
             aligned_with_kcf = (best_p["_iou"] > 0.15) or (abs(cx_p - cx_kcf) < 0.25 * frame.shape[1] and best_p["_iou"] > 0.05)
 
+        # Anti-confusion gate: check if multiple persons are near/overlapping tracker box
+        overlapping = [
+            p for p in persons
+            if (p.get("_iou", 0.0) > 0.15 or (best_p and _box_iou(best_p["_box_xywh"], p["_box_xywh"]) > 0.20))
+        ]
+        if len(overlapping) > 1 and margin < FOLLOW_ANTI_CONFUSION_MARGIN:
+            self.is_tracking = False
+            self.bbox = None
+            self.lost_frames = 0
+            return False, None, None, persons, kcf_score
+
         # ── 2. Determine if any YOLO detection matches target ─────────────────
         is_target_yolo_match = False
         if best_p:
